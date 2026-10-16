@@ -167,15 +167,96 @@ test("meaningful title, status, relationships and classification changes create 
   assert.equal((await commit(run)).body.status, "COMMITTED");
 });
 
+test("relationship source timestamps alone are stored but do not create document, stage, or vote events", async () => {
+  const initial = publication({ external_id: "902", normalized_snapshot: {
+    title: "Forslag om Ukrainesærloven", content_text: null, status: "Fremsat", publication_type: "L 1", relevance: "DIRECT",
+    documents: [{ id: 1, link_id: 2, title: "Lovudkast", date_raw: "2026-10-01", source_updated_at_raw: "2026-10-10T00:00:00", updated_at_utc: null }],
+    stages: [{ id: 3, title: "Fremsat", date_raw: "2026-10-01", type_id: 1, status_id: 2, source_updated_at_raw: "2026-10-10T00:00:00", updated_at_utc: null }],
+    votes: [{ id: 4, stage_id: 3, number: 1, approved: true, conclusion: "Vedtaget", source_updated_at_raw: "2026-10-10T00:00:00", updated_at_utc: null }],
+  } });
+  const firstRun = "00000000-0000-4000-8000-000000000020";
+  await start(firstRun, { proposed: cursors(20) });
+  await batch(firstRun, [initial]);
+  await commit(firstRun);
+
+  const changed = publication({ external_id: "902", normalized_snapshot: {
+    ...initial.normalized_snapshot,
+    documents: [{ id: 1, link_id: 2, title: "Lovudkast", date_raw: "2026-10-01", source_updated_at_raw: "2026-10-11T00:00:00", updated_at_utc: "2026-10-11T00:00:00Z" }],
+    stages: [{ id: 3, title: "Fremsat", date_raw: "2026-10-01", type_id: 1, status_id: 2, source_updated_at_raw: "2026-10-11T00:00:00", updated_at_utc: "2026-10-11T00:00:00Z" }],
+    votes: [{ id: 4, stage_id: 3, number: 1, approved: true, conclusion: "Vedtaget", source_updated_at_raw: "2026-10-11T00:00:00", updated_at_utc: "2026-10-11T00:00:00Z" }],
+  }, source_updated_at_raw: "2026-10-11T00:00:00", source_metadata: { source_updated_at_raw: "2026-10-11T00:00:00" } });
+  const secondRun = "00000000-0000-4000-8000-000000000021";
+  await start(secondRun, { proposed: cursors(21) });
+  await batch(secondRun, [changed]);
+  assert.equal((await commit(secondRun)).body.status, "COMMITTED");
+  const rows = await query("SELECT e.event_type FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.external_id='902' ORDER BY e.id");
+  assert.deepEqual(rows.map((row) => row.event_type), ["FIRST_SEEN"]);
+  const stored = await query("SELECT normalized_snapshot_json FROM publications WHERE external_id='902'");
+  assert.match(stored[0].normalized_snapshot_json, /2026-10-11T00:00:00/);
+});
+
+test("substantive document, stage, and vote changes still produce events", async () => {
+  const initial = publication({ external_id: "903" });
+  const firstRun = "00000000-0000-4000-8000-000000000022";
+  await start(firstRun, { proposed: cursors(22) });
+  await batch(firstRun, [initial]);
+  await commit(firstRun);
+  const updated = publication({ external_id: "903", normalized_snapshot: {
+    ...initial.normalized_snapshot,
+    documents: [{ id: 501, link_id: 701, title: "Ændret lovudkast" }],
+    stages: [{ id: 601, title: "Fremsat", date_raw: "2026-10-01", type_id: 1, status_id: 3 }],
+    votes: [{ id: 801, stage_id: 601, number: 1, approved: false, conclusion: "Forkastet", comment: null }],
+  } });
+  const secondRun = "00000000-0000-4000-8000-000000000023";
+  await start(secondRun, { proposed: cursors(23) });
+  await batch(secondRun, [updated]);
+  assert.equal((await commit(secondRun)).body.status, "COMMITTED");
+  const rows = await query("SELECT event_type FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.external_id='903' ORDER BY e.id");
+  assert.deepEqual(rows.map((row) => row.event_type), ["FIRST_SEEN", "DOCUMENTS_CHANGED", "STAGES_CHANGED", "VOTES_CHANGED"]);
+});
+
+test("concurrent commits process a staged record once and advance one checkpoint set", async () => {
+  const run = "00000000-0000-4000-8000-000000000024";
+  await start(run, { proposed: cursors(24) });
+  await batch(run, [publication({ external_id: "904" })]);
+  const results = await Promise.all([commit(run), commit(run)]);
+  assert.ok(results.every((result) => result.status === 200));
+  const rows = await query("SELECT processed_count, accepted_count, status FROM ingestion_runs WHERE run_id='00000000-0000-4000-8000-000000000024'");
+  assert.deepEqual(rows[0], { processed_count: 1, accepted_count: 1, status: "COMMITTED" });
+  const events = await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.external_id='904'");
+  assert.equal(events[0].count, 1);
+});
+
+test("checkpoint CAS failure cannot partially finalize and retry after interruption is safe", async () => {
+  const initial = "00000000-0000-4000-8000-000000000025";
+  await start(initial, { proposed: cursors(25) });
+  await batch(initial, [publication({ external_id: "905" })]);
+  assert.equal((await commit(initial)).body.status, "COMMITTED");
+  await query("CREATE TRIGGER ignore_sag_checkpoint BEFORE UPDATE OF checkpoint ON source_states WHEN OLD.stream_key='Sag' BEGIN SELECT RAISE(IGNORE); END");
+  const interrupted = "00000000-0000-4000-8000-000000000026";
+  await start(interrupted, { proposed: cursors(26) });
+  await batch(interrupted, [publication({ external_id: "906" }), publication({ external_id: "907" })]);
+  const failed = await commit(interrupted);
+  assert.equal(failed.status, 500);
+  const stateAfterFailure = (await request("/internal/source-states?source=folketinget", "GET")).body.streams;
+  assert.ok(stateAfterFailure.every((item: any) => item.checkpoint?.id === 25));
+  const statusAfterFailure = await query("SELECT status, processed_count, accepted_count, checkpoint_writes FROM ingestion_runs WHERE run_id='00000000-0000-4000-8000-000000000026'");
+  assert.deepEqual(statusAfterFailure[0], { status: "COMMITTING", processed_count: 2, accepted_count: 2, checkpoint_writes: 0 });
+  await query("DROP TRIGGER ignore_sag_checkpoint");
+  assert.equal((await commit(interrupted)).body.status, "COMMITTED");
+  const recovered = (await request("/internal/source-states?source=folketinget", "GET")).body.streams;
+  assert.ok(recovered.every((item: any) => item.checkpoint?.id === 26));
+});
+
 test("historical events cannot notify and incomplete snapshots cannot overwrite complete data or advance checkpoints", async () => {
   const histRun = "00000000-0000-4000-8000-000000000004";
-  await start(histRun, { mode: "historical", proposed: cursors(4) });
+  await start(histRun, { mode: "historical", proposed: cursors(40) });
   const historical = publication({ external_id: "99", historical: true });
   await batch(histRun, [historical]);
   await commit(histRun);
   const beforeState = (await request("/internal/source-states?source=folketinget", "GET")).body.streams.find((item: any) => item.stream === "Sag")?.checkpoint;
   const blockedRun = "00000000-0000-4000-8000-000000000005";
-  await start(blockedRun, { proposed: cursors(5) });
+  await start(blockedRun, { proposed: cursors(41) });
   await batch(blockedRun, [publication({ title: "Partial title", complete: false, notification_blocked: true, diagnostics: [{ code: "partial" }] })]);
   const blocked = await commit(blockedRun);
   assert.equal(blocked.body.status, "BLOCKED");
@@ -187,35 +268,43 @@ test("historical events cannot notify and incomplete snapshots cannot overwrite 
 test("incomplete collections, missing batches, retries and overlapping runs cannot move checkpoints", async () => {
   const partial = await request("/internal/ingest", "POST", {
     action: "start", run_id: "00000000-0000-4000-8000-000000000006", source: "folketinget",
-    mode: "incremental", expected_batches: 1, collection_complete: false, proposed_checkpoints: cursors(6),
+    mode: "incremental", expected_batches: 1, collection_complete: false, proposed_checkpoints: cursors(42),
   });
   assert.equal(partial.status, 409);
   const run = "00000000-0000-4000-8000-000000000007";
-  assert.equal((await start(run, { expected: 2, proposed: cursors(7) })).status, 201);
+  assert.equal((await start(run, { expected: 2, proposed: cursors(43) })).status, 201);
   const overlapping = "00000000-0000-4000-8000-000000000008";
-  assert.equal((await start(overlapping, { proposed: cursors(8) })).status, 409);
+  assert.equal((await start(overlapping, { proposed: cursors(44) })).status, 409);
   assert.equal((await commit(run)).body.error, "batches_incomplete");
   await batch(run, [publication({ external_id: "100" })], 0);
   await batch(run, [], 1);
   assert.equal((await batch(run, [publication({ external_id: "100" })], 0)).body.idempotent, true);
   assert.equal((await commit(run)).body.status, "COMMITTED");
-  assert.equal((await start(overlapping, { proposed: cursors(8) })).status, 201);
+  assert.equal((await start(overlapping, { proposed: cursors(44) })).status, 201);
   const openState = (await request("/internal/source-states?source=folketinget", "GET")).body.streams.find((item: any) => item.stream === "Sag")?.checkpoint;
-  assert.deepEqual(openState, { timestamp: "2026-10-16T10:11:12.1234567", id: 7 });
+  assert.deepEqual(openState, { timestamp: "2026-10-16T10:11:12.1234567", id: 43 });
   assert.equal((await request("/internal/ingest", "POST", { action: "abort", run_id: overlapping })).body.status, "ABORTED");
 });
 
 test("a failed D1 event write rolls back publication and checkpoint writes; retry resumes safely", async () => {
-  await query("CREATE TRIGGER fail_ingest_event BEFORE INSERT ON publication_events WHEN NEW.event_key LIKE 'ingest:%00000000-0000-4000-8000-000000000011%' BEGIN SELECT RAISE(ABORT, 'test failure'); END");
+  await query("CREATE TRIGGER fail_ingest_event BEFORE INSERT ON publication_events WHEN instr(NEW.event_key, '00000000-0000-4000-8000-000000000011:1:778:FIRST_SEEN:') > 0 BEGIN SELECT RAISE(ABORT, 'test failure'); END");
   const run = "00000000-0000-4000-8000-000000000011";
-  await start(run, { proposed: cursors(11) });
-  await batch(run, [publication({ external_id: "777" })]);
+  await start(run, { proposed: cursors(45) });
+  await batch(run, [publication({ external_id: "777" }), publication({ external_id: "778" })]);
   const failed = await commit(run);
   assert.equal(failed.status, 500);
+  const interruptedState = await query("SELECT status, processed_count, accepted_count FROM ingestion_runs WHERE run_id='00000000-0000-4000-8000-000000000011'");
+  assert.deepEqual(interruptedState[0], { status: "COMMITTING", processed_count: 1, accepted_count: 2 });
+  const firstRecord = await query("SELECT COUNT(*) AS count FROM publications WHERE external_id='777'");
+  const secondRecord = await query("SELECT COUNT(*) AS count FROM publications WHERE external_id='778'");
+  assert.equal(firstRecord[0].count, 1);
+  assert.equal(secondRecord[0].count, 0);
   const current = (await request("/internal/source-states?source=folketinget", "GET")).body.streams.find((item: any) => item.stream === "Sag")?.checkpoint;
-  assert.deepEqual(current, { timestamp: "2026-10-16T10:11:12.1234567", id: 7 });
+  assert.deepEqual(current, { timestamp: "2026-10-16T10:11:12.1234567", id: 43 });
   await query("DROP TRIGGER fail_ingest_event");
   assert.equal((await commit(run)).body.status, "COMMITTED");
+  const processed = await query("SELECT processed_count, status FROM ingestion_runs WHERE run_id='00000000-0000-4000-8000-000000000011'");
+  assert.deepEqual(processed[0], { processed_count: 2, status: "COMMITTED" });
 });
 
 test("source separation, timestamp precision and existing Telegram routes remain intact", async () => {
@@ -251,7 +340,7 @@ test("local D1 stores deduplicated snapshots, event transitions and notification
   const publications = result[0] as any[];
   const events = result[1] as any[];
   const checkpoints = result[2] as any[];
-  assert.equal(publications.length, 6);
+  assert.equal(publications.length, 13);
   const case42 = publications.find((row) => row.source_id === 1 && row.external_id === "42");
   assert.equal(case42?.original_title, "Forslag om udvidet Ukrainesærloven");
   assert.equal(case42?.source_complete, 1);
@@ -270,6 +359,6 @@ test("local D1 stores deduplicated snapshots, event transitions and notification
   assert.equal(publications.filter((row) => row.source_id === 2 && row.external_id === "123").length, 1);
   assert.equal(checkpoints.length, 8);
   const folketingetSag = checkpoints.find((row) => row.source_id === 1 && row.stream_key === "Sag");
-  assert.deepEqual(JSON.parse(folketingetSag?.checkpoint), { timestamp: "2026-10-16T10:11:12.1234567", id: 11 });
+  assert.deepEqual(JSON.parse(folketingetSag?.checkpoint), { timestamp: "2026-10-16T10:11:12.1234567", id: 45 });
 });
 

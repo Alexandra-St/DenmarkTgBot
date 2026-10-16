@@ -247,7 +247,9 @@ async function startRun(body: JsonObject, db: D1Database): Promise<Response> {
   if (body.collection_complete !== true) throw new RequestError(409, "incomplete_collection");
   const id = await getSourceId(db, source);
   const current = await readStates(db, id);
-  const proposed = validateCheckpoints(body.proposed_checkpoints, source, current.base);
+  const streamKeys: readonly string[] = source === "folketinget" ? ODA_STREAMS : HEARING_FEEDS;
+  const base = Object.fromEntries(streamKeys.map((key) => [key, current.base[key] ?? null]));
+  const proposed = validateCheckpoints(body.proposed_checkpoints, source, base);
   const startJson = canonical({ run_id: body.run_id, source, mode: body.mode, expected_batches: body.expected_batches, collection_complete: true, proposed_checkpoints: proposed });
   const startHash = await sha256(startJson);
   const oldRun = await db.prepare("SELECT status, start_request_hash, expected_batches FROM ingestion_runs WHERE run_id = ?").bind(body.run_id).first<{ status: string; start_request_hash: string; expected_batches: number }>();
@@ -258,7 +260,7 @@ async function startRun(body: JsonObject, db: D1Database): Promise<Response> {
   const now = new Date().toISOString();
   try {
     await db.prepare("INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'OPEN', ?, ?, ?, ?, ?)")
-      .bind(body.run_id, id, body.mode, body.expected_batches, canonical(proposed), canonical(current.base), startHash, now, now).run();
+      .bind(body.run_id, id, body.mode, body.expected_batches, canonical(proposed), canonical(base), startHash, now, now).run();
   } catch { throw new RequestError(409, "source_run_active_or_run_conflict"); }
   return json({ accepted: true, run_id: body.run_id, status: "OPEN", expected_batches: body.expected_batches, idempotent: false }, 201);
 }
@@ -311,13 +313,23 @@ function eventChanges(previous: JsonObject | null, incoming: PublicationInput): 
   };
   const oldStatus = typeof previous.status === "string" ? previous.status : null;
   const newStatus = typeof next.status === "string" ? next.status : null;
+  const semanticRows = (value: unknown, fields: string[]): JsonObject[] => Array.isArray(value)
+    ? value.filter(object).map((item) => Object.fromEntries(fields.filter((field) => field in item).map((field) => [field, item[field]])))
+    : [];
   compare("TITLE_CHANGED", previous.title, next.title);
   compare("CONTENT_CHANGED", previous.content_text, next.content_text);
   compare("STATUS_CHANGED", previous.status, next.status, oldStatus, newStatus);
   compare("PUBLICATION_TYPE_CHANGED", previous.publication_type, next.publication_type);
-  compare("DOCUMENTS_CHANGED", previous.documents, next.documents);
-  compare("STAGES_CHANGED", previous.stages, next.stages);
-  compare("VOTES_CHANGED", previous.votes, next.votes);
+  // Preserve source timestamps in normalized snapshots, but compare only content fields.
+  compare("DOCUMENTS_CHANGED",
+    semanticRows(previous.documents, ["id", "link_id", "title", "date_raw", "released_at_raw", "document_released_at_raw"]),
+    semanticRows(next.documents, ["id", "link_id", "title", "date_raw", "released_at_raw", "document_released_at_raw"]));
+  compare("STAGES_CHANGED",
+    semanticRows(previous.stages, ["id", "title", "date_raw", "type_id", "status_id"]),
+    semanticRows(next.stages, ["id", "title", "date_raw", "type_id", "status_id"]));
+  compare("VOTES_CHANGED",
+    semanticRows(previous.votes, ["id", "stage_id", "number", "approved", "conclusion", "comment"]),
+    semanticRows(next.votes, ["id", "stage_id", "number", "approved", "conclusion", "comment"]));
   compare("RECLASSIFIED", previous.relevance, next.relevance);
   return changes;
 }
@@ -331,12 +343,11 @@ async function processStaged(db: D1Database, runId: string, sourceId: number, mo
     const statements: D1PreparedStatement[] = [];
     if (!old) {
       const related = canonical({ documents: incoming.normalized_snapshot.documents, stages: incoming.normalized_snapshot.stages, votes: incoming.normalized_snapshot.votes });
-      statements.push(db.prepare("INSERT INTO publications (source_id, external_id, external_url, original_title, publication_type, relevance, relevance_reason, current_status, published_at, source_updated_at, discovered_at, updated_at, source_metadata_json, normalized_snapshot_json, relationship_snapshot_json, ruleset_version, source_complete, historical, diagnostics_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)")
-        .bind(sourceId, incoming.external_id, incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, now, now, canonical(incoming.source_metadata), canonical(incoming.normalized_snapshot), related, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics)));
+      statements.push(db.prepare("INSERT INTO publications (source_id, external_id, external_url, original_title, publication_type, relevance, relevance_reason, current_status, published_at, source_updated_at, discovered_at, updated_at, source_metadata_json, normalized_snapshot_json, relationship_snapshot_json, ruleset_version, source_complete, historical, diagnostics_json) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ? WHERE EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
+        .bind(sourceId, incoming.external_id, incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, now, now, canonical(incoming.source_metadata), canonical(incoming.normalized_snapshot), related, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), runId, sourceId, incoming.external_id));
     }
     statements.push(
-      db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ?").bind(runId, sourceId, incoming.external_id),
-      db.prepare("UPDATE ingestion_runs SET processed_count = processed_count + 1, had_incomplete = 1, updated_at = ? WHERE run_id = ?").bind(now, runId),
+      db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0").bind(runId, sourceId, incoming.external_id),
     );
     await db.batch(statements);
     return;
@@ -356,24 +367,24 @@ async function processStaged(db: D1Database, runId: string, sourceId: number, mo
     votes: incoming.normalized_snapshot.votes,
   });
   const writePublication = old
-    ? db.prepare("UPDATE publications SET external_url = ?, original_title = ?, publication_type = ?, relevance = ?, relevance_reason = ?, current_status = ?, published_at = ?, source_updated_at = ?, updated_at = CASE WHEN ? = 1 THEN ? ELSE updated_at END, source_metadata_json = ?, normalized_snapshot_json = ?, relationship_snapshot_json = ?, ruleset_version = ?, source_complete = 1, historical = ?, diagnostics_json = ? WHERE id = ?")
-      .bind(incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, meaningful ? 1 : 0, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), old.id)
-    : db.prepare("INSERT INTO publications (source_id, external_id, external_url, original_title, publication_type, relevance, relevance_reason, current_status, published_at, source_updated_at, discovered_at, updated_at, source_metadata_json, normalized_snapshot_json, relationship_snapshot_json, ruleset_version, source_complete, historical, diagnostics_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
-      .bind(sourceId, incoming.external_id, incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, now, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics));
+    ? db.prepare("UPDATE publications SET external_url = ?, original_title = ?, publication_type = ?, relevance = ?, relevance_reason = ?, current_status = ?, published_at = ?, source_updated_at = ?, updated_at = CASE WHEN ? = 1 THEN ? ELSE updated_at END, source_metadata_json = ?, normalized_snapshot_json = ?, relationship_snapshot_json = ?, ruleset_version = ?, source_complete = 1, historical = ?, diagnostics_json = ? WHERE id = ? AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
+      .bind(incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, meaningful ? 1 : 0, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), old.id, runId, sourceId, incoming.external_id)
+    : db.prepare("INSERT INTO publications (source_id, external_id, external_url, original_title, publication_type, relevance, relevance_reason, current_status, published_at, source_updated_at, discovered_at, updated_at, source_metadata_json, normalized_snapshot_json, relationship_snapshot_json, ruleset_version, source_complete, historical, diagnostics_json) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ? WHERE EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
+      .bind(sourceId, incoming.external_id, incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, now, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), runId, sourceId, incoming.external_id);
   const statements: D1PreparedStatement[] = [writePublication];
   const canNotify = mode === "incremental" && !incoming.historical && incoming.complete &&
     !incoming.notification_blocked && incoming.relevance !== "IRRELEVANT";
   for (const change of changes) {
     const fingerprint = await sha256(canonical({ type: change.type, snapshot: change.snapshot }));
     const eventKey = "ingest:" + runId + ":" + sourceId + ":" + incoming.external_id + ":" + change.type + ":" + fingerprint;
-    statements.push(db.prepare("INSERT INTO publication_events (publication_id, event_key, event_type, previous_status, new_status, occurred_at, detected_at, notify_eligible, change_snapshot_json) SELECT id, ?, ?, ?, ?, NULL, ?, ?, ? FROM publications WHERE source_id = ? AND external_id = ? ON CONFLICT (event_key) DO NOTHING")
-      .bind(eventKey, change.type, change.previousStatus, change.newStatus, now, canNotify ? 1 : 0, canonical(change.snapshot), sourceId, incoming.external_id));
+    statements.push(db.prepare("INSERT INTO publication_events (publication_id, event_key, event_type, previous_status, new_status, occurred_at, detected_at, notify_eligible, change_snapshot_json) SELECT id, ?, ?, ?, ?, NULL, ?, ?, ? FROM publications WHERE source_id = ? AND external_id = ? AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0) ON CONFLICT (event_key) DO NOTHING")
+      .bind(eventKey, change.type, change.previousStatus, change.newStatus, now, canNotify ? 1 : 0, canonical(change.snapshot), sourceId, incoming.external_id, runId, sourceId, incoming.external_id));
   }
   statements.push(
-    db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ?").bind(runId, sourceId, incoming.external_id),
-    db.prepare("UPDATE ingestion_runs SET processed_count = processed_count + 1, updated_at = ? WHERE run_id = ?").bind(now, runId),
+    db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0").bind(runId, sourceId, incoming.external_id),
   );
-  // Publication, events and stage progress share one D1 batch/transaction.
+  // Every write is gated on the staged row remaining pending. Competing commit batches serialize in SQLite;
+  // only the winner changes publications/events and the stage transition trigger counts the record once.
   await db.batch(statements);
 }
 
@@ -386,10 +397,8 @@ async function commitRun(body: JsonObject, db: D1Database): Promise<Response> {
   if (run.status !== "OPEN" && run.status !== "COMMITTING") throw new RequestError(409, "run_not_committable");
   const count = await db.prepare("SELECT COUNT(*) AS count FROM ingestion_batches WHERE run_id = ?").bind(run.run_id).first<{ count: number }>();
   if (count?.count !== run.expected_batches) throw new RequestError(409, "batches_incomplete");
-  if (run.status === "OPEN") {
-    await db.prepare("UPDATE ingestion_runs SET status = 'COMMITTING', updated_at = ? WHERE run_id = ? AND status = 'OPEN'")
-      .bind(new Date().toISOString(), run.run_id).run();
-  }
+  if (run.status === "OPEN") await db.prepare("UPDATE ingestion_runs SET status = 'COMMITTING', updated_at = ? WHERE run_id = ? AND status = 'OPEN'")
+    .bind(new Date().toISOString(), run.run_id).run();
   const pending = await db.prepare("SELECT external_id, publication_json FROM ingestion_staging WHERE run_id = ? AND processed = 0 ORDER BY external_id LIMIT ?")
     .bind(run.run_id, COMMIT_RECORDS).all<{ external_id: string; publication_json: string }>();
   let processed = 0;
