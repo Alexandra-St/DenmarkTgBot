@@ -18,15 +18,19 @@ class WorkflowGateError(ValueError):
     pass
 
 
-def validate_execution_mode(event: str, manual_confirmation: str, automation_enabled: str) -> str:
+def validate_execution_mode(event: str, requested_mode: str, manual_confirmation: str, automation_enabled: str) -> str:
     if event == "workflow_dispatch":
-        if manual_confirmation.lower() != "true":
-            raise WorkflowGateError("manual production confirmation is required")
-        return "manual"
+        if requested_mode == "dry_run":
+            return "dry_run"
+        if requested_mode == "production_ingest":
+            if manual_confirmation != "true":
+                raise WorkflowGateError("production ingestion confirmation is required")
+            return "production_ingest"
+        raise WorkflowGateError("unsupported manual execution mode")
     if event == "schedule":
         if automation_enabled != "true":
             raise WorkflowGateError("scheduled automation is disabled or invalid")
-        return "automated"
+        return "production_ingest"
     raise WorkflowGateError("unsupported workflow event")
 
 
@@ -37,7 +41,7 @@ def _load(path: str) -> Any:
         return None
 
 
-def render_summary(collection: Any, ingestion: Any, *, run_id: str, gate_status: str, collect_status: str, ingest_status: str) -> str:
+def render_summary(collection: Any, ingestion: Any, *, run_id: str, mode: str, gate_status: str, collect_status: str, ingest_status: str) -> str:
     feeds = collection.get("feeds", {}) if isinstance(collection, dict) else {}
     feed_lines = []
     for feed in ("immigration_ministry", "immigration_category"):
@@ -56,19 +60,29 @@ def render_summary(collection: Any, ingestion: Any, *, run_id: str, gate_status:
                 category = classify(item).to_dict().get("relevance")
                 if isinstance(category, str):
                     relevance[category] = relevance.get(category, 0) + 1
-    if isinstance(collection, dict) and collect_status == "success" and not collection_complete(collection, "hoeringsportalen"):
+    complete = collection_complete(collection, "hoeringsportalen") if isinstance(collection, dict) else False
+    if isinstance(collection, dict) and collect_status == "success" and not complete:
         collect_status = "incomplete"
-    reported_ingestion = ingestion.get("status", ingest_status) if isinstance(ingestion, dict) else ingest_status
+    if mode == "dry_run" and isinstance(ingestion, dict):
+        reported_ingestion = "DRY_RUN" if ingestion.get("would_submit") is True else "DRY_RUN_FAILED"
+    elif mode == "dry_run":
+        reported_ingestion = "DRY_RUN_FAILED" if ingest_status == "failure" or collect_status in {"failure", "incomplete"} else "not_run"
+    else:
+        reported_ingestion = ingestion.get("status", ingest_status) if isinstance(ingestion, dict) else ingest_status
     rows = [
         "## Høringsportalen monitoring run",
         f"- GitHub run ID: `{run_id or 'unavailable'}`",
         f"- Safety gate: `{gate_status}`",
+        f"- Mode: `{mode or 'unknown'}`",
         f"- Collection: `{collect_status}`",
+        f"- Collection complete: `{str(complete).lower()}`",
         *feed_lines,
         f"- Unique publications: **{unique_count}**",
         f"- Relevance: DIRECT {relevance.get('DIRECT', 0)}, POTENTIAL {relevance.get('POTENTIAL', 0)}, IRRELEVANT {relevance.get('IRRELEVANT', 0)}",
         f"- Ingestion: `{reported_ingestion}`",
     ]
+    if mode == "dry_run":
+        rows.append("- Production write: **No** (dry-run mode does not call the Worker)")
     if isinstance(ingestion, dict) and isinstance(ingestion.get("run_id"), str):
         rows.append(f"- Ingestion run ID: `{ingestion['run_id']}`")
     if gate_status == "failure":
@@ -92,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             mode = validate_execution_mode(
                 os.environ.get("GITHUB_EVENT_NAME", ""),
+                os.environ.get("REQUESTED_MODE", "dry_run"),
                 os.environ.get("CONFIRM_PRODUCTION_INGESTION", "false"),
                 os.environ.get("HOERINGSPORTALEN_AUTOMATION_ENABLED", ""),
             )
@@ -103,10 +118,12 @@ def main(argv: list[str] | None = None) -> int:
         if output_path:
             with Path(output_path).open("a", encoding="utf-8") as output:
                 output.write(f"run_id={uuid.uuid4()}\n")
+                output.write(f"mode={mode}\n")
         return 0
     body = render_summary(
         _load(args.collection), _load(args.ingestion),
         run_id=os.environ.get("GITHUB_RUN_ID", ""),
+        mode=os.environ.get("RUN_MODE", ""),
         gate_status=os.environ.get("GATE_STATUS", "not_run"),
         collect_status=os.environ.get("COLLECT_STATUS", "not_run"),
         ingest_status=os.environ.get("INGEST_STATUS", "not_run"),

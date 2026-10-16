@@ -1,21 +1,26 @@
 from __future__ import annotations
 
-import unittest
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import unittest
+from pathlib import Path
 
 from collectors.workflow_support import WorkflowGateError, render_summary, validate_execution_mode
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 class WorkflowSupportTests(unittest.TestCase):
-    def run_gate_cli(self, event: str, *, confirmation: str | None = None, automation: str | None = None):
+    def run_gate_cli(self, event: str, *, mode: str | None = "dry_run", confirmation: str | None = None, automation: str | None = None):
         env = os.environ.copy()
+        for name in ("REQUESTED_MODE", "CONFIRM_PRODUCTION_INGESTION", "HOERINGSPORTALEN_AUTOMATION_ENABLED"):
+            env.pop(name, None)
         env["GITHUB_EVENT_NAME"] = event
-        env.pop("CONFIRM_PRODUCTION_INGESTION", None)
-        env.pop("HOERINGSPORTALEN_AUTOMATION_ENABLED", None)
+        if mode is not None:
+            env["REQUESTED_MODE"] = mode
         if confirmation is not None:
             env["CONFIRM_PRODUCTION_INGESTION"] = confirmation
         if automation is not None:
@@ -25,85 +30,90 @@ class WorkflowSupportTests(unittest.TestCase):
             env["GITHUB_OUTPUT"] = str(output_path)
             result = subprocess.run(
                 [sys.executable, "-m", "collectors.workflow_support", "gate"],
-                cwd=Path(__file__).resolve().parents[1], env=env,
-                text=True, capture_output=True, check=False,
+                cwd=ROOT, env=env, text=True, capture_output=True, check=False,
             )
             output = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
         return result, output
 
-    def test_manual_mode_requires_explicit_confirmation(self):
-        self.assertEqual(validate_execution_mode("workflow_dispatch", "true", ""), "manual")
-        for value in ("", "false", "yes"):
-            with self.subTest(value=value), self.assertRaises(WorkflowGateError):
-                validate_execution_mode("workflow_dispatch", value, "true")
+    def test_direct_mode_validation(self):
+        self.assertEqual(validate_execution_mode("workflow_dispatch", "dry_run", "false", ""), "dry_run")
+        self.assertEqual(validate_execution_mode("workflow_dispatch", "production_ingest", "true", ""), "production_ingest")
+        self.assertEqual(validate_execution_mode("schedule", "", "false", "true"), "production_ingest")
+        for args in (
+            ("workflow_dispatch", "unknown", "true", "true"),
+            ("workflow_dispatch", "production_ingest", "false", ""),
+            ("schedule", "", "", "TRUE"),
+            ("repository_dispatch", "dry_run", "true", "true"),
+        ):
+            with self.subTest(args=args), self.assertRaises(WorkflowGateError):
+                validate_execution_mode(*args)
 
-    def test_scheduled_mode_requires_exact_enabled_gate(self):
-        self.assertEqual(validate_execution_mode("schedule", "false", "true"), "automated")
-        for value in ("", "false", "TRUE", "yes"):
-            with self.subTest(value=value), self.assertRaises(WorkflowGateError):
-                validate_execution_mode("schedule", "true", value)
-
-    def test_actual_cli_gate_scenarios_and_rejection_has_no_run_output(self):
+    def test_actual_cli_modes_and_fail_closed_scenarios(self):
         cases = (
-            ("schedule", None, "true", 0),
-            ("schedule", None, None, 2),
-            ("schedule", None, "false", 2),
-            ("schedule", None, "TRUE", 2),
-            ("workflow_dispatch", "true", None, 0),
-            ("workflow_dispatch", None, None, 2),
+            ("workflow_dispatch", "dry_run", None, None, 0, "dry_run"),
+            ("workflow_dispatch", "production_ingest", "true", None, 0, "production_ingest"),
+            ("workflow_dispatch", "production_ingest", None, None, 2, None),
+            ("workflow_dispatch", "production_ingest", "TRUE", None, 2, None),
+            ("workflow_dispatch", "invalid", "true", None, 2, None),
+            ("schedule", None, None, "true", 0, "production_ingest"),
+            ("schedule", None, None, None, 2, None),
+            ("schedule", None, None, "false", 2, None),
+            ("schedule", None, None, "TRUE", 2, None),
         )
-        for event, confirmation, automation, expected_code in cases:
-            with self.subTest(event=event, confirmation=confirmation, automation=automation):
-                result, output = self.run_gate_cli(event, confirmation=confirmation, automation=automation)
+        for event, mode, confirmation, automation, expected_code, expected_mode in cases:
+            with self.subTest(event=event, mode=mode, confirmation=confirmation, automation=automation):
+                result, output = self.run_gate_cli(event, mode=mode, confirmation=confirmation, automation=automation)
                 self.assertEqual(result.returncode, expected_code, result.stderr)
                 if expected_code == 0:
                     self.assertRegex(output, r"run_id=[0-9a-f-]{36}\n")
+                    self.assertIn(f"mode={expected_mode}\n", output)
                 else:
                     self.assertEqual(output, "")
 
-    def test_cli_uses_exact_workflow_environment_name_and_gate_precedes_side_effect_steps(self):
-        workflow = Path(".github/workflows/hoeringsportalen-incremental.yml").read_text(encoding="utf-8")
-        support = Path("collectors/workflow_support.py").read_text(encoding="utf-8")
+    def test_gate_order_and_dry_run_have_no_production_endpoint_credentials(self):
+        workflow = (ROOT / ".github/workflows/hoeringsportalen-incremental.yml").read_text(encoding="utf-8")
+        support = (ROOT / "collectors/workflow_support.py").read_text(encoding="utf-8")
         self.assertIn("HOERINGSPORTALEN_AUTOMATION_ENABLED: ${{ vars.HOERINGSPORTALEN_AUTOMATION_ENABLED }}", workflow)
         self.assertIn('os.environ.get("HOERINGSPORTALEN_AUTOMATION_ENABLED", "")', support)
-        self.assertLess(workflow.index("python -m collectors.workflow_support gate"), workflow.index("python -m collectors.main"))
-        self.assertLess(workflow.index("python -m collectors.main"), workflow.index("python -m collectors.ingestion_client"))
-        self.assertIn("if: ${{ steps.collect.outcome == 'success' }}", workflow)
+        gate = workflow.index("python -m collectors.workflow_support gate")
+        collect = workflow.index("python -m collectors.main")
+        dry_run = workflow.index("--dry-run")
+        production = workflow.index("python -m collectors.ingestion_client", dry_run + 1)
+        self.assertLess(gate, collect)
+        self.assertLess(collect, dry_run)
+        self.assertLess(dry_run, production)
+        dry_step = workflow.split("- name: Validate collected records without production writes", 1)[1].split("- name: Submit complete incremental run to production", 1)[0]
+        self.assertNotIn("INGEST_API_TOKEN", dry_step)
+        self.assertNotIn("INGEST_API_URL", dry_step)
+        self.assertIn("--dry-run", dry_step)
+        self.assertIn("steps.collect.outcome == 'success'", workflow)
 
-    def test_unknown_event_fails_closed(self):
-        with self.assertRaises(WorkflowGateError):
-            validate_execution_mode("repository_dispatch", "true", "true")
-
-    def test_summary_includes_feed_counts_and_sanitized_failure_category(self):
+    def test_dry_run_summary_is_explicit_about_status_completeness_and_no_write(self):
         collection = {
             "feeds": {
-                "immigration_ministry": {"status": "success", "entries_parsed": 3},
-                "immigration_category": {"status": "unavailable", "entries_parsed": 0},
+                "immigration_ministry": {"status": "success", "entries_parsed": 1, "invalid_entries": 0, "invalid_timestamps": 0, "missing_updated_at": 0, "invalid_cursor_ids": 0},
+                "immigration_category": {"status": "success_empty", "entries_parsed": 0, "invalid_entries": 0, "invalid_timestamps": 0, "missing_updated_at": 0, "invalid_cursor_ids": 0},
             },
-            "publications": [{}, {}, {}],
+            "publications": [],
         }
-        rendered = render_summary(collection, None, run_id="123", gate_status="success", collect_status="failure", ingest_status="skipped")
-        self.assertIn("Unique publications: **3**", rendered)
-        self.assertIn("`immigration_ministry`: `success` (3 entries)", rendered)
-        self.assertIn("collection_failed_or_incomplete", rendered)
-        self.assertNotIn("token", rendered.lower())
+        rendered = render_summary(collection, {"dry_run": True, "would_submit": True, "relevance_counts": {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0}}, run_id="123", mode="dry_run", gate_status="success", collect_status="success", ingest_status="success")
+        self.assertIn("Collection complete: `true`", rendered)
+        self.assertIn("Ingestion: `DRY_RUN`", rendered)
+        self.assertIn("Production write: **No**", rendered)
 
-    def test_summary_reports_confirmed_commit_status(self):
-        rendered = render_summary(None, {"status": "COMMITTED", "run_id": "safe-id"}, run_id="123", gate_status="success", collect_status="success", ingest_status="success")
-        self.assertIn("Ingestion: `COMMITTED`", rendered)
+    def test_unknown_mode_rejected_before_collection_in_workflow(self):
+        result, output = self.run_gate_cli("workflow_dispatch", mode="typo", confirmation="true")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(output, "")
 
-    def test_summary_reports_closed_safety_gate(self):
-        rendered = render_summary(None, None, run_id="123", gate_status="failure", collect_status="not_run", ingest_status="not_run")
-        self.assertIn("safety_gate_rejected", rendered)
-
-    def test_workflow_has_no_active_schedule_and_retains_lock_and_time_limit(self):
-        workflow = Path(".github/workflows/hoeringsportalen-incremental.yml").read_text(encoding="utf-8")
-        self.assertIn("workflow_dispatch:", workflow)
+    def test_workflow_defaults_to_dry_run_and_has_no_active_schedule(self):
+        workflow = (ROOT / ".github/workflows/hoeringsportalen-incremental.yml").read_text(encoding="utf-8")
+        self.assertIn("default: dry_run", workflow)
+        self.assertIn("- production_ingest", workflow)
         self.assertNotIn("  schedule:", workflow)
         self.assertIn("group: hoeringsportalen-incremental", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("timeout-minutes: 10", workflow)
-        self.assertIn("HOERINGSPORTALEN_AUTOMATION_ENABLED: ${{ vars.HOERINGSPORTALEN_AUTOMATION_ENABLED }}", workflow)
 
 
 if __name__ == "__main__":

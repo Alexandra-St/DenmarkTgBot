@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
-from unittest.mock import Mock
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
 from collectors.ingestion_client import (
@@ -10,6 +15,7 @@ from collectors.ingestion_client import (
     USER_AGENT,
     chunks,
     collection_complete,
+    main,
     prepare_records,
     proposed_checkpoints,
     upload,
@@ -223,9 +229,21 @@ class ClientTests(unittest.TestCase):
 
     def test_dry_run_does_not_send_http_and_reports_incomplete_status(self):
         opener = Mock(side_effect=AssertionError("dry run must not perform HTTP"))
-        result = upload(hearing_output(), source="hoeringsportalen", mode="incremental", endpoint="", token="", dry_run=True, opener=opener)
+        result = upload(hearing_output(), source="hoeringsportalen", mode="incremental", endpoint="https://production.example", token="test-only-token", dry_run=True, opener=opener)
         self.assertTrue(result["dry_run"])
         self.assertTrue(result["would_submit"])
+        opener.assert_not_called()
+
+    def test_incomplete_dry_run_exits_nonzero_without_http_requests(self):
+        value = hearing_output()
+        value["feeds"]["immigration_category"]["status"] = "unavailable"
+        opener = Mock(side_effect=AssertionError("dry-run must not call the ingestion service"))
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "collection.json"
+            input_path.write_text(json.dumps(value), encoding="utf-8")
+            with patch.dict(os.environ, {"INGEST_API_URL": "", "INGEST_API_TOKEN": ""}), redirect_stdout(StringIO()):
+                exit_code = main([str(input_path), "--source", "hoeringsportalen", "--mode", "incremental", "--dry-run"], opener=opener)
+        self.assertEqual(exit_code, 2)
         opener.assert_not_called()
 
     def test_chunking_obeys_both_record_and_request_size_limits(self):

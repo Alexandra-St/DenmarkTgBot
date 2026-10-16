@@ -3,6 +3,14 @@ name: Høringsportalen incremental collection
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Choose a no-write dry run or confirmed production ingestion
+        required: true
+        type: choice
+        options:
+          - dry_run
+          - production_ingest
+        default: dry_run
       confirm_production_ingestion:
         description: Confirm a complete collection may be submitted to production
         required: true
@@ -21,7 +29,7 @@ concurrency:
 
 jobs:
   collect-and-submit:
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.confirm_production_ingestion) }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -33,6 +41,7 @@ jobs:
         id: gate
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_MODE: ${{ inputs.mode }}
           CONFIRM_PRODUCTION_INGESTION: ${{ inputs.confirm_production_ingestion }}
           HOERINGSPORTALEN_AUTOMATION_ENABLED: ${{ vars.HOERINGSPORTALEN_AUTOMATION_ENABLED }}
         run: python -m collectors.workflow_support gate
@@ -40,9 +49,14 @@ jobs:
         id: collect
         continue-on-error: true
         run: python -m collectors.main > "$RUNNER_TEMP/hoeringsportalen.json" 2> "$RUNNER_TEMP/collector.log"
-      - name: Submit complete incremental run
-        id: ingest
-        if: ${{ steps.collect.outcome == 'success' }}
+      - name: Validate collected records without production writes
+        id: dry_run
+        if: ${{ steps.gate.outputs.mode == 'dry_run' && steps.collect.outcome == 'success' }}
+        continue-on-error: true
+        run: python -m collectors.ingestion_client "$RUNNER_TEMP/hoeringsportalen.json" --source hoeringsportalen --mode incremental --dry-run > "$RUNNER_TEMP/ingestion.json" 2> "$RUNNER_TEMP/ingestion.log"
+      - name: Submit complete incremental run to production
+        id: production_ingest
+        if: ${{ steps.gate.outputs.mode == 'production_ingest' && steps.collect.outcome == 'success' }}
         continue-on-error: true
         env:
           INGEST_API_URL: ${{ vars.INGEST_API_URL }}
@@ -54,9 +68,10 @@ jobs:
         env:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GATE_STATUS: ${{ steps.gate.outcome || 'not_run' }}
+          RUN_MODE: ${{ steps.gate.outputs.mode || 'rejected' }}
           COLLECT_STATUS: ${{ steps.collect.outcome || 'not_run' }}
-          INGEST_STATUS: ${{ steps.ingest.outcome || 'not_run' }}
+          INGEST_STATUS: ${{ (steps.gate.outputs.mode == 'dry_run' && steps.dry_run.outcome) || steps.production_ingest.outcome || 'not_run' }}
         run: python -m collectors.workflow_support summary --collection "$RUNNER_TEMP/hoeringsportalen.json" --ingestion "$RUNNER_TEMP/ingestion.json"
       - name: Fail the run if collection or ingestion failed
-        if: ${{ always() && (steps.collect.outcome != 'success' || steps.ingest.outcome != 'success') }}
+        if: ${{ always() && (steps.gate.outcome != 'success' || steps.collect.outcome != 'success' || (steps.gate.outputs.mode == 'dry_run' && steps.dry_run.outcome != 'success') || (steps.gate.outputs.mode == 'production_ingest' && steps.production_ingest.outcome != 'success')) }}
         run: exit 1
