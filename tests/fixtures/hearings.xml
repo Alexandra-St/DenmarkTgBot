@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Høringsportalen - Test feed</title>
+  <updated>2026-10-16T03:28:31Z</updated>
+  <entry>
+    <id>https://hoeringsportalen.dk/Hearing/Details/71507</id>
+    <title>Høring om Ukrainesærloven</title>
+    <updated>2026-09-17T14:27:44Z</updated>
+    <author><name>Udlændinge- og Integrationsministeriet</name></author>
+    <link rel="alternate" href="https://hoeringsportalen.dk/Hearing/Details/71507" />
+    <content type="html">&lt;p&gt;Forslag om ændringer.&lt;/p&gt;&lt;script&gt;do not include me()&lt;/script&gt;&lt;p&gt;Høringsfrist: 1. oktober&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <id>https://example.org/consultation/external-42</id>
+    <title>Høring med få felter</title>
+    <updated>2026-10-01T16:00:00+02:00</updated>
+  </entry>
+  <entry>
+    <id>https://hoeringsportalen.dk/Hearing/Details/71508</id>
+    <title>Høring med ugyldig dato</title>
+    <updated>not-a-date</updated>
+  </entry>
+</feed>
