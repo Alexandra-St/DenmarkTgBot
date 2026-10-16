@@ -106,11 +106,13 @@ class WorkflowSupportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(output, "")
 
-    def test_workflow_defaults_to_dry_run_and_has_no_active_schedule(self):
+    def test_workflow_defaults_to_dry_run_and_has_exact_gated_schedule(self):
         workflow = (ROOT / ".github/workflows/hoeringsportalen-incremental.yml").read_text(encoding="utf-8")
         self.assertIn("default: dry_run", workflow)
         self.assertIn("- production_ingest", workflow)
-        self.assertNotIn("  schedule:", workflow)
+        self.assertIn("  schedule:\n    - cron: '17 6,14,22 * * *'", workflow)
+        self.assertIn('if: ${{ github.event_name == \'schedule\' || github.event_name == \'workflow_dispatch\' }}', workflow)
+        self.assertIn("HOERINGSPORTALEN_AUTOMATION_ENABLED: ${{ vars.HOERINGSPORTALEN_AUTOMATION_ENABLED }}", workflow)
         self.assertIn("group: hoeringsportalen-incremental", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("timeout-minutes: 10", workflow)

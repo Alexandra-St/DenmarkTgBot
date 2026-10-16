@@ -16,9 +16,8 @@ on:
         required: true
         type: boolean
         default: false
-  # Future activation requires separate review and the automation enable gate:
-  # schedule:
-  #   - cron: '17 6,14,22 * * *'
+  schedule:
+    - cron: '17 6,14,22 * * *'
 
 permissions:
   contents: read
