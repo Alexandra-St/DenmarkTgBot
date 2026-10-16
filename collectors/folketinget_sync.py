@@ -9,13 +9,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
 from collectors.folketinget import COLLECTIONS, Cursor, ODataClient, ODataError, ODataPageError, ODataPaginationError, ScanResult
-from collectors.folketinget_models import Diagnostic, normalize_many
+from collectors.folketinget_models import Diagnostic
 from collectors.folketinget_relations import load_case
 
 _STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?$")
-_ENTITIES = {"Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"}
-
-
 @dataclass(frozen=True)
 class StreamResult:
     status: str
@@ -23,7 +20,6 @@ class StreamResult:
     records: int
     complete: bool
     upper_bound: dict[str, object] | None
-    candidate_checkpoint: dict[str, object] | None
 
 
 def parse_checkpoints(value: object) -> dict[str, Cursor]:
@@ -49,47 +45,19 @@ def _floor(days: int, overlap_hours: int) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
-def _cursor_key(cursor: Cursor) -> tuple[datetime, int, int]:
-    base, dot, fraction = cursor.timestamp.partition(".")
-    parsed = datetime.strptime(base, "%Y-%m-%dT%H:%M:%S")
-    return parsed, int(fraction.ljust(7, "0")) if dot else 0, cursor.entity_id
-
-
-def _merge_rows(*batches: tuple[dict[str, object], ...]) -> tuple[dict[str, object], ...]:
-    selected: dict[int, dict[str, object]] = {}
-
-    def key(row: dict[str, object]) -> tuple[datetime, int, int]:
-        stamp = row.get("opdateringsdato")
-        match = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,7}))?", str(stamp))
-        if match is None:
-            return datetime.min, 0, int(row.get("id", -1))
-        parsed = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
-        return parsed, int((match.group(2) or "").ljust(7, "0")), int(row.get("id", -1))
-
-    for batch in batches:
-        for row in batch:
-            entity_id = int(row.get("id", -1))
-            current = selected.get(entity_id)
-            if current is None or key(row) > key(current):
-                selected[entity_id] = row
-    return tuple(sorted(selected.values(), key=key))
-
-
 def _scan(client: ODataClient, name: str, floor: str, max_pages: int, precision_retries: int) -> tuple[ScanResult | None, list[dict[str, object]], str]:
     expr = f"opdateringsdato ge datetime'{floor}'"
     attempts = 0
-    collected: list[dict[str, object]] = []
+    partial: list[dict[str, object]] = []
     while True:
         try:
             result = client.scan(name, filter=expr, max_pages=max_pages)
-            collected.extend(result.records)
-            if attempts:
-                # Merge records from a prior cursor-precision failure with the
-                # completed restart; IDs are deduplicated deterministically.
-                result = ScanResult(_merge_rows(tuple(collected)), result.metadata)
-            return result, collected, "complete"
+            # A restarted, complete snapshot is authoritative. Partial pages
+            # from a precision-conflicted attempt are deliberately discarded.
+            status = "complete_after_precision_retry" if attempts else "complete"
+            return result, list(result.records), status
         except ODataPageError as exc:
-            collected.extend(exc.partial_result.records)
+            partial.extend(exc.partial_result.records)
             precision_conflict = isinstance(exc.cause, ODataPaginationError) and any(
                 marker in str(exc.cause)
                 for marker in ("cursor did not advance", "exceeded the captured upper bound")
@@ -97,9 +65,9 @@ def _scan(client: ODataClient, name: str, floor: str, max_pages: int, precision_
             if precision_conflict and attempts < precision_retries:
                 attempts += 1
                 continue
-            return None, collected, f"incomplete: {type(exc.cause).__name__ if exc.cause else 'page_error'}"
+            return None, partial, f"incomplete: {type(exc.cause).__name__ if exc.cause else 'page_error'}"
         except ODataError as exc:
-            return None, collected, f"failed: {type(exc).__name__}"
+            return None, partial, f"failed: {type(exc).__name__}"
 
 
 def _collect_refs(client: ODataClient, entity: str, ids: list[int], field: str) -> tuple[list[dict[str, object]], bool]:
@@ -128,20 +96,26 @@ def _affected_cases(client: ODataClient, changes: Mapping[str, tuple[dict[str, o
     for entity in ("Sagstrin", "SagDokument"):
         for row in changes.get(entity, ()):
             if isinstance(row.get("sagid"), int): cases.add(int(row["sagid"]))
-            else: diagnostics.append(asdict(Diagnostic("unresolved_case_reference", entity, "sagid is missing or null", row.get("id") if isinstance(row.get("id"), int) else None)))
+            else: diagnostics.append({**asdict(Diagnostic("unresolved_case_reference", entity, "sagid is missing or null", row.get("id") if isinstance(row.get("id"), int) else None)), "blocking": True})
     doc_ids = sorted({int(row["id"]) for row in changes.get("Dokument", ()) if isinstance(row.get("id"), int)})
     linked, ok = _collect_refs(client, "SagDokument", doc_ids, "dokumentid")
     complete = complete and ok
+    if not ok:
+        diagnostics.append({**asdict(Diagnostic("relationship_resolution_failed", "SagDokument", "document-to-case reverse lookup failed")), "blocking": True})
     cases.update(int(row["sagid"]) for row in linked if isinstance(row.get("sagid"), int))
     stage_ids = sorted({int(row["sagstrinid"]) for row in changes.get("Afstemning", ()) if isinstance(row.get("sagstrinid"), int)})
     if any(row.get("sagstrinid") is None for row in changes.get("Afstemning", ())):
-        diagnostics.append(asdict(Diagnostic("unresolved_vote", "Afstemning", "vote has null sagstrinid; case cannot be identified")))
+        diagnostics.append({**asdict(Diagnostic("unresolved_vote", "Afstemning", "vote has null sagstrinid; case cannot be identified")), "blocking": False})
     stages, ok = _collect_refs(client, "Sagstrin", stage_ids, "id")
     complete = complete and ok
+    if not ok:
+        diagnostics.append({**asdict(Diagnostic("relationship_resolution_failed", "Sagstrin", "vote-to-case stage lookup failed")), "blocking": True})
     cases.update(int(row["sagid"]) for row in stages if isinstance(row.get("sagid"), int))
     status_ids = sorted({int(row["id"]) for row in changes.get("Sagsstatus", ()) if isinstance(row.get("id"), int)})
     sags, ok = _collect_refs(client, "Sag", status_ids, "statusid")
     complete = complete and ok
+    if not ok:
+        diagnostics.append({**asdict(Diagnostic("relationship_resolution_failed", "Sag", "status-to-case lookup failed")), "blocking": True})
     cases.update(int(row["id"]) for row in sags if isinstance(row.get("id"), int))
     return cases, diagnostics, complete
 
@@ -159,7 +133,7 @@ def collect(client: ODataClient, *, mode: str, checkpoints: Mapping[str, Cursor]
     for name in sorted(COLLECTIONS):
         cp = supplied.get(name)
         fallback_days = days if mode == "historical" or cp is None else 0
-        floor = _floor(fallback_days, overlap_hours if cp is not None or mode == "historical" else 0)
+        floor = _floor(fallback_days, overlap_hours)
         if cp is not None:
             # Subtract overlap from the source timestamp's whole-second part;
             # preserve its original fractional precision verbatim.
@@ -172,11 +146,11 @@ def collect(client: ODataClient, *, mode: str, checkpoints: Mapping[str, Cursor]
         changes[name] = tuple(rows)
         upper = result.metadata.upper_bound if result else None
         upper_payload = {"timestamp": upper.timestamp, "id": upper.entity_id} if upper else None
-        candidate_cursor = max((cursor for cursor in (upper, cp) if cursor is not None), key=_cursor_key, default=None)
-        candidate = {"timestamp": candidate_cursor.timestamp, "id": candidate_cursor.entity_id} if candidate_cursor and stream_complete else None
-        streams[name] = StreamResult(status, result.metadata.page_count if result else 0, len(rows), stream_complete, upper_payload, candidate if stream_complete else None)
+        streams[name] = StreamResult(status, result.metadata.page_count if result else 0, len(rows), stream_complete, upper_payload)
         if not stream_complete:
-            diagnostics.append(asdict(Diagnostic("stream_scan_incomplete", name, status)))
+            diagnostics.append({**asdict(Diagnostic("stream_scan_incomplete", name, status)), "blocking": True})
+        elif status == "complete_after_precision_retry":
+            diagnostics.append({**asdict(Diagnostic("precision_retry_recovered", name, "discarded partial attempt; restarted scan completed")), "blocking": False})
     affected, relation_diagnostics, relations_complete = _affected_cases(client, changes)
     diagnostics.extend(relation_diagnostics)
     ok_all = ok_all and relations_complete
@@ -186,9 +160,9 @@ def collect(client: ODataClient, *, mode: str, checkpoints: Mapping[str, Cursor]
         if hydrated.case is not None:
             payload = hydrated.case.to_dict()
             payload["historical"] = mode == "historical"
-            payload["notify_eligible"] = False
+            payload["notify_eligible"] = False if mode == "historical" else None
             cases.append(payload)
-        diagnostics.extend(asdict(item) for item in hydrated.diagnostics)
+        diagnostics.extend({**asdict(item), "blocking": True} for item in hydrated.diagnostics)
         ok_all = ok_all and hydrated.complete
     return {
         "mode": mode,
@@ -196,9 +170,10 @@ def collect(client: ODataClient, *, mode: str, checkpoints: Mapping[str, Cursor]
         "historical": mode == "historical",
         "cases": cases,
         "streams": {name: asdict(streams[name]) for name in sorted(streams)},
-        "candidate_checkpoints": {name: stream.candidate_checkpoint for name, stream in sorted(streams.items()) if stream.candidate_checkpoint is not None},
+        "committable_checkpoints": {},
+        "checkpoint_note": "Checkpoints require successful durable persistence; this collector does not persist.",
         "diagnostics": diagnostics,
-        "complete": ok_all and not diagnostics,
+        "complete": ok_all and not any(item.get("blocking", True) for item in diagnostics),
     }
 
 
