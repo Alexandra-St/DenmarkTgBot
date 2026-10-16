@@ -8,16 +8,16 @@ const keyboard = (...rows: InlineKeyboardMarkup["inline_keyboard"]): InlineKeybo
 
 export function languageKeyboard(language: Language): InlineKeyboardMarkup {
   return keyboard(
-    [{ text: "🇺🇦 Українська", callback_data: "lang:uk" }],
-    [{ text: "🇷🇺 Русский", callback_data: "lang:ru" }],
+    [{ text: "Українська", callback_data: "lang:uk" }],
+    [{ text: "Русский", callback_data: "lang:ru" }],
     [{ text: t(language, "main"), callback_data: "nav:main" }],
   );
 }
 
 export function settingsLanguageKeyboard(language: Language): InlineKeyboardMarkup {
   return keyboard(
-    [{ text: "🇺🇦 Українська", callback_data: "lang:uk" }],
-    [{ text: "🇷🇺 Русский", callback_data: "lang:ru" }],
+    [{ text: "Українська", callback_data: "lang:uk" }],
+    [{ text: "Русский", callback_data: "lang:ru" }],
     [{ text: t(language, "back"), callback_data: "nav:settings" }],
     [{ text: t(language, "main"), callback_data: "nav:main" }],
   );

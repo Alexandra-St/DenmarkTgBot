@@ -4,6 +4,7 @@ import worker from "../src/index.ts";
 import { handleTelegramUpdate } from "../src/bot/handlers/webhook.ts";
 import { D1UserRepository, type Language, type UserPreferences, type UserRepository } from "../src/database/users.ts";
 import { TelegramApi, type TelegramClient } from "../src/bot/telegram.ts";
+import { languageKeyboard, settingsLanguageKeyboard } from "../src/bot/keyboards/index.ts";
 
 class MemoryRepository implements UserRepository {
   readonly users = new Map<number, UserPreferences>();
@@ -102,6 +103,14 @@ test("new user sees language selection; both language selections persist with de
     const telegram = new MemoryTelegram();
     await handleTelegramUpdate(message(id, "/start"), repo, telegram);
     assert.match(telegram.sent[0].text, /Оберіть мову|Выберите язык/);
+    const languageButtons = (telegram.sent[0].keyboard as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    }).inline_keyboard;
+    assert.deepEqual(languageButtons.slice(0, 2).map((row) => row[0]), [
+      { text: "Українська", callback_data: "lang:uk" },
+      { text: "Русский", callback_data: "lang:ru" },
+    ]);
+    assert.ok(languageButtons.flat().every((button) => !/[🇺🇦🇷🇺]/u.test(button.text)));
     assert.deepEqual(repo.users.size, 0);
     await handleTelegramUpdate(callback(id, `lang:${language}`), repo, telegram);
     assert.equal(repo.users.get(id)?.language, language);
@@ -109,6 +118,14 @@ test("new user sees language selection; both language selections persist with de
     assert.equal(repo.users.get(id)?.notify_potential, 0);
     assert.match(telegram.edited.at(-1)!.text, new RegExp(menuPrompt));
     assert.equal(telegram.answered.length, 1);
+  }
+});
+
+test("language selectors in the initial menu and settings use plain language names", () => {
+  for (const markup of [languageKeyboard("uk"), settingsLanguageKeyboard("ru")]) {
+    const labels = markup.inline_keyboard.slice(0, 2).map((row) => row[0].text);
+    assert.deepEqual(labels, ["Українська", "Русский"]);
+    assert.ok(markup.inline_keyboard.flat().every((button) => !/[🇺🇦🇷🇺]/u.test(button.text)));
   }
 });
 
@@ -216,30 +233,60 @@ test("webhook rejects wrong method, missing/invalid secret, malformed JSON, and 
   assert.equal((await call("/health")).status, 200);
 });
 
-test("authenticated webhook persists new user via D1 and calls only mocked Telegram API", async () => {
+test("authenticated webhook persists both language choices, edits to main menu, and keeps /start idempotent", async () => {
   const db = new MemoryD1();
   const oldFetch = globalThis.fetch;
-  const apiCalls: string[] = [];
-  globalThis.fetch = async (input) => {
-    apiCalls.push(String(input));
+  const apiCalls: Array<{ url: string; payload: Record<string, unknown> }> = [];
+  globalThis.fetch = async (input, init) => {
+    apiCalls.push({
+      url: String(input),
+      payload: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+    });
     return Response.json({ ok: true, result: true });
   };
   try {
-    const response = await worker.fetch(
-      new Request("https://local/telegram/webhook", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Telegram-Bot-Api-Secret-Token": "test-secret",
-        },
-        body: JSON.stringify(callback(600, "lang:uk")),
-      }),
-      { DB: db as never, TELEGRAM_WEBHOOK_SECRET: "test-secret", TELEGRAM_BOT_TOKEN: "test-token" },
-    );
-    assert.equal(response.status, 200);
-    assert.equal(db.users.get(600)?.language, "uk");
-    assert.equal(apiCalls.length, 2);
-    assert.ok(apiCalls.every((url) => url.startsWith("https://api.telegram.org/bottest-token/")));
+    const env = {
+      DB: db as never,
+      TELEGRAM_WEBHOOK_SECRET: "test-secret",
+      TELEGRAM_BOT_TOKEN: "test-token",
+    };
+    for (const [id, language, menuText] of [
+      [600, "uk", "Оберіть розділ"],
+      [601, "ru", "Выберите раздел"],
+    ] as const) {
+      const response = await worker.fetch(
+        new Request("https://local/telegram/webhook", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Telegram-Bot-Api-Secret-Token": "test-secret",
+          },
+          body: JSON.stringify(callback(id, `lang:${language}`)),
+        }),
+        env,
+      );
+      assert.equal(response.status, 200);
+      assert.equal(db.users.get(id)?.language, language);
+      assert.match(String(apiCalls.at(-1)?.payload.text), new RegExp(menuText));
+      assert.equal(apiCalls.at(-1)?.url.endsWith("/editMessageText"), true);
+
+      for (let count = 0; count < 2; count += 1) {
+        const startResponse = await worker.fetch(
+          new Request("https://local/telegram/webhook", {
+            method: "POST",
+            headers: { "X-Telegram-Bot-Api-Secret-Token": "test-secret" },
+            body: JSON.stringify(message(id, "/start")),
+          }),
+          env,
+        );
+        assert.equal(startResponse.status, 200);
+        assert.match(String(apiCalls.at(-1)?.payload.text), new RegExp(menuText));
+        assert.equal(apiCalls.at(-1)?.url.endsWith("/sendMessage"), true);
+      }
+    }
+    assert.equal(db.users.size, 2);
+    assert.equal(apiCalls.length, 8);
+    assert.ok(apiCalls.every(({ url }) => url.startsWith("https://api.telegram.org/bottest-token/")));
   } finally {
     globalThis.fetch = oldFetch;
   }
