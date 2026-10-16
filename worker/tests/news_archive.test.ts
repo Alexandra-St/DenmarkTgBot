@@ -89,8 +89,8 @@ test("News and Archive read only complete relevant records from local D1", async
 
     const users = new D1UserRepository(db);
     const localized = [
-      { id: 9001, language: "uk" as const, newsHeading: "Публікації з останньої доступної вибірки", archiveHeading: "Архів публікацій", empty: "У цій категорії поки немає публікацій", titleLabel: "Оригінальна назва" },
-      { id: 9002, language: "ru" as const, newsHeading: "Публикации из последней доступной выборки", archiveHeading: "Архив публикаций", empty: "В этой категории пока нет публикаций", titleLabel: "Оригинальное название" },
+      { id: 9001, language: "uk" as const, newsHeading: "Новини", archiveHeading: "Архів публікацій", empty: "У цій категорії поки немає публікацій", titleLabel: "Оригінальна назва" },
+      { id: 9002, language: "ru" as const, newsHeading: "Новости", archiveHeading: "Архив публикаций", empty: "В этой категории пока нет публикаций", titleLabel: "Оригинальное название" },
     ];
     await users.create(9002, "ru");
     for (const fixture of localized) {
@@ -99,9 +99,13 @@ test("News and Archive read only complete relevant records from local D1", async
 
       await click("menu:news");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.newsHeading));
-      assert.match(telegram.edited.at(-1)!.text, /не обов’язково нові|не обязательно новые/u);
+      assert.match(telegram.edited.at(-1)!.text, /не обов’язково нові або нещодавно опубліковані|не обязательно новые или недавно опубликованные/u);
+      assert.match(telegram.edited.at(-1)!.text, /датою оновлення джерелом|дате обновления источником/u);
+      assert.match(telegram.edited.at(-1)!.text, /доступні в боті офіційні публікації|доступные в боте официальные публикации/u);
+      assert.match(telegram.edited.at(-1)!.text, /ті самі записи|одни и те же записи/u);
       assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
       assert.match(telegram.edited.at(-1)!.text, /Danish title/);
+      assert.ok(Array.from(telegram.edited.at(-1)!.text).length <= 4096, "News fits Telegram message limit");
       let markup = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data?: string }>> };
       assert.equal(markup.inline_keyboard.flat().filter((button) => button.callback_data?.startsWith("pub:d:")).length, 5);
       assert.ok(markup.inline_keyboard.flat().every((button) => !button.callback_data || new TextEncoder().encode(button.callback_data).length <= 64));
@@ -123,6 +127,7 @@ test("News and Archive read only complete relevant records from local D1", async
       assert.equal((telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ url?: string }>> }).inline_keyboard.flat().some((button) => button.url), false, "non-official URL is never exposed");
       await click("news:page:9999");
       assert.match(telegram.edited.at(-1)!.text, /Наразі немає публікацій для показу|Сейчас нет публикаций для показа/u);
+      assert.match(telegram.edited.at(-1)!.text, /датою оновлення джерелом|дате обновления источником/u);
       assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
       await click("news:page:1");
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
@@ -131,17 +136,23 @@ test("News and Archive read only complete relevant records from local D1", async
 
       await click("menu:archive");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.archiveHeading));
-      assert.match(telegram.edited.at(-1)!.text, /не обов’язково нові|не обязательно новые/u);
+      assert.match(telegram.edited.at(-1)!.text, /Усі публікації, що стосуються теми|Все публикации по теме/u);
+      assert.match(telegram.edited.at(-1)!.text, /🟢 DIRECT/u);
+      assert.match(telegram.edited.at(-1)!.text, /🟡 POTENTIAL/u);
+      assert.match(telegram.edited.at(-1)!.text, /ті самі записи|одни и те же записи/u);
+      assert.ok(Array.from(telegram.edited.at(-1)!.text).length <= 4096, "Archive fits Telegram message limit");
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
       const filterButton = (name: string) => markup.inline_keyboard.flat().find((button) => button.callback_data === `archive:filter:${name}:0`)!.callback_data!;
+      assert.ok(markup.inline_keyboard.flat().some((button) => button.text === "🟢 DIRECT"));
+      assert.ok(markup.inline_keyboard.flat().some((button) => button.text === "🟡 POTENTIAL"));
       await click(filterButton("direct"));
-      assert.ok(telegram.edited.at(-1)!.text.includes("🟢"));
-      assert.equal(telegram.edited.at(-1)!.text.includes("🟡"), false, "DIRECT filter excludes POTENTIAL entries");
+      let publicationRows = telegram.edited.at(-1)!.text.split("\n").filter((line) => /^[🟢🟡] Danish title/u.test(line));
+      assert.ok(publicationRows.length > 0 && publicationRows.every((line) => line.startsWith("🟢")), "DIRECT filter excludes POTENTIAL entries");
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
       assert.ok(markup.inline_keyboard.flat().some((button) => button.callback_data === "archive:filter:potential:0"));
       await click("archive:filter:potential:0");
-      assert.ok(telegram.edited.at(-1)!.text.includes("🟡"));
-      assert.equal(telegram.edited.at(-1)!.text.includes("🟢"), false, "POTENTIAL filter excludes DIRECT entries");
+      publicationRows = telegram.edited.at(-1)!.text.split("\n").filter((line) => /^[🟢🟡] Danish title/u.test(line));
+      assert.ok(publicationRows.length > 0 && publicationRows.every((line) => line.startsWith("🟡")), "POTENTIAL filter excludes DIRECT entries");
       await click("archive:filter:all:0");
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
       await click(markup.inline_keyboard.flat().find((button) => button.text.includes("➡️"))!.callback_data!);
@@ -159,6 +170,8 @@ test("News and Archive read only complete relevant records from local D1", async
 
       await click("archive:page:potential:9999");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.empty));
+      assert.match(telegram.edited.at(-1)!.text, /🟢 DIRECT/u);
+      assert.match(telegram.edited.at(-1)!.text, /🟡 POTENTIAL/u);
       assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
       await click("pub:d:999:news:all:0");
       assert.match(telegram.edited.at(-1)!.text, /більше не знайдено|больше не найдена/u);

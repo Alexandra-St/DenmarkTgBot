@@ -174,19 +174,26 @@ test("explicit preference callbacks are idempotent and DIRECT/POTENTIAL stay ind
 });
 
 test("About and unknown callbacks are handled in selected language", async () => {
-  const repo = new MemoryRepository();
-  const telegram = new MemoryTelegram();
-  await handleTelegramUpdate(callback(400, "lang:ru"), repo, telegram);
-  await handleTelegramUpdate(callback(400, "menu:news"), repo, telegram);
-  assert.match(telegram.edited.at(-1)!.text, /Мониторинг ещё не запущен/);
-  await handleTelegramUpdate(callback(400, "menu:about"), repo, telegram);
-  assert.match(telegram.edited.at(-1)!.text, /Høringsportalen/);
-  assert.match(telegram.edited.at(-1)!.text, /Folketinget ещё ожидается/);
-  assert.match(telegram.edited.at(-1)!.text, /Мониторинг и уведомления отключены/);
-  const count = telegram.edited.length;
-  await handleTelegramUpdate(callback(400, "future:unknown"), repo, telegram);
-  assert.equal(telegram.edited.length, count);
-  assert.equal(telegram.answered.length, 4);
+  for (const [id, language, expected] of [
+    [400, "ru", [/бесплатный информационный бот/, /Høringsportalen/, /Folketinget ещё не собраны/, /мониторинг и уведомления не включены/, /Telegram ID/, /не является юридической консультацией/]],
+    [401, "uk", [/безкоштовний інформаційний бот/, /Høringsportalen/, /Folketinget ще не зібрані/, /моніторинг і сповіщення не ввімкнені/, /Telegram ID/, /не є юридичною консультацією/]],
+  ] as const) {
+    const repo = new MemoryRepository();
+    const telegram = new MemoryTelegram();
+    await handleTelegramUpdate(callback(id, `lang:${language}`), repo, telegram);
+    await handleTelegramUpdate(callback(id, "menu:about"), repo, telegram);
+    const about = telegram.edited.at(-1)!.text;
+    for (const phrase of expected) assert.match(about, phrase);
+    assert.ok(Array.from(about).length <= 4096, "About screen fits Telegram message limit");
+    assert.deepEqual(
+      [repo.users.get(id)?.notify_direct, repo.users.get(id)?.notify_potential],
+      [1, 0],
+      "About does not change notification preferences",
+    );
+    const count = telegram.edited.length;
+    await handleTelegramUpdate(callback(id, "future:unknown"), repo, telegram);
+    assert.equal(telegram.edited.length, count);
+  }
 });
 
 test("D1 repository uses the existing user fields and independent defaults", async () => {

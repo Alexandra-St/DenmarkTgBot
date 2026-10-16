@@ -84,7 +84,7 @@ export async function publicationListScreen(
   const intro = context.kind === "news" ? t(language, "latestTrackedDescription") : t(language, "archiveDescription");
   const text = items.length
     ? `${heading}\n\n${intro}\n\n${t(language, "publicationListNotice")}\n\n${items.map((item) => itemText(item, language)).join("\n\n")}`
-    : `${heading}\n\n${context.kind === "news" ? t(language, "newsEmpty") : t(language, "archiveEmpty")}\n\n${t(language, "publicationListNotice")}`;
+    : `${heading}\n\n${intro}\n\n${context.kind === "news" ? t(language, "newsEmpty") : t(language, "archiveEmpty")}\n\n${t(language, "publicationListNotice")}`;
   return {
     text,
     keyboard: publicationListKeyboard(language, items, page.hasNext, context),
