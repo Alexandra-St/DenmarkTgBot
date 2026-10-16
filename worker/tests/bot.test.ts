@@ -14,10 +14,11 @@ class MemoryRepository implements UserRepository {
   async find(id: number): Promise<UserPreferences | null> {
     return this.users.get(id) ?? null;
   }
-  async create(id: number, language: Language): Promise<void> {
-    if (this.users.has(id)) return;
+  async create(id: number, language: Language): Promise<boolean> {
+    if (this.users.has(id)) return false;
     this.creates += 1;
     this.users.set(id, { telegram_id: id, language, notify_direct: 1, notify_potential: 0 });
+    return true;
   }
   async updateLanguage(id: number, language: Language): Promise<void> {
     const user = this.users.get(id);
@@ -57,21 +58,22 @@ class MemoryD1 {
     const statement = {
       bind(...args: unknown[]) { values = args; return statement; },
       async first() {
-        if (!sql.startsWith("SELECT")) throw new Error("Unexpected query");
-        return thisDb.users.get(Number(values[0])) ?? null;
-      },
-      async run() {
+        if (sql.startsWith("SELECT")) return thisDb.users.get(Number(values[0])) ?? null;
         if (sql.startsWith("INSERT INTO users")) {
           const id = Number(values[0]);
-          if (!thisDb.users.has(id)) {
-            thisDb.users.set(id, {
-              telegram_id: id,
-              language: values[1] as Language,
-              notify_direct: 1,
-              notify_potential: 0,
-            });
-          }
-        } else if (sql.startsWith("UPDATE users SET language")) {
+          if (thisDb.users.has(id)) return null;
+          thisDb.users.set(id, {
+            telegram_id: id,
+            language: values[1] as Language,
+            notify_direct: 1,
+            notify_potential: 0,
+          });
+          return { telegram_id: id };
+        }
+        throw new Error("Unexpected query");
+      },
+      async run() {
+        if (sql.startsWith("UPDATE users SET language")) {
           const user = thisDb.users.get(Number(values[2]));
           if (user) user.language = values[0] as Language;
         } else if (sql.includes("notify_direct = ?")) {
@@ -101,7 +103,7 @@ const callback = (id: number, data: string) => ({
   },
 });
 
-test("new user sees language selection; both language selections persist with defaults", async () => {
+test("first language selection sends localized first-time welcome and then main menu", async () => {
   for (const [id, language, menuPrompt] of [
     [101, "uk", "Оберіть розділ"],
     [102, "ru", "Выберите раздел"],
@@ -123,6 +125,12 @@ test("new user sees language selection; both language selections persist with de
     assert.equal(repo.users.get(id)?.language, language);
     assert.equal(repo.users.get(id)?.notify_direct, 1);
     assert.equal(repo.users.get(id)?.notify_potential, 0);
+    const welcome = telegram.sent.at(-1)!.text;
+    assert.match(welcome, language === "uk" ? /Вітаємо в DenmarkBot/u : /Добро пожаловать в DenmarkBot/u);
+    assert.match(welcome, language === "uk" ? /Høringsportalen/u : /Høringsportalen/u);
+    assert.match(welcome, language === "uk" ? /Folketinget ще розробляється/u : /Folketinget ещё разрабатывается/u);
+    assert.match(welcome, language === "uk" ? /Сповіщення поки тестуються й не надсилаються/u : /Уведомления пока тестируются и не отправляются/u);
+    assert.ok(welcome.length < 4096);
     assert.match(telegram.edited.at(-1)!.text, new RegExp(menuPrompt));
     assert.equal(telegram.answered.length, 1);
   }
@@ -144,8 +152,39 @@ test("repeated start does not duplicate users and returning users retain languag
   await handleTelegramUpdate(message(200, "/start"), repo, telegram);
   await handleTelegramUpdate(message(200, "/start@DenmarkForUABot"), repo, telegram);
   assert.equal(repo.creates, 1);
-  assert.equal(telegram.sent.length, 2);
-  assert.match(telegram.sent[0].text, /Выберите раздел/);
+  assert.equal(telegram.sent.length, 3);
+  assert.equal(telegram.sent.filter(({ text }) => text.includes("Добро пожаловать")).length, 1);
+  assert.match(telegram.sent.at(-1)!.text, /Выберите раздел/);
+});
+
+test("existing users and Settings language changes never receive first-time welcome", async () => {
+  const repo = new MemoryRepository();
+  const telegram = new MemoryTelegram();
+  repo.users.set(249, { telegram_id: 249, language: "ru", notify_direct: 0, notify_potential: 1 });
+  await handleTelegramUpdate(message(249, "/start"), repo, telegram);
+  await handleTelegramUpdate(callback(249, "lang:uk"), repo, telegram);
+  assert.equal(telegram.sent.some(({ text }) => text.includes("Добро пожаловать в DenmarkBot") || text.includes("Вітаємо в DenmarkBot")), false);
+  assert.deepEqual(repo.users.get(249), { telegram_id: 249, language: "uk", notify_direct: 0, notify_potential: 1 });
+
+  await handleTelegramUpdate(callback(250, "lang:uk"), repo, telegram);
+  const before = { ...repo.users.get(250)! };
+  await handleTelegramUpdate(callback(250, "lang:ru"), repo, telegram);
+  assert.equal(telegram.sent.filter(({ text }) => text.includes("Вітаємо в DenmarkBot")).length, 1);
+  assert.equal(repo.users.get(250)?.language, "ru");
+  assert.equal(repo.users.get(250)?.notify_direct, before.notify_direct);
+  assert.equal(repo.users.get(250)?.notify_potential, before.notify_potential);
+  assert.match(telegram.edited.at(-1)!.text, /Настройки/);
+});
+
+test("concurrent duplicate first language callbacks only send one welcome", async () => {
+  const repo = new MemoryRepository();
+  const telegram = new MemoryTelegram();
+  await Promise.all([
+    handleTelegramUpdate(callback(251, "lang:ru"), repo, telegram),
+    handleTelegramUpdate(callback(251, "lang:ru"), repo, telegram),
+  ]);
+  assert.equal(repo.creates, 1);
+  assert.equal(telegram.sent.filter(({ text }) => text.includes("Добро пожаловать в DenmarkBot")).length, 1);
 });
 
 test("explicit preference callbacks are idempotent and DIRECT/POTENTIAL stay independent", async () => {
@@ -315,7 +354,7 @@ test("authenticated webhook persists both language choices, edits to main menu, 
       }
     }
     assert.equal(db.users.size, 2);
-    assert.equal(apiCalls.length, 8);
+    assert.equal(apiCalls.length, 10);
     assert.ok(apiCalls.every(({ url }) => url.startsWith("https://api.telegram.org/bottest-token/")));
   } finally {
     globalThis.fetch = oldFetch;

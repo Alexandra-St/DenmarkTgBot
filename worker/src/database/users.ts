@@ -9,7 +9,7 @@ export interface UserPreferences {
 
 export interface UserRepository {
   find(telegramId: number): Promise<UserPreferences | null>;
-  create(telegramId: number, language: Language): Promise<void>;
+  create(telegramId: number, language: Language): Promise<boolean>;
   updateLanguage(telegramId: number, language: Language): Promise<void>;
   updateNotification(telegramId: number, preference: "direct" | "potential", enabled: boolean): Promise<void>;
 }
@@ -28,14 +28,15 @@ export class D1UserRepository implements UserRepository {
       .first<UserPreferences>();
   }
 
-  async create(telegramId: number, language: Language): Promise<void> {
+  async create(telegramId: number, language: Language): Promise<boolean> {
     const timestamp = new Date().toISOString();
-    await this.db
+    const inserted = await this.db
       .prepare(
-        "INSERT INTO users (telegram_id, language, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (telegram_id) DO NOTHING",
+        "INSERT INTO users (telegram_id, language, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (telegram_id) DO NOTHING RETURNING telegram_id",
       )
       .bind(telegramId, language, timestamp, timestamp)
-      .run();
+      .first<{ telegram_id: number }>();
+    return inserted !== null;
   }
 
   async updateLanguage(telegramId: number, language: Language): Promise<void> {

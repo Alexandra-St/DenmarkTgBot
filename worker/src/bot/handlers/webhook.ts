@@ -143,8 +143,10 @@ async function processCallback(
         settingsKeyboard(language),
       ));
     } else {
-      await repository.create(callback.from.id, language);
-      await showMain(telegram, message.chat.id, language, message.message_id, t(language, "languageSaved"), metrics);
+      const created = await repository.create(callback.from.id, language);
+      if (created) await telegram.sendMessage(message.chat.id, t(language, "firstTimeWelcome"));
+      else await repository.updateLanguage(callback.from.id, language);
+      await showMain(telegram, message.chat.id, language, message.message_id, undefined, metrics);
     }
     return;
   }
