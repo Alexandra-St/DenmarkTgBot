@@ -340,3 +340,99 @@ test("unrelated Telegram API failures produce a retryable webhook error", async 
     globalThis.fetch = oldFetch;
   }
 });
+
+test("callback acknowledgement runs concurrently with D1 and UI work and emits redacted timing", async () => {
+  const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const repository = new MemoryRepository();
+  repository.users.set(701, { telegram_id: 701, language: "uk", notify_direct: 1, notify_potential: 0 });
+  const telegram = new MemoryTelegram();
+  let acknowledgementFinished = false;
+  let editFinishedBeforeAcknowledgement = false;
+  telegram.answerCallback = async (id: string) => {
+    await delay(90);
+    telegram.answered.push(id);
+    acknowledgementFinished = true;
+  };
+  telegram.editMessage = async (chatId, messageId, text, keyboard) => {
+    await delay(15);
+    telegram.edited.push({ chatId, messageId, text, keyboard });
+    editFinishedBeforeAcknowledgement = !acknowledgementFinished;
+  };
+  const slowRepository: UserRepository = {
+    ...repository,
+    find: async (id) => {
+      await delay(30);
+      return repository.find(id);
+    },
+    create: repository.create.bind(repository),
+    updateLanguage: repository.updateLanguage.bind(repository),
+    updateNotification: repository.updateNotification.bind(repository),
+  };
+  const originalInfo = console.info;
+  const logLines: string[] = [];
+  console.info = (value?: unknown) => { logLines.push(String(value)); };
+  const baselineStarted = performance.now();
+  await telegram.answerCallback("baseline-callback");
+  await slowRepository.find(701);
+  await telegram.editMessage(701, 10, "baseline", undefined);
+  const sequentialBaselineMs = performance.now() - baselineStarted;
+  acknowledgementFinished = false;
+  editFinishedBeforeAcknowledgement = false;
+  telegram.answered.length = 0;
+  telegram.edited.length = 0;
+  const started = performance.now();
+  try {
+    await handleTelegramUpdate(callback(701, "nav:main"), slowRepository, telegram);
+  } finally {
+    console.info = originalInfo;
+  }
+  const totalMs = performance.now() - started;
+  assert.equal(editFinishedBeforeAcknowledgement, true);
+  assert.equal(telegram.answered.length, 1);
+  assert.equal(telegram.edited.length, 1);
+  // The old sequential path would take roughly 90 + 30 + 15 ms.
+  assert.ok(totalMs < sequentialBaselineMs - 25,
+    `expected overlap: sequential=${sequentialBaselineMs.toFixed(1)} ms, concurrent=${totalMs.toFixed(1)} ms`);
+  assert.equal(logLines.length, 1);
+  const metric = JSON.parse(logLines[0]) as Record<string, unknown>;
+  assert.equal(metric.event, "telegram_callback_timing");
+  assert.equal(metric.route, "menu");
+  for (const field of ["callback_ack_ms", "user_lookup_ms", "publication_lookup_ms", "telegram_edit_ms", "total_ms"]) {
+    assert.equal(typeof metric[field], "number");
+  }
+  assert.equal(metric.success, "success");
+  assert.doesNotMatch(logLines[0], /callback-701|nav:main|test-token|telegram_id|chat_id/);
+});
+
+test("Telegram API requests have bounded abort signals and transient write failures are not retried", async () => {
+  const oldFetch = globalThis.fetch;
+  let calls = 0;
+  let boundedSignal = false;
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    boundedSignal = init?.signal instanceof AbortSignal;
+    return Response.json({ ok: false, error_code: 503, description: "temporary failure" }, { status: 503 });
+  };
+  try {
+    const telegram = new TelegramApi("not-a-real-token");
+    await assert.rejects(() => telegram.editMessage(1, 2, "content"), /temporary failure/);
+    assert.equal(calls, 1);
+    assert.equal(boundedSignal, true);
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("rapid repeated navigation callbacks edit the existing message without sending duplicates", async () => {
+  const repository = new MemoryRepository();
+  repository.users.set(702, { telegram_id: 702, language: "ru", notify_direct: 1, notify_potential: 0 });
+  const telegram = new MemoryTelegram();
+  await Promise.all([
+    handleTelegramUpdate(callback(702, "nav:main"), repository, telegram),
+    handleTelegramUpdate(callback(702, "nav:main"), repository, telegram),
+  ]);
+  assert.equal(telegram.answered.length, 2);
+  assert.equal(telegram.edited.length, 2);
+  assert.equal(telegram.sent.length, 0);
+  assert.ok(telegram.edited.every(({ text }) => text.includes("Выберите раздел")));
+});

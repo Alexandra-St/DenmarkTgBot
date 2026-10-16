@@ -31,6 +31,9 @@ export class TelegramApi implements TelegramClient {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      // Callback answers expire quickly; keep other Telegram writes bounded too.
+      // Do not retry writes: an ambiguous timeout could otherwise duplicate them.
+      signal: AbortSignal.timeout(method === "answerCallbackQuery" ? 3_000 : 8_000),
     });
     let result: { ok?: boolean; error_code?: number; description?: string };
     try {
