@@ -45,10 +45,17 @@ export function notificationKeyboard(
   direct: boolean,
   potential: boolean,
 ): InlineKeyboardMarkup {
-  const mark = (enabled: boolean) => t(language, enabled ? "enabled" : "disabled");
+  const directAction = direct ? "disableDirect" : "enableDirect";
+  const potentialAction = potential ? "disablePotential" : "enablePotential";
   return keyboard(
-    [{ text: `${mark(direct)} ${t(language, "direct")}`, callback_data: "notify:direct" }],
-    [{ text: `${mark(potential)} ${t(language, "potential")}`, callback_data: "notify:potential" }],
+    [{
+      text: `${direct ? "✅" : "⬜"} ${t(language, directAction)}`,
+      callback_data: `notify:direct:set:${direct ? 0 : 1}`,
+    }],
+    [{
+      text: `${potential ? "✅" : "⬜"} ${t(language, potentialAction)}`,
+      callback_data: `notify:potential:set:${potential ? 0 : 1}`,
+    }],
     [{ text: t(language, "back"), callback_data: "nav:settings" }],
   );
 }

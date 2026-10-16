@@ -37,6 +37,20 @@ function notificationText(user: UserPreferences, language: Language): string {
   return `${t(language, "notificationsTitle")}\n\n${direct} ${t(language, "direct")}\n${potential} ${t(language, "potential")}`;
 }
 
+async function showNotificationSettings(
+  telegram: TelegramClient,
+  chatId: number,
+  messageId: number,
+  user: UserPreferences,
+): Promise<void> {
+  await telegram.editMessage(
+    chatId,
+    messageId,
+    notificationText(user, user.language),
+    notificationKeyboard(user.language, Boolean(user.notify_direct), Boolean(user.notify_potential)),
+  );
+}
+
 async function handleStart(
   message: TelegramMessage,
   repository: UserRepository,
@@ -114,24 +128,17 @@ async function handleCallback(
       settingsLanguageKeyboard(language),
     );
   } else if (data === "settings:notifications") {
-    await telegram.editMessage(
-      message.chat.id,
-      message.message_id,
-      notificationText(user, language),
-      notificationKeyboard(language, Boolean(user.notify_direct), Boolean(user.notify_potential)),
-    );
-  } else if (data === "notify:direct" || data === "notify:potential") {
-    const preference = data.slice("notify:".length) as "direct" | "potential";
-    const current = preference === "direct" ? Boolean(user.notify_direct) : Boolean(user.notify_potential);
-    await repository.updateNotification(callback.from.id, preference, !current);
+    await showNotificationSettings(telegram, message.chat.id, message.message_id, user);
+  } else if (data.startsWith("notify:")) {
+    const target = /^notify:(direct|potential):set:([01])$/.exec(data);
+    if (target) {
+      const preference = target[1] as "direct" | "potential";
+      await repository.updateNotification(callback.from.id, preference, target[2] === "1");
+    }
+    // Legacy toggle payloads and malformed/stale notification callbacks only refresh the view.
     const updated = await repository.find(callback.from.id);
     if (!updated) throw new Error("User disappeared after preference update");
-    await telegram.editMessage(
-      message.chat.id,
-      message.message_id,
-      notificationText(updated, language),
-      notificationKeyboard(language, Boolean(updated.notify_direct), Boolean(updated.notify_potential)),
-    );
+    await showNotificationSettings(telegram, message.chat.id, message.message_id, updated);
   } else if (data === "menu:news" || data === "menu:archive") {
     await telegram.editMessage(
       message.chat.id,

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import worker from "../src/index.ts";
 import { handleTelegramUpdate } from "../src/bot/handlers/webhook.ts";
 import { D1UserRepository, type Language, type UserPreferences, type UserRepository } from "../src/database/users.ts";
-import type { TelegramClient } from "../src/bot/telegram.ts";
+import { TelegramApi, type TelegramClient } from "../src/bot/telegram.ts";
 
 class MemoryRepository implements UserRepository {
   readonly users = new Map<number, UserPreferences>();
@@ -55,13 +55,14 @@ class MemoryD1 {
       async run() {
         if (sql.startsWith("INSERT INTO users")) {
           const id = Number(values[0]);
-          if (thisDb.users.has(id)) throw new Error("duplicate");
-          thisDb.users.set(id, {
-            telegram_id: id,
-            language: values[1] as Language,
-            notify_direct: 1,
-            notify_potential: 0,
-          });
+          if (!thisDb.users.has(id)) {
+            thisDb.users.set(id, {
+              telegram_id: id,
+              language: values[1] as Language,
+              notify_direct: 1,
+              notify_potential: 0,
+            });
+          }
         } else if (sql.startsWith("UPDATE users SET language")) {
           const user = thisDb.users.get(Number(values[2]));
           if (user) user.language = values[0] as Language;
@@ -115,6 +116,7 @@ test("repeated start does not duplicate users and returning users retain languag
   const repo = new MemoryRepository();
   const telegram = new MemoryTelegram();
   await handleTelegramUpdate(callback(200, "lang:ru"), repo, telegram);
+  await handleTelegramUpdate(callback(200, "lang:ru"), repo, telegram);
   await handleTelegramUpdate(message(200, "/start"), repo, telegram);
   await handleTelegramUpdate(message(200, "/start@DenmarkForUABot"), repo, telegram);
   assert.equal(repo.creates, 1);
@@ -122,14 +124,27 @@ test("repeated start does not duplicate users and returning users retain languag
   assert.match(telegram.sent[0].text, /Выберите раздел/);
 });
 
-test("settings change language and toggle preferences independently", async () => {
+test("explicit preference callbacks are idempotent and DIRECT/POTENTIAL stay independent", async () => {
   const repo = new MemoryRepository();
   const telegram = new MemoryTelegram();
   await handleTelegramUpdate(callback(300, "lang:uk"), repo, telegram);
-  await handleTelegramUpdate(callback(300, "notify:potential"), repo, telegram);
+  await handleTelegramUpdate(callback(300, "settings:notifications"), repo, telegram);
+  const buttons = telegram.edited.at(-1)!.keyboard as {
+    inline_keyboard: Array<Array<{ callback_data?: string }>>;
+  };
+  assert.equal(buttons.inline_keyboard[0][0].callback_data, "notify:direct:set:0");
+  assert.equal(buttons.inline_keyboard[1][0].callback_data, "notify:potential:set:1");
+  await handleTelegramUpdate(callback(300, "notify:potential:set:1"), repo, telegram);
+  await handleTelegramUpdate(callback(300, "notify:potential:set:1"), repo, telegram);
   assert.deepEqual(
     [repo.users.get(300)?.notify_direct, repo.users.get(300)?.notify_potential],
     [1, 1],
+  );
+  await handleTelegramUpdate(callback(300, "notify:direct:set:0"), repo, telegram);
+  await handleTelegramUpdate(callback(300, "notify:direct:set:0"), repo, telegram);
+  assert.deepEqual(
+    [repo.users.get(300)?.notify_direct, repo.users.get(300)?.notify_potential],
+    [0, 1],
   );
   await handleTelegramUpdate(callback(300, "notify:direct"), repo, telegram);
   assert.deepEqual(
@@ -225,6 +240,53 @@ test("authenticated webhook persists new user via D1 and calls only mocked Teleg
     assert.equal(db.users.get(600)?.language, "uk");
     assert.equal(apiCalls.length, 2);
     assert.ok(apiCalls.every((url) => url.startsWith("https://api.telegram.org/bottest-token/")));
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("Telegram unchanged-message and expired-ack errors are harmless; other errors remain failures", async () => {
+  const oldFetch = globalThis.fetch;
+  let description = "";
+  globalThis.fetch = async () => Response.json(
+    { ok: false, error_code: 400, description },
+    { status: 400 },
+  );
+  try {
+    const telegram = new TelegramApi("not-a-real-token");
+    description = "Bad Request: message is not modified";
+    await telegram.editMessage(1, 2, "same");
+    description = "Bad Request: query is too old and response timeout expired or query ID is invalid";
+    await telegram.answerCallback("expired-callback");
+    description = "Bad Request: message can't be edited";
+    await assert.rejects(() => telegram.editMessage(1, 2, "same"), /message can't be edited/);
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("unrelated Telegram API failures produce a retryable webhook error", async () => {
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith("/answerCallbackQuery")) return Response.json({ ok: true, result: true });
+    return Response.json(
+      { ok: false, error_code: 400, description: "Bad Request: chat not found" },
+      { status: 400 },
+    );
+  };
+  try {
+    const db = new MemoryD1();
+    db.users.set(700, { telegram_id: 700, language: "uk", notify_direct: 1, notify_potential: 0 });
+    const response = await worker.fetch(
+      new Request("https://local/telegram/webhook", {
+        method: "POST",
+        headers: { "X-Telegram-Bot-Api-Secret-Token": "test-secret" },
+        body: JSON.stringify(callback(700, "menu:about")),
+      }),
+      { DB: db as never, TELEGRAM_WEBHOOK_SECRET: "test-secret", TELEGRAM_BOT_TOKEN: "not-a-real-token" },
+    );
+    assert.equal(response.status, 500);
+    assert.doesNotMatch(await response.text(), /not-a-real-token/);
   } finally {
     globalThis.fetch = oldFetch;
   }
