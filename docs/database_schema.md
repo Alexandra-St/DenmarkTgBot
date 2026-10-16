@@ -8,7 +8,7 @@
 | `sources` | Справочник источников с уникальным `code`; миграция добавляет `folketinget` и `hoeringsportalen`. |
 | `publications` | Снимок публикации; уникальность `(source_id, external_id)`, внешний ID сохраняется как текст. `relevance`: `DIRECT`, `POTENTIAL`, `IRRELEVANT`. |
 | `publication_events` | История событий с уникальным `event_key`; `notify_eligible=0` позволяет импортировать историю без уведомлений. |
-| `notifications` | Очередь доставки с уникальностью `(telegram_id, event_id)` и статусами `PENDING`, `SENT`, `FAILED`. |
+| `notifications` | Очередь доставки с уникальностью `(telegram_id, event_id)` и статусами `PENDING`, `SENDING`, `SENT`, `FAILED` (`SENDING` добавлен миграцией 0005 для атомарного claim). |
 | `source_states` | Независимый checkpoint на каждую пару `(source_id, stream_key)`. |
 | `source_ingestion_baselines` | Источник допускается к incremental-синхронизации только после атомарного успешного COMMITTED historical-запуска. |
 | `ingestion_runs` | Жизненный цикл импорта, базовые/предложенные checkpoints, счётчики, блокировки и итоговый статус. Частичный уникальный индекс разрешает только один незавершённый запуск на источник. |

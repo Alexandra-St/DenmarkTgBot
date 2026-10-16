@@ -1,10 +1,10 @@
 # Local notification pipeline
 
-This phase adds a local-only pipeline. It is not connected to the webhook, a scheduled trigger, or production D1. Delivery is disabled unless a caller explicitly sets NOTIFICATION_DELIVERY_ENABLED=true; no current application route invokes it.
+The notification pipeline is connected to protected internal Worker routes, but remains disabled by default. It is not connected to the Telegram webhook or scheduled workflow. No production configuration or database was changed in this phase.
 
 ## Eligibility and queueing
 
-prepareNotificationQueue creates PENDING rows from publication_events only when:
+The authenticated `POST /internal/notifications/prepare` route accepts a run ID and creates PENDING rows only for events whose keys belong to that specific ingestion run. It first verifies that D1 records the run as `COMMITTED` and `incremental`; historical, open, blocked, and unrelated runs cannot create queue rows. It also requires `NOTIFICATION_QUEUE_ENABLED=true`. The queue function then creates PENDING rows only when:
 
 - NOTIFICATION_ACTIVATION_CUTOFF is a valid UTC ISO timestamp and has been reached;
 - the event was detected strictly after that cutoff and within the last seven days;
@@ -13,7 +13,7 @@ prepareNotificationQueue creates PENDING rows from publication_events only when:
 
 Høringsportalen FIRST_SEEN is explicitly excluded even if a row is accidentally marked eligible. An official updated_at timestamp is never used as evidence of publication freshness. Missing, malformed, or future cutoff values fail closed. Queue creation uses the existing (telegram_id, event_id) uniqueness and ON CONFLICT DO NOTHING, so repeated preparation does not create duplicate rows.
 
-The activation cutoff is a manual future policy value, not a setting activated by this phase. Existing preferences are read only.
+`NOTIFICATION_ACTIVATION_CUTOFF` is the queue activation cutoff. Queue creation is disabled unless its separate enable flag is exactly `true` and the cutoff is valid and reached. Missing, malformed, or future values fail closed. Existing preferences are read only.
 
 ## Local integration verification
 
@@ -23,7 +23,7 @@ Migration 0005 is also tested from an empty database and against the previous sc
 
 ## Delivery and message content
 
-The separate deliverPendingNotifications component uses a Telegram client interface so local tests use mocks. It rechecks the activation cutoff, freshness, event eligibility, publication history/completeness, category preference, and Høringsportalen first-seen restriction immediately before sending. It validates official HTTPS hosts and fails closed for unknown event types or invalid URLs.
+The authenticated `POST /internal/notifications/deliver` route uses the existing bounded-timeout Telegram API client. It requires `NOTIFICATION_DELIVERY_ENABLED=true` and a distinct valid `NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF`; both are absent by default. The delivery component rechecks freshness, event eligibility, publication history/completeness, category preference, and Høringsportalen first-seen restriction immediately before sending. It validates official HTTPS hosts and fails closed for unknown event types or invalid URLs.
 
 Messages are localized in Ukrainian or Russian and include the relevance marker, change description, publication title, official source, official URL, and a legal-information disclaimer. Status changes include old and new statuses. The copy reports a first detection as “first detected by the bot,” never as newly published.
 
@@ -35,9 +35,11 @@ Telegram sendMessage and D1 status persistence cannot form one transaction. If T
 
 ## Future monitoring sequence
 
-The future sequence is: official Høringsportalen feeds → collection of both feeds → validation, deduplication, and ruleset 1.1 classification → bounded incremental ingestion → semantic change detection → idempotent notification queue → separately gated Telegram delivery. The current GitHub Actions workflow is manual only; the queue and delivery functions are not integrated into it or into Worker routes.
+The future sequence is: official Høringsportalen feeds → collection of both feeds → validation, deduplication, and ruleset 1.1 classification → bounded incremental ingestion → semantic change detection → idempotent notification queue → separately gated Telegram delivery. The current GitHub Actions workflow remains separately gated; it does not call the notification queue or delivery routes. Queue preparation must be explicitly requested with a committed incremental run ID.
 
 GitHub Actions scheduled workflows are the recommended free starting point, with a proposed three runs per day at minute 17 (17 6,14,22 * * * UTC). This cadence is a proposal only; no schedule was enabled. Keep the existing concurrency group and ten-minute timeout. Three maximum-length runs per day would use up to 930 minutes in a 31-day month. GitHub Free currently includes 2,000 standard-runner minutes monthly for private repositories, while standard hosted runners are free for public repositories; verify account usage and budget before enabling a schedule. GitHub notes scheduled runs may be delayed or dropped under high load, especially near the hour ([billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions), [schedule limitations](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)).
 
 
-Before any future production activation, review the activation cutoff, migration state, categories, stale-event window, stuck SENDING recovery procedure, and an explicit manual delivery enablement. No scheduling or production delivery is enabled by this phase.
+`GET /internal/notifications/preview` is authenticated with the existing ingestion bearer token. It returns aggregate event/recipient counts by category and historical/stale suppression counts; it never returns identities or writes queue/status rows. With missing or invalid queue activation cutoff it returns zero eligible counts and `activation_configured: false`.
+
+Migration 0005 adds the `SENDING` claim state and has local compatibility coverage from both empty schema and preexisting records. It has not been applied to production by this phase. Before any future production activation, review the migration state, activation cutoffs, categories, stale-event window, stuck SENDING recovery procedure, and separate queue/delivery enable flags. No scheduling or production delivery is enabled by this phase.

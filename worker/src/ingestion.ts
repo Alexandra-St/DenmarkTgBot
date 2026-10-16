@@ -35,7 +35,7 @@ function tokenMatches(expected: string, supplied: string): boolean {
   return mismatch === 0;
 }
 
-async function authorized(request: Request, env: IngestEnv): Promise<boolean> {
+export async function isIngestionRequestAuthorized(request: Request, env: IngestEnv): Promise<boolean> {
   const expected = env.INGEST_API_TOKEN;
   const match = /^Bearer ([^\s]+)$/.exec(request.headers.get("Authorization") ?? "");
   return Boolean(expected && match && tokenMatches(expected, match[1]));
@@ -217,7 +217,7 @@ function validateCheckpoints(value: unknown, source: SourceCode, base: Record<st
 }
 
 async function ingest(request: Request, env: IngestEnv): Promise<Response> {
-  if (!await authorized(request, env)) return json({ error: "unauthorized" }, 401);
+  if (!await isIngestionRequestAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
   try {
     const body = await readJson(request);
     if (!object(body) || !string(body.action, 20)) throw new RequestError(400, "invalid_request");
@@ -231,7 +231,7 @@ async function ingest(request: Request, env: IngestEnv): Promise<Response> {
 }
 
 async function sourceStates(request: Request, env: IngestEnv): Promise<Response> {
-  if (!await authorized(request, env)) return json({ error: "unauthorized" }, 401);
+  if (!await isIngestionRequestAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
   try {
     const source = new URL(request.url).searchParams.get("source");
     if (source !== "folketinget" && source !== "hoeringsportalen") throw new RequestError(400, "invalid_source");

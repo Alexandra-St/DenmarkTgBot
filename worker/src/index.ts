@@ -3,13 +3,18 @@ import { TelegramApi } from "./bot/telegram.ts";
 import { D1UserRepository } from "./database/users.ts";
 import { D1PublicationRepository } from "./database/publications.ts";
 import type { TelegramUpdate } from "./types/telegram.ts";
-import { handleIngestionRequest, handleSourceStatesRequest } from "./ingestion.ts";
+import { handleIngestionRequest, handleSourceStatesRequest, isIngestionRequestAuthorized } from "./ingestion.ts";
+import { deliverPendingNotifications, prepareNotificationQueue, previewNotifications, type NotificationEnv } from "./notifications.ts";
 
 interface Env {
   DB: D1Database;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   INGEST_API_TOKEN?: string;
+  NOTIFICATION_QUEUE_ENABLED?: string;
+  NOTIFICATION_ACTIVATION_CUTOFF?: string;
+  NOTIFICATION_DELIVERY_ENABLED?: string;
+  NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF?: string;
 }
 
 const json = (body: unknown, status = 200): Response =>
@@ -37,6 +42,33 @@ export default {
 
     if (url.pathname === "/internal/ingest") return handleIngestionRequest(request, env);
     if (url.pathname === "/internal/source-states") return handleSourceStatesRequest(request, env);
+    if (url.pathname.startsWith("/internal/notifications/")) {
+      if (!await isIngestionRequestAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
+      const notificationEnv = env as Env & NotificationEnv;
+      if (url.pathname === "/internal/notifications/preview") {
+        if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
+        return json(await previewNotifications(notificationEnv));
+      }
+      if (url.pathname === "/internal/notifications/prepare") {
+        if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        let body: unknown;
+        try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+        if (!body || typeof body !== "object" || typeof (body as { run_id?: unknown }).run_id !== "string") {
+          return json({ error: "invalid_run_id" }, 400);
+        }
+        return json(await prepareNotificationQueue(notificationEnv, (body as { run_id: string }).run_id));
+      }
+      if (url.pathname === "/internal/notifications/deliver") {
+        if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        if (env.NOTIFICATION_DELIVERY_ENABLED !== "true" || !env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF) {
+          return json({ enabled: false, sent: 0, failed: 0 });
+        }
+        if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "delivery_not_configured" }, 503);
+        const result = await deliverPendingNotifications(notificationEnv, new TelegramApi(env.TELEGRAM_BOT_TOKEN));
+        return json(result);
+      }
+      return json({ error: "Not Found" }, 404);
+    }
 
     if (url.pathname !== "/telegram/webhook") return json({ error: "Not Found" }, 404);
     if (request.method !== "POST") return json({ error: "Method Not Allowed" }, 405);

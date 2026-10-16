@@ -6,8 +6,11 @@ const MAX_EVENT_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface NotificationEnv {
   DB: D1Database;
+  INGEST_API_TOKEN?: string;
+  NOTIFICATION_QUEUE_ENABLED?: string;
   NOTIFICATION_ACTIVATION_CUTOFF?: string;
   NOTIFICATION_DELIVERY_ENABLED?: string;
+  NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF?: string;
 }
 
 export interface NotificationTelegramClient {
@@ -28,13 +31,20 @@ function activationCutoff(value: string | undefined): Date | null {
   return parsed;
 }
 
-/** Create durable pending rows only after an explicit activation cutoff is configured and reached. */
+/** Queue only events produced by a confirmed incremental ingestion run. */
 export async function prepareNotificationQueue(
   env: NotificationEnv,
+  runId: string,
   now = new Date(),
 ): Promise<NotificationQueueResult> {
+  if (env.NOTIFICATION_QUEUE_ENABLED !== "true") return { eligible: false, queued: 0 };
   const cutoff = activationCutoff(env.NOTIFICATION_ACTIVATION_CUTOFF);
-  if (!cutoff || now.getTime() < cutoff.getTime()) return { eligible: false, queued: 0 };
+  if (!cutoff || now.getTime() < cutoff.getTime() || !/^[0-9a-f-]{36}$/iu.test(runId)) {
+    return { eligible: false, queued: 0 };
+  }
+  const run = await env.DB.prepare("SELECT run_id FROM ingestion_runs WHERE run_id = ? AND mode = 'incremental' AND status = 'COMMITTED'")
+    .bind(runId).first<{ run_id: string }>();
+  if (!run) return { eligible: false, queued: 0 };
 
   const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
   const result = await env.DB.prepare(`
@@ -45,7 +55,8 @@ export async function prepareNotificationQueue(
     JOIN sources s ON s.id = p.source_id
     JOIN users u ON (p.relevance = 'DIRECT' AND u.notify_direct = 1)
       OR (p.relevance = 'POTENTIAL' AND u.notify_potential = 1)
-    WHERE e.notify_eligible = 1
+    WHERE e.event_key LIKE ?
+      AND e.notify_eligible = 1
       AND p.historical = 0
       AND p.source_complete = 1
       AND p.relevance IN ('DIRECT', 'POTENTIAL')
@@ -56,9 +67,83 @@ export async function prepareNotificationQueue(
         SELECT 1 FROM notifications n WHERE n.telegram_id = u.telegram_id AND n.event_id = e.id
       )
     ON CONFLICT (telegram_id, event_id) DO NOTHING
-  `).bind(now.toISOString(), cutoff.toISOString(), staleBefore).run();
+  `).bind(now.toISOString(), `ingest:${runId}:%`, cutoff.toISOString(), staleBefore).run();
 
   return { eligible: true, queued: result.meta.changes ?? 0 };
+}
+
+export interface NotificationPreview {
+  activation_configured: boolean;
+  eligible_events: number;
+  estimated_recipients: number;
+  direct_events: number;
+  potential_events: number;
+  direct_recipients: number;
+  potential_recipients: number;
+  suppressed_historical_events: number;
+  suppressed_stale_events: number;
+}
+
+/** Aggregate-only read path: never queues records or exposes account identifiers. */
+export async function previewNotifications(env: NotificationEnv, now = new Date()): Promise<NotificationPreview> {
+  const cutoff = activationCutoff(env.NOTIFICATION_ACTIVATION_CUTOFF);
+  const activationActive = Boolean(cutoff && now.getTime() >= cutoff.getTime());
+  const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
+  const cutoffValue = cutoff?.toISOString() ?? "";
+  const row = await env.DB.prepare(`
+    WITH candidates AS (
+      SELECT p.relevance, p.historical, p.source_complete, e.notify_eligible,
+        e.detected_at, e.event_type, s.code AS source_code,
+        (SELECT COUNT(*) FROM users u WHERE
+          (p.relevance = 'DIRECT' AND u.notify_direct = 1) OR
+          (p.relevance = 'POTENTIAL' AND u.notify_potential = 1)) AS recipient_count
+      FROM publication_events e
+      JOIN publications p ON p.id = e.publication_id
+      JOIN sources s ON s.id = p.source_id
+    )
+    SELECT
+      COALESCE(SUM(CASE WHEN historical = 1 THEN 1 ELSE 0 END), 0) AS suppressed_historical_events,
+      COALESCE(SUM(CASE WHEN historical = 0 AND notify_eligible = 1 AND source_complete = 1
+        AND relevance IN ('DIRECT', 'POTENTIAL') AND detected_at < ? THEN 1 ELSE 0 END), 0) AS suppressed_stale_events,
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+        AND relevance IN ('DIRECT', 'POTENTIAL') AND detected_at > ? AND detected_at >= ?
+        AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN 1 ELSE 0 END), 0) AS eligible_events,
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+        AND relevance IN ('DIRECT', 'POTENTIAL') AND detected_at > ? AND detected_at >= ?
+        AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN recipient_count ELSE 0 END), 0) AS estimated_recipients,
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+        AND relevance = 'DIRECT' AND detected_at > ? AND detected_at >= ?
+        AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN 1 ELSE 0 END), 0) AS direct_events,
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+        AND relevance = 'POTENTIAL' AND detected_at > ? AND detected_at >= ?
+        AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN 1 ELSE 0 END), 0) AS potential_events,
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+        AND relevance = 'DIRECT' AND detected_at > ? AND detected_at >= ?
+        AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN recipient_count ELSE 0 END), 0) AS direct_recipients,
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+        AND relevance = 'POTENTIAL' AND detected_at > ? AND detected_at >= ?
+        AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN recipient_count ELSE 0 END), 0) AS potential_recipients
+    FROM candidates
+  `).bind(
+    staleBefore,
+    activationActive ? 1 : 0, cutoffValue, staleBefore,
+    activationActive ? 1 : 0, cutoffValue, staleBefore,
+    activationActive ? 1 : 0, cutoffValue, staleBefore,
+    activationActive ? 1 : 0, cutoffValue, staleBefore,
+    activationActive ? 1 : 0, cutoffValue, staleBefore,
+    activationActive ? 1 : 0, cutoffValue, staleBefore,
+  ).first<Omit<NotificationPreview, "activation_configured">>();
+  return {
+    activation_configured: activationActive,
+    eligible_events: row?.eligible_events ?? 0,
+    estimated_recipients: row?.estimated_recipients ?? 0,
+    direct_events: row?.direct_events ?? 0,
+    potential_events: row?.potential_events ?? 0,
+    direct_recipients: row?.direct_recipients ?? 0,
+    potential_recipients: row?.potential_recipients ?? 0,
+    suppressed_historical_events: row?.suppressed_historical_events ?? 0,
+    suppressed_stale_events: row?.suppressed_stale_events ?? 0,
+  };
 }
 
 interface PendingNotification {
@@ -134,7 +219,7 @@ export async function deliverPendingNotifications(
   now = new Date(),
 ): Promise<DeliveryResult> {
   if (env.NOTIFICATION_DELIVERY_ENABLED !== "true") return { enabled: false, sent: 0, failed: 0 };
-  const cutoff = activationCutoff(env.NOTIFICATION_ACTIVATION_CUTOFF);
+  const cutoff = activationCutoff(env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF);
   if (!cutoff || now.getTime() < cutoff.getTime()) return { enabled: false, sent: 0, failed: 0 };
   const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
   const rows = await env.DB.prepare(`
