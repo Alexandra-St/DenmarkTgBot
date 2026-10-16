@@ -2,5 +2,13 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "denmarktgbot",
   "main": "src/index.ts",
-  "compatibility_date": "2026-10-16"
+  "compatibility_date": "2026-10-16",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "denmarktgbot-db",
+      "database_id": "local",
+      "migrations_dir": "migrations"
+    }
+  ]
 }
