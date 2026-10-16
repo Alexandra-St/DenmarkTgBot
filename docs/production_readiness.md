@@ -32,7 +32,7 @@ Post-deployment read-only D1 checks confirmed the original user/source counts an
 1. Run the local checks from the repository root: `python3 -m unittest discover -s tests -v`, then from `worker/`: `npm run typecheck` and `npm test`. All checks passed before deployment (119 Python tests, 23 Worker tests, typecheck passed).
 2. Keep the first collection manually initiated. Collect both sources, inspect completeness and diagnostics, and run uploader `--dry-run` before any write.
 3. Run historical mode first for each source independently. Do not run incremental mode until that source's historical run reports `COMMITTED` and `checkpoints_advanced: true`; D1 enforces this order. Historical records/events remain ineligible for notifications.
-4. Do not schedule collection or enable notification delivery in this phase. The ingestion token is ready, but no import has been run.
+4. The Høringsportalen GitHub Actions cron is configured for 06:17, 14:17 and 22:17 UTC, protected by `HOERINGSPORTALEN_AUTOMATION_ENABLED`; verify the current repository variable before relying on whether scheduled writes are active. Notification queue and delivery remain separate and disabled by default in checked-in Wrangler configuration.
 
 ## Historical-first import
 
@@ -63,7 +63,7 @@ Do not continue to incremental collection unless both historical imports are com
 
 - Before each run, save collector output and review `complete`, stream/feed status, diagnostics, and proposed record/batch counts. Use uploader `--dry-run` first; it performs no writes.
 - After upload, require `status=COMMITTED`, expected processed/accepted counts, and `checkpoints_advanced=true`. Inspect source states and baseline rows through authenticated read-only queries before scheduling any future automation.
-- Keep the first production run manually initiated. There is no scheduler or notification delivery in this phase.
+- The scheduled Høringsportalen workflow is configured and remains controlled by its repository automation gate. Notification delivery is separate and is not invoked by ingestion.
 - `cleanup` defaults to dry-run. Only old `COMMITTED`/`ABORTED` staging and batch rows are eligible; it retains run audit rows and never removes `BLOCKED`/active runs, publications, events, notifications, or checkpoints. Require a reviewed dry-run before any explicit deletion.
 - A source or staging failure leaves checkpoints unchanged. Diagnose and resume the same run; do not reset D1 or manually advance cursors.
 

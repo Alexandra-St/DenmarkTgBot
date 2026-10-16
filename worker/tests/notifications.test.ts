@@ -219,6 +219,10 @@ test("notification preview route uses ingestion authorization and never exposes 
     const fetch = worker.fetch as unknown as (request: Request, env: typeof env) => Promise<Response>;
     const unauthorized = await fetch(new Request("https://local.test/internal/notifications/preview"), env);
     assert.equal(unauthorized.status, 401);
+    const queueUnauthenticated = await fetch(new Request("https://local.test/internal/notifications/prepare", { method: "POST" }), env);
+    assert.equal(queueUnauthenticated.status, 401);
+    const deliveryUnauthenticated = await fetch(new Request("https://local.test/internal/notifications/deliver", { method: "POST" }), env);
+    assert.equal(deliveryUnauthenticated.status, 401);
     const authorized = await fetch(new Request("https://local.test/internal/notifications/preview", {
       headers: { Authorization: "Bearer local-only" },
     }), env);
@@ -289,6 +293,15 @@ test("delivery remains disabled by default; success is recorded once through a m
     let calls = 0;
     const mock = { async sendMessage(_id: number, text: string) { calls += 1; assert.match(text, /Test publication deliver/u); } };
     assert.deepEqual(await deliverPendingNotifications({ DB: db as never }, mock), { enabled: false, sent: 0, failed: 0 });
+    assert.deepEqual(await deliverPendingNotifications({
+      DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_ACTIVATION_CUTOFF: cutoff,
+    }, mock, now), { enabled: false, sent: 0, failed: 0 }, "queue cutoff does not activate delivery");
+    assert.deepEqual(await deliverPendingNotifications({
+      DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: "invalid",
+    }, mock, now), { enabled: false, sent: 0, failed: 0 });
+    assert.deepEqual(await deliverPendingNotifications({
+      DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: "2026-10-17T00:00:00Z",
+    }, mock, now), { enabled: false, sent: 0, failed: 0 });
     assert.equal(calls, 0);
 
     const result = await deliverPendingNotifications({
