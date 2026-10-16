@@ -4,7 +4,7 @@
 
 The collector-to-Worker flow passed locally against a temporary Wrangler D1 database. The local run applied migrations `0001`–`0004`, imported historical fixture records for both sources, then accepted an incremental Folketinget run. A first incremental run is rejected until that source has a committed historical baseline.
 
-Production has **not** been checked or changed in this phase. The checked-in `worker/wrangler.jsonc` points to Worker `denmarktgbot` and D1 `denmarktgbot-db` (`1bbb417b-2b54-4f77-85ec-d3b94be9c0c8`). It contains no `INGEST_API_TOKEN` binding. Do not assume the production migration state or token configuration: both need operator verification. No Cloudflare deployment, remote migration, source collection, Telegram call, or secret change was performed.
+Production migration inventory was checked read-only on 2026-10-16. Wrangler reported `0002_ingestion.sql`, `0003_ingestion_safety.sql`, and `0004_historical_baseline_gate.sql` as pending; `SELECT name FROM d1_migrations` returned only `0001_initial_schema.sql`. Therefore `0001` is applied and `0002`–`0004` are pending. The checked-in `worker/wrangler.jsonc` points to Worker `denmarktgbot` and D1 `denmarktgbot-db` (`1bbb417b-2b54-4f77-85ec-d3b94be9c0c8`). It contains no `INGEST_API_TOKEN` binding; the secret's presence is not confirmed. No production data was modified: no migration was applied, Worker deployed, source collected, Telegram call made, or secret changed.
 
 ## Before any production run
 
@@ -18,13 +18,14 @@ Production has **not** been checked or changed in this phase. The checked-in `wo
    npm test
    ```
 
-3. From `worker/`, inspect the remote migration inventory. This is read-only:
+3. From `worker/`, recheck the remote migration inventory immediately before any approved change. These are read-only commands:
 
    ```sh
    npx wrangler d1 migrations list denmarktgbot-db --remote
+   npx wrangler d1 execute denmarktgbot-db --remote --command "SELECT name FROM d1_migrations ORDER BY name"
    ```
 
-   Confirm `0001`–`0003` are applied and `0004_historical_baseline_gate.sql` is pending. Stop if the inventory differs; do not recreate the database or rerun applied migrations.
+   Verified on 2026-10-16: `0001_initial_schema.sql` is applied; `0002_ingestion.sql`, `0003_ingestion_safety.sql`, and `0004_historical_baseline_gate.sql` are pending. Wrangler's list output shows pending migrations; the read-only query confirms the applied migration names. Stop if a fresh inventory differs. Do not recreate the database or edit the migration history.
 
 4. Back up the existing D1 database to a restricted location and verify the export exists before continuing. Do not place it in the repository:
 
@@ -32,7 +33,7 @@ Production has **not** been checked or changed in this phase. The checked-in `wo
    npx wrangler d1 export denmarktgbot-db --remote --output=/secure/backups/denmarktgbot-before-ingestion-baseline.sql
    ```
 
-5. Apply only the pending migration, after the backup and change approval:
+5. After reviewing the three pending migration files and getting explicit change approval, apply the pending migrations in order. Wrangler applies the migration files that remain pending:
 
    ```sh
    npx wrangler d1 migrations apply denmarktgbot-db --remote
