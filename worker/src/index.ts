@@ -2,11 +2,13 @@ import { handleTelegramUpdate } from "./bot/handlers/webhook.ts";
 import { TelegramApi } from "./bot/telegram.ts";
 import { D1UserRepository } from "./database/users.ts";
 import type { TelegramUpdate } from "./types/telegram.ts";
+import { handleIngestionRequest, handleSourceStatesRequest } from "./ingestion.ts";
 
 interface Env {
   DB: D1Database;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
+  INGEST_API_TOKEN?: string;
 }
 
 const json = (body: unknown, status = 200): Response =>
@@ -31,6 +33,9 @@ export default {
     if (url.pathname === "/health" && request.method === "GET") {
       return json({ status: "ok", service: "DenmarkTgBot" });
     }
+
+    if (url.pathname === "/internal/ingest") return handleIngestionRequest(request, env);
+    if (url.pathname === "/internal/source-states") return handleSourceStatesRequest(request, env);
 
     if (url.pathname !== "/telegram/webhook") return json({ error: "Not Found" }, 404);
     if (request.method !== "POST") return json({ error: "Method Not Allowed" }, 405);

@@ -1,0 +1,453 @@
+type SourceCode = "folketinget" | "hoeringsportalen";
+type Relevance = "DIRECT" | "POTENTIAL" | "IRRELEVANT";
+type JsonObject = Record<string, unknown>;
+
+interface IngestEnv { DB: D1Database; INGEST_API_TOKEN?: string }
+interface Cursor { timestamp: string; id: number }
+interface PublicationInput {
+  source: SourceCode; external_id: string; title: string; url: string;
+  relevance: Relevance; relevance_reason: string; ruleset_version: string;
+  status: string | null; publication_type: string | null; published_at: string | null;
+  source_updated_at: string | null; source_updated_at_raw: string | null;
+  historical: boolean; notification_blocked: boolean; complete: boolean;
+  diagnostics: unknown[]; source_metadata: JsonObject; normalized_snapshot: JsonObject;
+}
+
+const ODA_STREAMS = ["Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"] as const;
+const HEARING_FEEDS = ["immigration_ministry", "immigration_category"] as const;
+const MAX_BODY_BYTES = 256 * 1024;
+const MAX_BATCH_RECORDS = 50;
+const COMMIT_RECORDS = 20;
+const MAX_RUN_BATCHES = 200;
+
+const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), {
+  status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+});
+
+function tokenMatches(expected: string, supplied: string): boolean {
+  const a = new TextEncoder().encode(expected);
+  const b = new TextEncoder().encode(supplied);
+  let mismatch = a.length ^ b.length;
+  mismatch |= Number(a.length > 256 || b.length > 256);
+  for (let index = 0; index < 256; index += 1) mismatch |= (a[index] ?? 0) ^ (b[index] ?? 0);
+  return mismatch === 0;
+}
+
+async function authorized(request: Request, env: IngestEnv): Promise<boolean> {
+  const expected = env.INGEST_API_TOKEN;
+  const match = /^Bearer ([^\s]+)$/.exec(request.headers.get("Authorization") ?? "");
+  return Boolean(expected && match && tokenMatches(expected, match[1]));
+}
+
+class RequestError extends Error {
+  readonly status: number;
+  readonly code: string;
+  constructor(status: number, code: string) { super(code); this.status = status; this.code = code; }
+}
+
+async function readJson(request: Request): Promise<unknown> {
+  const length = request.headers.get("Content-Length");
+  if (length && (!/^\d+$/.test(length) || Number(length) > MAX_BODY_BYTES)) throw new RequestError(413, "request_too_large");
+  if (!request.body) throw new RequestError(400, "invalid_json");
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const part = await reader.read();
+    if (part.done) break;
+    size += part.value.byteLength;
+    if (size > MAX_BODY_BYTES) {
+      await reader.cancel();
+      throw new RequestError(413, "request_too_large");
+    }
+    chunks.push(part.value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown; }
+  catch { throw new RequestError(400, "invalid_json"); }
+}
+
+function object(value: unknown): value is JsonObject { return typeof value === "object" && value !== null && !Array.isArray(value); }
+function string(value: unknown, max: number, empty = false): value is string {
+  return typeof value === "string" && value.length <= max && (empty || value.trim().length > 0);
+}
+function integer(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+  if (object(value)) return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
+  return JSON.stringify(value) ?? "null";
+}
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function utcTimestamp(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?(?:Z|[+-]\d\d:\d\d)$/.test(value) && !Number.isNaN(Date.parse(value));
+}
+function sourceTimestamp(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?$/.test(value) && !Number.isNaN(Date.parse(value + "Z"));
+}
+function timestampParts(value: string): [string, string] {
+  const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,7}))?$/.exec(value);
+  return [match?.[1] ?? value, (match?.[2] ?? "").padEnd(7, "0")];
+}
+function compareCursor(a: Cursor, b: Cursor, source: SourceCode): number {
+  let order: number;
+  if (source === "hoeringsportalen") order = a.timestamp.localeCompare(b.timestamp);
+  else {
+    const x = timestampParts(a.timestamp);
+    const y = timestampParts(b.timestamp);
+    order = x[0].localeCompare(y[0]) || x[1].localeCompare(y[1]);
+  }
+  return order || a.id - b.id;
+}
+function parseCursor(value: unknown, source: SourceCode): Cursor | null {
+  if (value === null) return null;
+  if (!object(value) || !integer(value.id)) throw new RequestError(400, "invalid_checkpoint");
+  const valid = source === "hoeringsportalen" ? utcTimestamp(value.timestamp) : sourceTimestamp(value.timestamp);
+  if (!valid) throw new RequestError(400, "invalid_checkpoint");
+  return { timestamp: value.timestamp as string, id: value.id };
+}
+function officialUrl(source: SourceCode, value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && (source === "folketinget"
+      ? url.hostname === "oda.ft.dk" && url.pathname.startsWith("/api/Sag(")
+      : url.hostname === "hoeringsportalen.dk" && /^\/Hearing\/Details\/\d+\/?$/i.test(url.pathname));
+  } catch { return false; }
+}
+
+function relationships(value: unknown, kind: "documents" | "stages" | "votes"): JsonObject[] {
+  if (!Array.isArray(value) || value.length > 1000) throw new RequestError(400, "invalid_snapshot");
+  const rows: JsonObject[] = [];
+  const ids = new Set<string>();
+  for (const item of value) {
+    if (!object(item) || !integer(item.id)) throw new RequestError(400, "invalid_snapshot");
+    if (kind === "documents" && item.link_id !== undefined && !integer(item.link_id)) throw new RequestError(400, "invalid_snapshot");
+    if (kind === "votes" && item.stage_id !== undefined && item.stage_id !== null && !integer(item.stage_id)) throw new RequestError(400, "invalid_snapshot");
+    for (const field of ["type_id", "status_id", "number"]) {
+      if (item[field] !== undefined && item[field] !== null && !integer(item[field])) throw new RequestError(400, "invalid_snapshot");
+    }
+    for (const field of ["date_raw", "released_at_raw", "document_released_at_raw", "source_updated_at_raw", "link_source_updated_at_raw", "conclusion", "comment"]) {
+      if (item[field] !== undefined && item[field] !== null && !string(item[field], 4000, true)) throw new RequestError(400, "invalid_snapshot");
+    }
+    for (const field of ["updated_at_utc", "link_updated_at_utc"]) {
+      if (item[field] !== undefined && item[field] !== null && !utcTimestamp(item[field])) throw new RequestError(400, "invalid_snapshot");
+    }
+    if (item.approved !== undefined && item.approved !== null && typeof item.approved !== "boolean") throw new RequestError(400, "invalid_snapshot");
+    if (item.title !== undefined && item.title !== null && !string(item.title, 4000, true)) throw new RequestError(400, "invalid_snapshot");
+    const key = kind === "documents" ? String(item.id) + ":" + String(item.link_id ?? "") : String(item.id);
+    if (ids.has(key)) throw new RequestError(400, "duplicate_relationship_id");
+    ids.add(key);
+    rows.push({ ...item });
+  }
+  rows.sort((a, b) => Number(a.id) - Number(b.id) || Number(a.link_id ?? 0) - Number(b.link_id ?? 0));
+  return rows;
+}
+
+function validatePublication(raw: unknown, source: SourceCode, mode: "historical" | "incremental"): PublicationInput {
+  if (!object(raw)) throw new RequestError(400, "invalid_publication");
+  if (raw.source !== source || typeof raw.external_id !== "string" || !/^\d{1,20}$/.test(raw.external_id)) throw new RequestError(400, "invalid_publication_id");
+  if (!string(raw.title, 4000) || !officialUrl(source, raw.url)) throw new RequestError(400, "invalid_publication_fields");
+  if (raw.relevance !== "DIRECT" && raw.relevance !== "POTENTIAL" && raw.relevance !== "IRRELEVANT") throw new RequestError(400, "invalid_relevance");
+  if (!string(raw.relevance_reason, 2000, true) || !string(raw.ruleset_version, 32) || !/^\d+\.\d+$/.test(raw.ruleset_version)) throw new RequestError(400, "invalid_classification");
+  if (raw.status !== null && !string(raw.status, 500, true)) throw new RequestError(400, "invalid_status");
+  if (raw.publication_type !== null && !string(raw.publication_type, 200, true)) throw new RequestError(400, "invalid_publication_type");
+  if (raw.published_at !== null && !utcTimestamp(raw.published_at)) throw new RequestError(400, "invalid_published_at");
+  if (raw.source_updated_at !== null && !utcTimestamp(raw.source_updated_at)) throw new RequestError(400, "invalid_source_updated_at");
+  if (raw.source_updated_at_raw !== null && !string(raw.source_updated_at_raw, 64, true)) throw new RequestError(400, "invalid_source_updated_at_raw");
+  if (typeof raw.historical !== "boolean" || raw.historical !== (mode === "historical")) throw new RequestError(400, "invalid_historical_flag");
+  if (typeof raw.notification_blocked !== "boolean" || typeof raw.complete !== "boolean") throw new RequestError(400, "invalid_completeness");
+  if (!Array.isArray(raw.diagnostics) || raw.diagnostics.length > 100 || !object(raw.source_metadata)) throw new RequestError(400, "invalid_source_metadata");
+  if (!object(raw.normalized_snapshot) || raw.normalized_snapshot.title !== raw.title) throw new RequestError(400, "invalid_snapshot");
+  const documents = relationships(raw.normalized_snapshot.documents, "documents");
+  const stages = relationships(raw.normalized_snapshot.stages, "stages");
+  const votes = relationships(raw.normalized_snapshot.votes, "votes");
+  if (source === "hoeringsportalen" && (documents.length || stages.length || votes.length)) throw new RequestError(400, "invalid_snapshot");
+  if (raw.normalized_snapshot.content_text !== undefined && raw.normalized_snapshot.content_text !== null && !string(raw.normalized_snapshot.content_text, 100_000, true)) throw new RequestError(400, "invalid_snapshot");
+  const snapshot: JsonObject = { title: raw.title, content_text: raw.normalized_snapshot.content_text ?? null, status: raw.status, publication_type: raw.publication_type, relevance: raw.relevance, documents, stages, votes };
+  if (canonical(raw.source_metadata).length > 64 * 1024 || canonical(raw.diagnostics).length > 64 * 1024 || canonical(snapshot).length > 128 * 1024) throw new RequestError(413, "publication_too_large");
+  return {
+    source, external_id: raw.external_id, title: raw.title, url: raw.url, relevance: raw.relevance,
+    relevance_reason: raw.relevance_reason, ruleset_version: raw.ruleset_version,
+    status: raw.status as string | null, publication_type: raw.publication_type as string | null,
+    published_at: raw.published_at as string | null, source_updated_at: raw.source_updated_at as string | null,
+    source_updated_at_raw: raw.source_updated_at_raw as string | null, historical: raw.historical,
+    notification_blocked: raw.notification_blocked, complete: raw.complete, diagnostics: raw.diagnostics,
+    source_metadata: raw.source_metadata, normalized_snapshot: snapshot,
+  };
+}
+
+function failure(error: unknown): Response {
+  if (error instanceof RequestError) return json({ error: error.code }, error.status);
+  return json({ error: "internal_error" }, 500);
+}
+async function getSourceId(db: D1Database, source: SourceCode): Promise<number> {
+  const row = await db.prepare("SELECT id FROM sources WHERE code = ? AND enabled = 1").bind(source).first<{ id: number }>();
+  if (!row) throw new RequestError(400, "unknown_source");
+  return row.id;
+}
+async function readStates(db: D1Database, id: number): Promise<{ base: Record<string, Cursor | null>; rows: Array<{ stream_key: string; last_success_at: string | null }> }> {
+  const result = await db.prepare("SELECT stream_key, checkpoint, last_success_at FROM source_states WHERE source_id = ? ORDER BY stream_key").bind(id).all<{ stream_key: string; checkpoint: string | null; last_success_at: string | null }>();
+  const base: Record<string, Cursor | null> = {};
+  for (const row of result.results ?? []) {
+    let value: unknown = null;
+    if (row.checkpoint !== null) { try { value = JSON.parse(row.checkpoint) as unknown; } catch { throw new RequestError(500, "source_state_corrupt"); } }
+    base[row.stream_key] = value === null ? null : parseCursor(value, row.stream_key.startsWith("immigration_") ? "hoeringsportalen" : "folketinget");
+  }
+  return { base, rows: result.results ?? [] };
+}
+function validateCheckpoints(value: unknown, source: SourceCode, base: Record<string, Cursor | null>): Record<string, Cursor | null> {
+  if (!object(value)) throw new RequestError(400, "invalid_checkpoint");
+  const keys: readonly string[] = source === "folketinget" ? ODA_STREAMS : HEARING_FEEDS;
+  if (Object.keys(value).length !== keys.length || keys.some((key) => !(key in value))) throw new RequestError(400, "invalid_checkpoint_streams");
+  const proposed: Record<string, Cursor | null> = {};
+  for (const key of keys) {
+    const next = parseCursor(value[key], source);
+    const previous = base[key] ?? null;
+    if (previous && (!next || compareCursor(next, previous, source) < 0)) throw new RequestError(409, "checkpoint_regression");
+    proposed[key] = next;
+  }
+  return proposed;
+}
+
+async function ingest(request: Request, env: IngestEnv): Promise<Response> {
+  if (!await authorized(request, env)) return json({ error: "unauthorized" }, 401);
+  try {
+    const body = await readJson(request);
+    if (!object(body) || !string(body.action, 20)) throw new RequestError(400, "invalid_request");
+    if (body.action === "start") return await startRun(body, env.DB);
+    if (body.action === "batch") return await submitBatch(body, env.DB);
+    if (body.action === "commit") return await commitRun(body, env.DB);
+    if (body.action === "abort") return await abortRun(body, env.DB);
+    throw new RequestError(400, "invalid_action");
+  } catch (error) { return failure(error); }
+}
+
+async function sourceStates(request: Request, env: IngestEnv): Promise<Response> {
+  if (!await authorized(request, env)) return json({ error: "unauthorized" }, 401);
+  try {
+    const source = new URL(request.url).searchParams.get("source");
+    if (source !== "folketinget" && source !== "hoeringsportalen") throw new RequestError(400, "invalid_source");
+    const id = await getSourceId(env.DB, source);
+    const result = await readStates(env.DB, id);
+    return json({ source, streams: result.rows.map((row) => ({ stream: row.stream_key, checkpoint: result.base[row.stream_key] ?? null, last_success_at: row.last_success_at })) });
+  } catch (error) { return failure(error); }
+}
+
+async function startRun(body: JsonObject, db: D1Database): Promise<Response> {
+  if (typeof body.run_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.run_id)) throw new RequestError(400, "invalid_run_id");
+  if (body.source !== "folketinget" && body.source !== "hoeringsportalen") throw new RequestError(400, "unknown_source");
+  const source = body.source;
+  if (body.mode !== "historical" && body.mode !== "incremental") throw new RequestError(400, "invalid_mode");
+  if (!integer(body.expected_batches) || body.expected_batches < 1 || body.expected_batches > MAX_RUN_BATCHES) throw new RequestError(400, "invalid_batch_count");
+  if (body.collection_complete !== true) throw new RequestError(409, "incomplete_collection");
+  const id = await getSourceId(db, source);
+  const current = await readStates(db, id);
+  const proposed = validateCheckpoints(body.proposed_checkpoints, source, current.base);
+  const startJson = canonical({ run_id: body.run_id, source, mode: body.mode, expected_batches: body.expected_batches, collection_complete: true, proposed_checkpoints: proposed });
+  const startHash = await sha256(startJson);
+  const oldRun = await db.prepare("SELECT status, start_request_hash, expected_batches FROM ingestion_runs WHERE run_id = ?").bind(body.run_id).first<{ status: string; start_request_hash: string; expected_batches: number }>();
+  if (oldRun) {
+    if (oldRun.start_request_hash !== startHash) throw new RequestError(409, "run_id_conflict");
+    return json({ accepted: true, run_id: body.run_id, status: oldRun.status, expected_batches: oldRun.expected_batches, idempotent: true });
+  }
+  const now = new Date().toISOString();
+  try {
+    await db.prepare("INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'OPEN', ?, ?, ?, ?, ?)")
+      .bind(body.run_id, id, body.mode, body.expected_batches, canonical(proposed), canonical(current.base), startHash, now, now).run();
+  } catch { throw new RequestError(409, "source_run_active_or_run_conflict"); }
+  return json({ accepted: true, run_id: body.run_id, status: "OPEN", expected_batches: body.expected_batches, idempotent: false }, 201);
+}
+
+async function submitBatch(body: JsonObject, db: D1Database): Promise<Response> {
+  if (typeof body.run_id !== "string" || !Array.isArray(body.records) || body.records.length > MAX_BATCH_RECORDS || !integer(body.batch_index)) throw new RequestError(400, "invalid_batch");
+  const run = await db.prepare("SELECT r.source_id, r.mode, r.status, r.expected_batches, s.code AS source FROM ingestion_runs r JOIN sources s ON s.id = r.source_id WHERE r.run_id = ?").bind(body.run_id)
+    .first<{ source_id: number; mode: "historical" | "incremental"; status: string; expected_batches: number; source: SourceCode }>();
+  if (!run) throw new RequestError(404, "run_not_found");
+  if (run.status !== "OPEN") throw new RequestError(409, "run_not_open");
+  if (body.batch_index >= run.expected_batches) throw new RequestError(400, "invalid_batch_index");
+  const pubs = body.records.map((item) => validatePublication(item, run.source, run.mode));
+  const inBatch = new Set<string>();
+  for (const pub of pubs) { if (inBatch.has(pub.external_id)) throw new RequestError(400, "duplicate_publication_in_batch"); inBatch.add(pub.external_id); }
+  const payloadHash = await sha256(canonical(pubs));
+  const existingBatch = await db.prepare("SELECT payload_hash, record_count FROM ingestion_batches WHERE run_id = ? AND batch_index = ?").bind(body.run_id, body.batch_index).first<{ payload_hash: string; record_count: number }>();
+  if (existingBatch) {
+    if (existingBatch.payload_hash !== payloadHash) throw new RequestError(409, "batch_idempotency_conflict");
+    return json({ accepted: true, run_id: body.run_id, batch_index: body.batch_index, accepted_records: existingBatch.record_count, idempotent: true });
+  }
+  const statements: D1PreparedStatement[] = [
+    db.prepare("INSERT INTO ingestion_batches (run_id, batch_index, payload_hash, record_count, accepted_at) VALUES (?, ?, ?, ?, ?)")
+      .bind(body.run_id, body.batch_index, payloadHash, pubs.length, new Date().toISOString()),
+  ];
+  let newlyStaged = 0;
+  for (const pub of pubs) {
+    const encoded = canonical(pub);
+    const recordHash = await sha256(encoded);
+    const prior = await db.prepare("SELECT payload_hash FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ?")
+      .bind(body.run_id, run.source_id, pub.external_id).first<{ payload_hash: string }>();
+    if (prior && prior.payload_hash !== recordHash) throw new RequestError(409, "publication_batch_conflict");
+    if (!prior) {
+      newlyStaged += 1;
+      statements.push(db.prepare("INSERT INTO ingestion_staging (run_id, source_id, external_id, publication_json, payload_hash, source_complete) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(body.run_id, run.source_id, pub.external_id, encoded, recordHash, pub.complete ? 1 : 0));
+    }
+  }
+  statements.push(db.prepare("UPDATE ingestion_runs SET accepted_count = accepted_count + ?, updated_at = ? WHERE run_id = ? AND status = 'OPEN'")
+    .bind(newlyStaged, new Date().toISOString(), body.run_id));
+  try { await db.batch(statements); } catch { throw new RequestError(409, "batch_conflict"); }
+  return json({ accepted: true, run_id: body.run_id, batch_index: body.batch_index, accepted_records: newlyStaged, idempotent: false }, 201);
+}
+
+function eventChanges(previous: JsonObject | null, incoming: PublicationInput): Array<{ type: string; previousStatus: string | null; newStatus: string | null; snapshot: JsonObject }> {
+  const next = incoming.normalized_snapshot;
+  if (!previous) return [{ type: "FIRST_SEEN", previousStatus: null, newStatus: incoming.status, snapshot: { current: next } }];
+  const changes: Array<{ type: string; previousStatus: string | null; newStatus: string | null; snapshot: JsonObject }> = [];
+  const compare = (type: string, before: unknown, after: unknown, oldStatus: string | null = null, newStatus: string | null = null) => {
+    if (canonical(before) !== canonical(after)) changes.push({ type, previousStatus: oldStatus, newStatus, snapshot: { previous: before ?? null, current: after ?? null } });
+  };
+  const oldStatus = typeof previous.status === "string" ? previous.status : null;
+  const newStatus = typeof next.status === "string" ? next.status : null;
+  compare("TITLE_CHANGED", previous.title, next.title);
+  compare("CONTENT_CHANGED", previous.content_text, next.content_text);
+  compare("STATUS_CHANGED", previous.status, next.status, oldStatus, newStatus);
+  compare("PUBLICATION_TYPE_CHANGED", previous.publication_type, next.publication_type);
+  compare("DOCUMENTS_CHANGED", previous.documents, next.documents);
+  compare("STAGES_CHANGED", previous.stages, next.stages);
+  compare("VOTES_CHANGED", previous.votes, next.votes);
+  compare("RECLASSIFIED", previous.relevance, next.relevance);
+  return changes;
+}
+
+async function processStaged(db: D1Database, runId: string, sourceId: number, mode: "historical" | "incremental", staged: { external_id: string; publication_json: string }): Promise<void> {
+  const incoming = JSON.parse(staged.publication_json) as PublicationInput;
+  const old = await db.prepare("SELECT id, normalized_snapshot_json, source_complete FROM publications WHERE source_id = ? AND external_id = ?")
+    .bind(sourceId, incoming.external_id).first<{ id: number; normalized_snapshot_json: string; source_complete: number }>();
+  const now = new Date().toISOString();
+  if (!incoming.complete) {
+    const statements: D1PreparedStatement[] = [];
+    if (!old) {
+      const related = canonical({ documents: incoming.normalized_snapshot.documents, stages: incoming.normalized_snapshot.stages, votes: incoming.normalized_snapshot.votes });
+      statements.push(db.prepare("INSERT INTO publications (source_id, external_id, external_url, original_title, publication_type, relevance, relevance_reason, current_status, published_at, source_updated_at, discovered_at, updated_at, source_metadata_json, normalized_snapshot_json, relationship_snapshot_json, ruleset_version, source_complete, historical, diagnostics_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)")
+        .bind(sourceId, incoming.external_id, incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, now, now, canonical(incoming.source_metadata), canonical(incoming.normalized_snapshot), related, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics)));
+    }
+    statements.push(
+      db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ?").bind(runId, sourceId, incoming.external_id),
+      db.prepare("UPDATE ingestion_runs SET processed_count = processed_count + 1, had_incomplete = 1, updated_at = ? WHERE run_id = ?").bind(now, runId),
+    );
+    await db.batch(statements);
+    return;
+  }
+
+  let oldSnapshot: JsonObject | null = null;
+  if (old?.source_complete === 1) {
+    try { oldSnapshot = JSON.parse(old.normalized_snapshot_json) as JsonObject; }
+    catch { throw new RequestError(500, "stored_snapshot_corrupt"); }
+  }
+  const changes = eventChanges(oldSnapshot, incoming);
+  const meaningful = !old || old.source_complete !== 1 || changes.length > 0;
+  const normalizedJson = canonical(incoming.normalized_snapshot);
+  const relationshipsJson = canonical({
+    documents: incoming.normalized_snapshot.documents,
+    stages: incoming.normalized_snapshot.stages,
+    votes: incoming.normalized_snapshot.votes,
+  });
+  const writePublication = old
+    ? db.prepare("UPDATE publications SET external_url = ?, original_title = ?, publication_type = ?, relevance = ?, relevance_reason = ?, current_status = ?, published_at = ?, source_updated_at = ?, updated_at = CASE WHEN ? = 1 THEN ? ELSE updated_at END, source_metadata_json = ?, normalized_snapshot_json = ?, relationship_snapshot_json = ?, ruleset_version = ?, source_complete = 1, historical = ?, diagnostics_json = ? WHERE id = ?")
+      .bind(incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, meaningful ? 1 : 0, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), old.id)
+    : db.prepare("INSERT INTO publications (source_id, external_id, external_url, original_title, publication_type, relevance, relevance_reason, current_status, published_at, source_updated_at, discovered_at, updated_at, source_metadata_json, normalized_snapshot_json, relationship_snapshot_json, ruleset_version, source_complete, historical, diagnostics_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
+      .bind(sourceId, incoming.external_id, incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, now, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics));
+  const statements: D1PreparedStatement[] = [writePublication];
+  const canNotify = mode === "incremental" && !incoming.historical && incoming.complete &&
+    !incoming.notification_blocked && incoming.relevance !== "IRRELEVANT";
+  for (const change of changes) {
+    const fingerprint = await sha256(canonical({ type: change.type, snapshot: change.snapshot }));
+    const eventKey = "ingest:" + runId + ":" + sourceId + ":" + incoming.external_id + ":" + change.type + ":" + fingerprint;
+    statements.push(db.prepare("INSERT INTO publication_events (publication_id, event_key, event_type, previous_status, new_status, occurred_at, detected_at, notify_eligible, change_snapshot_json) SELECT id, ?, ?, ?, ?, NULL, ?, ?, ? FROM publications WHERE source_id = ? AND external_id = ? ON CONFLICT (event_key) DO NOTHING")
+      .bind(eventKey, change.type, change.previousStatus, change.newStatus, now, canNotify ? 1 : 0, canonical(change.snapshot), sourceId, incoming.external_id));
+  }
+  statements.push(
+    db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ?").bind(runId, sourceId, incoming.external_id),
+    db.prepare("UPDATE ingestion_runs SET processed_count = processed_count + 1, updated_at = ? WHERE run_id = ?").bind(now, runId),
+  );
+  // Publication, events and stage progress share one D1 batch/transaction.
+  await db.batch(statements);
+}
+
+async function commitRun(body: JsonObject, db: D1Database): Promise<Response> {
+  if (typeof body.run_id !== "string") throw new RequestError(400, "invalid_run_id");
+  const run = await db.prepare("SELECT run_id, source_id, mode, expected_batches, status, proposed_checkpoints_json, base_checkpoints_json, had_incomplete FROM ingestion_runs WHERE run_id = ?").bind(body.run_id)
+    .first<{ run_id: string; source_id: number; mode: "historical" | "incremental"; expected_batches: number; status: string; proposed_checkpoints_json: string; base_checkpoints_json: string; had_incomplete: number }>();
+  if (!run) throw new RequestError(404, "run_not_found");
+  if (run.status === "COMMITTED" || run.status === "BLOCKED") return json({ run_id: run.run_id, status: run.status, processed_records: 0, checkpoints_advanced: run.status === "COMMITTED", idempotent: true });
+  if (run.status !== "OPEN" && run.status !== "COMMITTING") throw new RequestError(409, "run_not_committable");
+  const count = await db.prepare("SELECT COUNT(*) AS count FROM ingestion_batches WHERE run_id = ?").bind(run.run_id).first<{ count: number }>();
+  if (count?.count !== run.expected_batches) throw new RequestError(409, "batches_incomplete");
+  if (run.status === "OPEN") {
+    await db.prepare("UPDATE ingestion_runs SET status = 'COMMITTING', updated_at = ? WHERE run_id = ? AND status = 'OPEN'")
+      .bind(new Date().toISOString(), run.run_id).run();
+  }
+  const pending = await db.prepare("SELECT external_id, publication_json FROM ingestion_staging WHERE run_id = ? AND processed = 0 ORDER BY external_id LIMIT ?")
+    .bind(run.run_id, COMMIT_RECORDS).all<{ external_id: string; publication_json: string }>();
+  let processed = 0;
+  for (const item of pending.results ?? []) {
+    await processStaged(db, run.run_id, run.source_id, run.mode, item);
+    processed += 1;
+  }
+  const remaining = await db.prepare("SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id = ? AND processed = 0").bind(run.run_id).first<{ count: number }>();
+  if ((remaining?.count ?? 0) > 0) return json({ run_id: run.run_id, status: "COMMITTING", processed_records: processed, remaining_records: remaining?.count ?? 0, checkpoints_advanced: false });
+  const state = await db.prepare("SELECT had_incomplete FROM ingestion_runs WHERE run_id = ?").bind(run.run_id).first<{ had_incomplete: number }>();
+  if (state?.had_incomplete) {
+    const now = new Date().toISOString();
+    await db.prepare("UPDATE ingestion_runs SET status = 'BLOCKED', error_code = 'incomplete_publication', completed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'COMMITTING'")
+      .bind(now, now, run.run_id).run();
+    return json({ run_id: run.run_id, status: "BLOCKED", processed_records: processed, checkpoints_advanced: false, error: "incomplete_publication" });
+  }
+  const proposed = JSON.parse(run.proposed_checkpoints_json) as Record<string, Cursor | null>;
+  const base = JSON.parse(run.base_checkpoints_json) as Record<string, Cursor | null>;
+  const current = await readStates(db, run.source_id);
+  for (const key of Object.keys(proposed)) {
+    if (canonical(current.base[key] ?? null) !== canonical(base[key] ?? null)) {
+      const now = new Date().toISOString();
+      await db.prepare("UPDATE ingestion_runs SET status = 'BLOCKED', error_code = 'checkpoint_conflict', completed_at = ?, updated_at = ? WHERE run_id = ?")
+        .bind(now, now, run.run_id).run();
+      throw new RequestError(409, "checkpoint_conflict");
+    }
+  }
+  const now = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [];
+  for (const [key, value] of Object.entries(proposed)) {
+    statements.push(db.prepare("INSERT INTO source_states (source_id, stream_key, checkpoint, last_success_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (source_id, stream_key) DO UPDATE SET checkpoint = excluded.checkpoint, last_success_at = excluded.last_success_at, updated_at = excluded.updated_at WHERE source_states.checkpoint IS ?")
+      .bind(run.source_id, key, value === null ? null : canonical(value), now, now, base[key] == null ? null : canonical(base[key])));
+  }
+  statements.push(db.prepare("UPDATE ingestion_runs SET status = 'COMMITTED', completed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'COMMITTING' AND had_incomplete = 0")
+    .bind(now, now, run.run_id));
+  await db.batch(statements);
+  const finalState = await db.prepare("SELECT status FROM ingestion_runs WHERE run_id = ?").bind(run.run_id).first<{ status: string }>();
+  if (finalState?.status !== "COMMITTED") throw new RequestError(409, "checkpoint_commit_failed");
+  return json({ run_id: run.run_id, status: "COMMITTED", processed_records: processed, checkpoints_advanced: true });
+}
+
+async function abortRun(body: JsonObject, db: D1Database): Promise<Response> {
+  if (typeof body.run_id !== "string") throw new RequestError(400, "invalid_run_id");
+  const run = await db.prepare("SELECT status FROM ingestion_runs WHERE run_id = ?").bind(body.run_id).first<{ status: string }>();
+  if (!run) throw new RequestError(404, "run_not_found");
+  if (run.status === "ABORTED") return json({ run_id: body.run_id, status: "ABORTED", idempotent: true });
+  if (run.status !== "OPEN") throw new RequestError(409, "run_cannot_be_aborted");
+  const now = new Date().toISOString();
+  await db.prepare("UPDATE ingestion_runs SET status = 'ABORTED', error_code = 'client_aborted', completed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'OPEN'")
+    .bind(now, now, body.run_id).run();
+  return json({ run_id: body.run_id, status: "ABORTED", checkpoints_advanced: false });
+}
+
+export async function handleIngestionRequest(request: Request, env: IngestEnv): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  return ingest(request, env);
+}
+export async function handleSourceStatesRequest(request: Request, env: IngestEnv): Promise<Response> {
+  if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
+  return sourceStates(request, env);
+}

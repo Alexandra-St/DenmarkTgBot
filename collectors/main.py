@@ -52,12 +52,28 @@ def collect(
 
         all_entries.extend(parsed.entries)
         status = "success_empty" if parsed.entries_seen == 0 else "success"
+        upper = None
+        missing_updates = 0
+        invalid_cursor_ids = 0
+        for entry in parsed.entries:
+            if entry.updated_at is None:
+                missing_updates += 1
+                continue
+            if not entry.external_id.isdigit():
+                invalid_cursor_ids += 1
+                continue
+            candidate = {"timestamp": entry.updated_at, "id": int(entry.external_id)}
+            if upper is None or (candidate["timestamp"], candidate["id"]) > (upper["timestamp"], upper["id"]):
+                upper = candidate
         feed_report[feed.code] = {
             "status": status,
             "entries_seen": parsed.entries_seen,
             "entries_parsed": len(parsed.entries),
             "invalid_entries": parsed.invalid_entries,
             "invalid_timestamps": parsed.invalid_timestamps,
+            "missing_updated_at": missing_updates,
+            "invalid_cursor_ids": invalid_cursor_ids,
+            "upper_bound": upper,
         }
         if parsed.entries_seen == 0:
             LOGGER.info("Feed %s returned no entries", feed.code)
