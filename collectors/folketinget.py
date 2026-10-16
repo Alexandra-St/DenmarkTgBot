@@ -298,6 +298,7 @@ class ODataClient:
         filter: str | None = None,
         select: str | None = None,
         page_size: int | None = None,
+        max_pages: int | None = None,
     ) -> ScanResult:
         """Read a collection in ascending (opdateringsdato, id) order.
 
@@ -308,6 +309,8 @@ class ODataClient:
         size = self.page_size if page_size is None else page_size
         if size < 1 or size > MAX_PAGE_SIZE:
             raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
+        if max_pages is not None and max_pages < 1:
+            raise ValueError("max_pages must be positive")
         if select is not None and not {"id", "opdateringsdato"}.issubset(
             {part.strip() for part in select.split(",")}
         ):
@@ -378,6 +381,8 @@ class ODataClient:
                         output[cursor.entity_id] = (cursor_key, row)
                 if last_cursor == upper:
                     return result(True)
+                if max_pages is not None and pages >= max_pages:
+                    raise ODataPageError(pages + 1, result(False), "configured page limit reached", cause=ODataPaginationError("configured page limit reached"))
                 # Deliberately continue after short pages: the upper-bounded range,
                 # not the page length, determines completion.
         except ODataPageError:

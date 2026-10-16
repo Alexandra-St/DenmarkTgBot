@@ -69,6 +69,14 @@ class URLAndTransportTests(unittest.TestCase):
         client = ODataClient(opener=Mock(return_value=response([])))
         self.assertEqual(client.fetch_page("Sag", {"$top": 1}), [])
 
+    def test_scan_page_limit_returns_incomplete_partial_result(self) -> None:
+        pages = [response([row(2, T2)]), response([row(1, T1)])]
+        client = ODataClient(page_size=1, opener=Mock(side_effect=pages))
+        with self.assertRaises(ODataPageError) as caught:
+            client.scan("Sag", max_pages=1)
+        self.assertFalse(caught.exception.partial_result.metadata.complete)
+        self.assertEqual(len(caught.exception.partial_result.records), 1)
+
     def test_query_parameters_are_encoded_and_bounded(self) -> None:
         url = build_url("Sag", {"$filter": "titel eq 'A & B'", "$select": "id,titel", "$top": 3})
         self.assertEqual(urlparse(url).scheme, "https")
