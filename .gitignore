@@ -1,0 +1,27 @@
+# Dependencies and build output
+node_modules/
+.wrangler/
+dist/
+build/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# OS and editor files
+.DS_Store
+*.swp
+*.swo
+
+# Local tooling state
+.codex/
+.agents/
