@@ -1,34 +1,29 @@
 # Høringsportalen incremental monitoring
 
-## Collection and submission
+## Current-window reconciliation
 
-`python -m collectors.main` fetches both configured official ATOM feeds over HTTPS, validates and normalizes entries, merges duplicate official IDs, and writes JSON to stdout. A failed feed or invalid entry makes the collector exit nonzero. The uploader refuses incomplete output before making any ingestion request. It reads authenticated source state, classifies with deterministic ruleset 1.1, and submits bounded batches to the existing ingestion API.
+`python -m collectors.main` fetches both configured official ATOM feeds over HTTPS, validates them, preserves official IDs and original `updated` text, and merges duplicate IDs into one publication with membership in each matching feed. A failure, malformed entry, or invalid timestamp/cursor makes collection incomplete. The uploader refuses incomplete output before any ingestion request.
 
-Incremental upload compares each publication's `(updated_at, official ID)` cursor against the saved checkpoint for every feed containing that publication. A record is included if it is ahead of at least one corresponding feed checkpoint. An unset feed checkpoint includes that feed's whole current window. Exact-equal cursors are already observed. The two feed checkpoints advance independently from each feed's upper bound; an empty feed retains its prior checkpoint. A submission failure leaves checkpoint advancement to the ingestion service's commit transaction; retry an interrupted run with the same run ID.
+Every complete incremental run submits **all unique publications currently visible in both feeds**, including records whose timestamps are equal to or behind saved checkpoints. D1 upsert and semantic snapshot comparison decide whether a publication changed. Identical snapshots and source-timestamp-only changes create no events and do not refresh the publication's meaningful `updated_at` time. Title/content changes remain detectable even when the official `updated` timestamp does not advance. Historical mode, ruleset 1.1 classification, event idempotency, and bounded batch sizes remain in effect.
 
-The parser stores the normalized UTC update time and preserves the original ATOM `updated` string as `source_updated_at_raw` and in source metadata. Official IDs remain unchanged. Duplicate IDs merge feed membership and retain metadata from the newest entry.
+The two feed checkpoints remain independent. Each checkpoint records the greatest valid `(updated_at, official ID)` cursor observed in that feed and is proposed from that feed's successful window. A successful empty feed retains its prior cursor. Checkpoints no longer filter records: they record progress and are advanced only by the ingestion service's atomic successful commit. Failed or incomplete collection does not start a run; interrupted submission can be resumed with its original run ID.
 
-## Feed limits and missed entries
+## Feed-window limits
 
-Each configured feed returns only its latest 25 entries. Checkpoints therefore detect only entries still present in a feed window. If more than 25 publications or updates occur between successful runs, an entry may leave the window before collection. An old entry may also appear in a window after a long gap. The source provides no cursor pagination or archive feed in this collector. The client cannot prove that a window contains every entry since a checkpoint, cannot recover entries that have fallen out of both windows, and must not report complete historical coverage. Running more often reduces exposure but does not prove completeness; overlap by timestamp and ID protects boundary ordering only.
+Each configured feed exposes only its latest 25 entries. Reconciliation prevents a visible older or unchanged-timestamp record from being silently skipped, but it cannot recover records that have already fallen out of both windows before a run. The source provides no archive pagination through these feeds. “Collection complete” means both current windows parsed cleanly; it does not mean exhaustive historical coverage. More frequent runs reduce, but do not eliminate, the chance that records age out between runs.
 
-The feed's `updated` value is not proof of first publication time. A previously unseen old item appearing in a feed can be distinguished in storage as a `FIRST_SEEN` record, but its age cannot be established reliably from that timestamp. `published_at` remains unset. Høringsportalen `FIRST_SEEN` events are consequently stored with `notify_eligible=0`. Later meaningful changes to known records may be eligible under existing rules; no notification delivery is implemented or enabled. Technical timestamp-only changes do not create semantic change events.
+## First detection and notification policy
 
-## Failures and recovery
+The ATOM `updated` timestamp does not establish when a publication first appeared. `published_at` is therefore not invented. A publication first observed by the bot is stored as `FIRST_SEEN` with `notify_eligible=0`, even in incremental mode. Historical records remain non-notifiable. Later meaningful updates to known records may be eligible under existing rules, but delivery remains disabled.
 
-- If either feed is unavailable, malformed, or has invalid timestamps/cursor data, collection exits nonzero and the uploader makes no ingestion request.
-- The uploader reads source state before filtering and submitting. Missing feed state causes that feed's visible entries to be included; an invalid saved checkpoint fails closed.
-- Ingestion owns checkpoint compare-and-swap and commit behavior. Never advance checkpoints manually.
-- If submission is interrupted, retain the run ID printed in the error and retry with `--run-id <same-id>`; inspect/abort an open run only through the documented ingestion API.
-- A complete run can still have feed-window gaps. “Complete” means both current feeds parsed cleanly, not exhaustive source history.
+Future policy proposal: keep `FIRST_SEEN` ineligible by default. If product requirements call for alerts about newly observed items, define a separate, explicitly named “newly detected” notification policy, distinct from “newly published.” It should require user opt-in and describe the event as first detection by the bot. Only a trustworthy source publication date or a separately verified freshness signal could support describing it as newly published. Until then, no automatic first-seen alert should be sent.
 
-## Future scheduling and cost
+## Cloudflare 403 / 1010 investigation
 
-`.github/workflows/hoeringsportalen-incremental.yml` is manual `workflow_dispatch` only. There is no schedule. The job also requires the explicit confirmation input before it collects and submits. Configure `INGEST_API_URL` as a GitHub Actions variable and `INGEST_API_TOKEN` as a GitHub Actions secret; never store token values in the repository. The workflow has a ten-minute job timeout and concurrency lock. It uses Python's standard library and GitHub-hosted Linux runners, with no paid third-party services. Before enabling a schedule, choose an interval that fits the current 25-entry windows, verify GitHub Actions free-minute allowance for the account/repository, alert on failed runs, and review feed-gap risk. Scheduling and notifications remain disabled.
+Earlier authenticated source-state reads returned HTTP 403 / Cloudflare Error 1010. In this investigation, the same two read-only GETs succeeded with HTTP 200 through both the current Python ingestion client (`DenmarkTgBot-IngestionClient/1.0`, JSON accept header) and system `curl` (diagnostic user agent). The responses contained Høringsportalen's two feed states and an empty Folketinget stream list. `curl` received `server: cloudflare`; the response ray IDs were `a4b792ec0ad2cbc0-MAD` (Høringsportalen) and `a4b792ef2ce2cfe6-MAD` (Folketinget). No 1010 error page appeared in these requests.
 
-## Remaining risks
+The earlier block is not reproducible now, so its precise trigger is unresolved. The Cloudflare dashboard redirected to its login page; no authenticated read-only WAF/security-rule view was available. No WAF setting was changed. The current successful GETs establish that the API is reachable now, but do not identify why Cloudflare previously returned 1010.
 
-- No API or feed mechanism proves complete coverage across a gap longer than the current 25-entry windows.
-- Same-ID corrections that do not advance `updated` cannot pass the cursor filter.
-- A gap or delayed appearance cannot be reliably distinguished from a newly published item. First-seen notification eligibility is suppressed to avoid presenting it as breaking news.
-- Production source-state reads must succeed before any incremental submission. Current preflight GETs were blocked at Cloudflare with HTTP 403 / Error 1010, so production checkpoints could not be independently verified in this task.
+## Manual workflow and cost
+
+`.github/workflows/hoeringsportalen-incremental.yml` is `workflow_dispatch` only, with an explicit production-ingestion confirmation input. No schedule or notification delivery is enabled. Configure `INGEST_API_URL` as a GitHub Actions variable and `INGEST_API_TOKEN` as a GitHub Actions secret. The workflow uses Python's standard library, GitHub-hosted runners, a ten-minute timeout, and a concurrency lock. Before considering a schedule, assess the 25-entry window risk, add failure alerting, and verify the repository's available GitHub Actions minutes. No paid service is required by this workflow.
