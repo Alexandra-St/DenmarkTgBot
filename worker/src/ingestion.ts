@@ -19,6 +19,8 @@ const MAX_BODY_BYTES = 256 * 1024;
 const MAX_BATCH_RECORDS = 50;
 const COMMIT_RECORDS = 20;
 const MAX_RUN_BATCHES = 200;
+const MAX_CLEANUP_RUNS = 20;
+const DEFAULT_INGESTION_RETENTION_DAYS = 90;
 
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), {
   status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
@@ -223,6 +225,7 @@ async function ingest(request: Request, env: IngestEnv): Promise<Response> {
     if (body.action === "batch") return await submitBatch(body, env.DB);
     if (body.action === "commit") return await commitRun(body, env.DB);
     if (body.action === "abort") return await abortRun(body, env.DB);
+    if (body.action === "cleanup") return await cleanupStaging(body, env.DB);
     throw new RequestError(400, "invalid_action");
   } catch (error) { return failure(error); }
 }
@@ -250,6 +253,8 @@ async function startRun(body: JsonObject, db: D1Database): Promise<Response> {
   const streamKeys: readonly string[] = source === "folketinget" ? ODA_STREAMS : HEARING_FEEDS;
   const base = Object.fromEntries(streamKeys.map((key) => [key, current.base[key] ?? null]));
   const proposed = validateCheckpoints(body.proposed_checkpoints, source, base);
+  const baseline = await db.prepare("SELECT source_id FROM source_ingestion_baselines WHERE source_id = ?").bind(id).first<{ source_id: number }>();
+  if (body.mode === "incremental" && !baseline) throw new RequestError(409, "historical_baseline_required");
   const startJson = canonical({ run_id: body.run_id, source, mode: body.mode, expected_batches: body.expected_batches, collection_complete: true, proposed_checkpoints: proposed });
   const startHash = await sha256(startJson);
   const oldRun = await db.prepare("SELECT status, start_request_hash, expected_batches FROM ingestion_runs WHERE run_id = ?").bind(body.run_id).first<{ status: string; start_request_hash: string; expected_batches: number }>();
@@ -432,6 +437,8 @@ async function commitRun(body: JsonObject, db: D1Database): Promise<Response> {
     statements.push(db.prepare("INSERT INTO source_states (source_id, stream_key, checkpoint, last_success_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (source_id, stream_key) DO UPDATE SET checkpoint = excluded.checkpoint, last_success_at = excluded.last_success_at, updated_at = excluded.updated_at WHERE source_states.checkpoint IS ?")
       .bind(run.source_id, key, value === null ? null : canonical(value), now, now, base[key] == null ? null : canonical(base[key])));
   }
+  if (run.mode === "historical") statements.push(db.prepare("INSERT INTO source_ingestion_baselines (source_id, baseline_run_id, initialized_at) VALUES (?, ?, ?) ON CONFLICT (source_id) DO NOTHING")
+    .bind(run.source_id, run.run_id, now));
   statements.push(db.prepare("UPDATE ingestion_runs SET status = 'COMMITTED', completed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'COMMITTING' AND had_incomplete = 0")
     .bind(now, now, run.run_id));
   await db.batch(statements);
@@ -450,6 +457,48 @@ async function abortRun(body: JsonObject, db: D1Database): Promise<Response> {
   await db.prepare("UPDATE ingestion_runs SET status = 'ABORTED', error_code = 'client_aborted', completed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'OPEN'")
     .bind(now, now, body.run_id).run();
   return json({ run_id: body.run_id, status: "ABORTED", checkpoints_advanced: false });
+}
+
+async function cleanupStaging(body: JsonObject, db: D1Database): Promise<Response> {
+  const retentionDays = body.retention_days === undefined ? DEFAULT_INGESTION_RETENTION_DAYS : body.retention_days;
+  if (!integer(retentionDays) || retentionDays < 1 || retentionDays > 3650) throw new RequestError(400, "invalid_retention_days");
+  if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") throw new RequestError(400, "invalid_cleanup_mode");
+  const dryRun = body.dry_run !== false;
+  if (!dryRun && body.confirm !== "DELETE_STAGING") throw new RequestError(400, "cleanup_confirmation_required");
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+  const summary = await db.prepare(`
+    SELECT COUNT(*) AS runs,
+      COALESCE(SUM((SELECT COUNT(*) FROM ingestion_staging st WHERE st.run_id = r.run_id)), 0) AS staged_records,
+      COALESCE(SUM((SELECT COUNT(*) FROM ingestion_batches b WHERE b.run_id = r.run_id)), 0) AS batches
+    FROM ingestion_runs r
+    WHERE r.status IN ('COMMITTED', 'ABORTED') AND r.completed_at IS NOT NULL AND r.completed_at <= ?
+      AND (EXISTS (SELECT 1 FROM ingestion_staging st WHERE st.run_id = r.run_id)
+        OR EXISTS (SELECT 1 FROM ingestion_batches b WHERE b.run_id = r.run_id))
+  `).bind(cutoff).first<{ runs: number; staged_records: number; batches: number }>();
+  if (dryRun) return json({
+    dry_run: true, retention_days: retentionDays, cutoff, eligible_runs: summary?.runs ?? 0,
+    staged_records: summary?.staged_records ?? 0, batches: summary?.batches ?? 0,
+    deletion_limit_runs: MAX_CLEANUP_RUNS, deleted_runs: 0,
+  });
+
+  const candidates = await db.prepare("SELECT run_id FROM ingestion_runs r WHERE r.status IN ('COMMITTED', 'ABORTED') AND r.completed_at IS NOT NULL AND r.completed_at <= ? AND (EXISTS (SELECT 1 FROM ingestion_staging st WHERE st.run_id = r.run_id) OR EXISTS (SELECT 1 FROM ingestion_batches b WHERE b.run_id = r.run_id)) ORDER BY r.completed_at, r.run_id LIMIT ?")
+    .bind(cutoff, MAX_CLEANUP_RUNS).all<{ run_id: string }>();
+  let deletedRuns = 0;
+  for (const candidate of candidates.results ?? []) {
+    const guard = "EXISTS (SELECT 1 FROM ingestion_runs r WHERE r.run_id = ? AND r.status IN ('COMMITTED', 'ABORTED') AND r.completed_at IS NOT NULL AND r.completed_at <= ?)";
+    await db.batch([
+      db.prepare(`DELETE FROM ingestion_staging WHERE run_id = ? AND ${guard}`).bind(candidate.run_id, candidate.run_id, cutoff),
+      db.prepare(`DELETE FROM ingestion_batches WHERE run_id = ? AND ${guard}`).bind(candidate.run_id, candidate.run_id, cutoff),
+    ]);
+    deletedRuns += 1;
+  }
+  const remaining = await db.prepare("SELECT COUNT(*) AS count FROM ingestion_runs r WHERE r.status IN ('COMMITTED', 'ABORTED') AND r.completed_at IS NOT NULL AND r.completed_at <= ? AND (EXISTS (SELECT 1 FROM ingestion_staging st WHERE st.run_id = r.run_id) OR EXISTS (SELECT 1 FROM ingestion_batches b WHERE b.run_id = r.run_id))")
+    .bind(cutoff).first<{ count: number }>();
+  return json({
+    dry_run: false, retention_days: retentionDays, cutoff, eligible_runs: summary?.runs ?? 0,
+    deleted_runs: deletedRuns, remaining_eligible_runs: remaining?.count ?? 0,
+    deletion_limit_runs: MAX_CLEANUP_RUNS,
+  });
 }
 
 export async function handleIngestionRequest(request: Request, env: IngestEnv): Promise<Response> {

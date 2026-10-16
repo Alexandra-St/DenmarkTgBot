@@ -130,6 +130,33 @@ test("internal routes authenticate before reading state; reject invalid JSON and
   assert.equal((await request("/internal/ingest", "POST", { action: "start", source: "duplicate" })).status, 400);
   const invalidId = await request("/internal/ingest", "POST", { action: "start", run_id: "00000000-0000-4000-8000-000000000021", source: "folketinget", mode: "incremental", expected_batches: 1, collection_complete: true, proposed_checkpoints: {} });
   assert.equal(invalidId.body.error, "invalid_checkpoint_streams");
+  for (const [source, runId, emptyCheckpoints] of [
+    ["folketinget", "00000000-0000-4000-8000-000000000030", Object.fromEntries(["Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"].map((key) => [key, null]))],
+    ["hoeringsportalen", "00000000-0000-4000-8000-000000000031", { immigration_ministry: null, immigration_category: null }],
+  ] as const) {
+    const firstIncremental = await request("/internal/ingest", "POST", {
+      action: "start", run_id: runId, source, mode: "incremental", expected_batches: 1,
+      collection_complete: true, proposed_checkpoints: emptyCheckpoints,
+    });
+    assert.equal(firstIncremental.status, 409);
+    assert.equal(firstIncremental.body.error, "historical_baseline_required");
+  }
+  for (const [source, runId, emptyCheckpoints] of [
+    ["folketinget", "00000000-0000-4000-8000-000000000032", Object.fromEntries(["Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"].map((key) => [key, null]))],
+    ["hoeringsportalen", "00000000-0000-4000-8000-000000000033", { immigration_ministry: null, immigration_category: null }],
+  ] as const) {
+    const baselineRun = await start(runId, { source, mode: "historical", proposed: emptyCheckpoints });
+    assert.equal(baselineRun.status, 201);
+    await batch(runId, []);
+    assert.equal((await commit(runId)).body.status, "COMMITTED");
+    const incrementalRunId = source === "folketinget" ? "00000000-0000-4000-8000-000000000034" : "00000000-0000-4000-8000-000000000035";
+    const incrementalRun = await request("/internal/ingest", "POST", {
+      action: "start", run_id: incrementalRunId, source, mode: "incremental", expected_batches: 1,
+      collection_complete: true, proposed_checkpoints: emptyCheckpoints,
+    });
+    assert.equal(incrementalRun.status, 201);
+    assert.equal((await request("/internal/ingest", "POST", { action: "abort", run_id: incrementalRunId })).body.status, "ABORTED");
+  }
 });
 
 test("valid writes persist once; batch retry and identical reingestion do not duplicate events or modify timestamps", async () => {
@@ -328,6 +355,58 @@ test("source separation, timestamp precision and existing Telegram routes remain
   assert.equal(precision.status, 409);
   assert.equal((await fetch(baseUrl + "/health")).status, 200);
   assert.equal((await fetch(baseUrl + "/telegram/webhook", { method: "POST" })).status, 503);
+});
+
+test("staging cleanup defaults to dry-run and preserves active, blocked, publication, event, user, and checkpoint data", async () => {
+  const old = "2000-01-01T00:00:00.000Z";
+  await query("UPDATE ingestion_runs SET completed_at='" + old + "' WHERE run_id IN ('00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000005')");
+
+  const hpState = (await request("/internal/source-states?source=hoeringsportalen", "GET")).body;
+  const savedHp = Object.fromEntries(hpState.streams.map((item: any) => [item.stream, item.checkpoint]));
+  const aborted = "00000000-0000-4000-8000-000000000027";
+  await start(aborted, { source: "hoeringsportalen", proposed: savedHp });
+  const hpPublication = {
+    source: "hoeringsportalen", external_id: "124", title: "Høringspostering", url: "https://hoeringsportalen.dk/Hearing/Details/124",
+    relevance: "IRRELEVANT", relevance_reason: "no match", ruleset_version: "1.1", status: null, publication_type: null,
+    published_at: null, source_updated_at: "2026-10-16T10:11:12.123456Z", source_updated_at_raw: "2026-10-16T10:11:12.123456Z",
+    historical: false, notification_blocked: false, complete: true, diagnostics: [], source_metadata: { feed_codes: ["immigration_ministry"] },
+    normalized_snapshot: { title: "Høringspostering", content_text: null, status: null, publication_type: null, relevance: "IRRELEVANT", documents: [], stages: [], votes: [] },
+  };
+  await batch(aborted, [hpPublication]);
+  assert.equal((await request("/internal/ingest", "POST", { action: "abort", run_id: aborted })).body.status, "ABORTED");
+  await query("UPDATE ingestion_runs SET completed_at='" + old + "' WHERE run_id='00000000-0000-4000-8000-000000000027'");
+
+  const open = "00000000-0000-4000-8000-000000000028";
+  await start(open, { proposed: cursors(45) });
+  await batch(open, [publication({ external_id: "909" })]);
+  const committing = "00000000-0000-4000-8000-000000000029";
+  await start(committing, { source: "hoeringsportalen", proposed: savedHp });
+  await batch(committing, [hpPublication]);
+  await query("UPDATE ingestion_runs SET status='COMMITTING' WHERE run_id='00000000-0000-4000-8000-000000000029'");
+
+  const folketingStateBefore = (await request("/internal/source-states?source=folketinget", "GET")).body.streams;
+  const hpStateBefore = (await request("/internal/source-states?source=hoeringsportalen", "GET")).body.streams;
+  const protectedDataBefore = await query("SELECT (SELECT COUNT(*) FROM publications) AS publications, (SELECT COUNT(*) FROM publication_events) AS events, (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM notifications) AS notifications");
+  const dryRun = await request("/internal/ingest", "POST", { action: "cleanup", retention_days: 30 });
+  assert.equal(dryRun.body.dry_run, true);
+  assert.equal(dryRun.body.eligible_runs, 2);
+  assert.equal(dryRun.body.deleted_runs, 0);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id='00000000-0000-4000-8000-000000000001'")).at(0)?.count, 1);
+  const unconfirmed = await request("/internal/ingest", "POST", { action: "cleanup", retention_days: 30, dry_run: false });
+  assert.equal(unconfirmed.status, 400);
+  const deleted = await request("/internal/ingest", "POST", { action: "cleanup", retention_days: 30, dry_run: false, confirm: "DELETE_STAGING" });
+  assert.equal(deleted.body.deleted_runs, 2);
+  assert.equal(deleted.body.remaining_eligible_runs, 0);
+  const retained = await query("SELECT run_id, status FROM ingestion_runs WHERE run_id IN ('00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000005','00000000-0000-4000-8000-000000000027','00000000-0000-4000-8000-000000000028','00000000-0000-4000-8000-000000000029') ORDER BY run_id");
+  assert.equal(retained.length, 5);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id IN ('00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000027')")).at(0)?.count, 0);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM ingestion_batches WHERE run_id IN ('00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000027')")).at(0)?.count, 0);
+  assert.ok((await query("SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id='00000000-0000-4000-8000-000000000005'")).at(0)?.count > 0);
+  assert.ok((await query("SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id='00000000-0000-4000-8000-000000000028'")).at(0)?.count > 0);
+  assert.ok((await query("SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id='00000000-0000-4000-8000-000000000029'")).at(0)?.count > 0);
+  assert.deepEqual((await request("/internal/source-states?source=folketinget", "GET")).body.streams, folketingStateBefore);
+  assert.deepEqual((await request("/internal/source-states?source=hoeringsportalen", "GET")).body.streams, hpStateBefore);
+  assert.deepEqual((await query("SELECT (SELECT COUNT(*) FROM publications) AS publications, (SELECT COUNT(*) FROM publication_events) AS events, (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM notifications) AS notifications"))[0], protectedDataBefore[0]);
 });
 
 test("local D1 stores deduplicated snapshots, event transitions and notification-safe history", async () => {
