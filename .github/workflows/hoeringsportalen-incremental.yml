@@ -1,0 +1,35 @@
+name: Høringsportalen incremental collection (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production_ingestion:
+        description: Confirm a complete collection may be submitted to production
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hoeringsportalen-incremental
+  cancel-in-progress: false
+
+jobs:
+  collect-and-submit:
+    if: ${{ inputs.confirm_production_ingestion }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Collect both official feeds
+        run: python -m collectors.main > "$RUNNER_TEMP/hoeringsportalen.json"
+      - name: Submit complete incremental run
+        env:
+          INGEST_API_URL: ${{ vars.INGEST_API_URL }}
+          INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}
+        run: python -m collectors.ingestion_client "$RUNNER_TEMP/hoeringsportalen.json" --source hoeringsportalen --mode incremental

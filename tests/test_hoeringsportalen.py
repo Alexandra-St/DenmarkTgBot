@@ -61,6 +61,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(first.title, "Høring om Ukrainesærloven")
         self.assertEqual(first.url, "https://hoeringsportalen.dk/Hearing/Details/71507")
         self.assertEqual(first.updated_at, "2026-09-17T14:27:44.000000Z")
+        self.assertEqual(first.updated_at_raw, "2026-09-17T14:27:44Z")
         self.assertEqual(first.author, "Udlændinge- og Integrationsministeriet")
         self.assertEqual(first.feed_codes, ("immigration_ministry",))
         self.assertEqual(result.entries[1].external_id, "https://example.org/consultation/external-42")
@@ -122,11 +123,13 @@ class DeduplicationTests(unittest.TestCase):
             older,
             title="Updated title",
             updated_at="2026-09-18T10:00:00.000000Z",
+            updated_at_raw="2026-09-18T12:00:00+02:00",
             feed_codes=("immigration_category",),
         )
         results = deduplicate([older, newer, parsed.entries[1]])
         match = next(item for item in results if item.external_id == "71507")
         self.assertEqual(match.title, "Updated title")
+        self.assertEqual(match.updated_at_raw, "2026-09-18T12:00:00+02:00")
         self.assertEqual(match.feed_codes, ("immigration_category", "immigration_ministry"))
 
     def test_results_sort_newest_first_with_stable_id_ties(self) -> None:

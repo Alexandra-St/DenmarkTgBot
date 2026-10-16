@@ -357,6 +357,37 @@ test("source separation, timestamp precision and existing Telegram routes remain
   assert.equal((await fetch(baseUrl + "/telegram/webhook", { method: "POST" })).status, 503);
 });
 
+test("Høringsportalen first-seen records stay notification-ineligible while later meaningful updates remain distinguishable", async () => {
+  const proposed = { immigration_ministry: null, immigration_category: null };
+  const baselineRun = "00000000-0000-4000-8000-000000000036";
+  assert.equal((await start(baselineRun, { source: "hoeringsportalen", mode: "historical", proposed })).status, 201);
+  assert.equal((await batch(baselineRun, [])).status, 201);
+  assert.equal((await commit(baselineRun)).body.status, "COMMITTED");
+  const run1 = "00000000-0000-4000-8000-000000000037";
+  const record = {
+    source: "hoeringsportalen", external_id: "910", title: "Ældre høring fundet i feed-vinduet",
+    url: "https://hoeringsportalen.dk/Hearing/Details/910", relevance: "DIRECT", relevance_reason: "rule match",
+    ruleset_version: "1.1", status: null, publication_type: null, published_at: null,
+    source_updated_at: "2020-01-02T00:00:00.000000Z", source_updated_at_raw: "2020-01-02T00:00:00Z",
+    historical: false, notification_blocked: false, complete: true, diagnostics: [],
+    source_metadata: { feed_codes: ["immigration_ministry"] },
+    normalized_snapshot: { title: "Ældre høring fundet i feed-vinduet", content_text: null, status: null, publication_type: null, relevance: "DIRECT", documents: [], stages: [], votes: [] },
+  };
+  assert.equal((await start(run1, { source: "hoeringsportalen", proposed })).status, 201);
+  assert.equal((await batch(run1, [record])).status, 201);
+  assert.equal((await commit(run1)).body.status, "COMMITTED");
+  const first = await query("SELECT event_type, notify_eligible FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=2 AND p.external_id='910'");
+  assert.deepEqual(first, [{ event_type: "FIRST_SEEN", notify_eligible: 0 }]);
+
+  const run2 = "00000000-0000-4000-8000-000000000038";
+  const updated = { ...record, title: "Ældre høring med opdateret titel", normalized_snapshot: { ...record.normalized_snapshot, title: "Ældre høring med opdateret titel" } };
+  assert.equal((await start(run2, { source: "hoeringsportalen", proposed })).status, 201);
+  assert.equal((await batch(run2, [updated])).status, 201);
+  assert.equal((await commit(run2)).body.status, "COMMITTED");
+  const events = await query("SELECT event_type, notify_eligible FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=2 AND p.external_id='910' ORDER BY e.id");
+  assert.deepEqual(events, [{ event_type: "FIRST_SEEN", notify_eligible: 0 }, { event_type: "TITLE_CHANGED", notify_eligible: 1 }]);
+});
+
 test("staging cleanup defaults to dry-run and preserves active, blocked, publication, event, user, and checkpoint data", async () => {
   const old = "2000-01-01T00:00:00.000Z";
   await query("UPDATE ingestion_runs SET completed_at='" + old + "' WHERE run_id IN ('00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000005')");
@@ -419,7 +450,7 @@ test("local D1 stores deduplicated snapshots, event transitions and notification
   const publications = result[0] as any[];
   const events = result[1] as any[];
   const checkpoints = result[2] as any[];
-  assert.equal(publications.length, 13);
+  assert.equal(publications.length, 14);
   const case42 = publications.find((row) => row.source_id === 1 && row.external_id === "42");
   assert.equal(case42?.original_title, "Forslag om udvidet Ukrainesærloven");
   assert.equal(case42?.source_complete, 1);

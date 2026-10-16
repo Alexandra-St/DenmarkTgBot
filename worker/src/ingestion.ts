@@ -380,10 +380,11 @@ async function processStaged(db: D1Database, runId: string, sourceId: number, mo
   const canNotify = mode === "incremental" && !incoming.historical && incoming.complete &&
     !incoming.notification_blocked && incoming.relevance !== "IRRELEVANT";
   for (const change of changes) {
+    const eventNotifyEligible = canNotify && !(incoming.source === "hoeringsportalen" && change.type === "FIRST_SEEN");
     const fingerprint = await sha256(canonical({ type: change.type, snapshot: change.snapshot }));
     const eventKey = "ingest:" + runId + ":" + sourceId + ":" + incoming.external_id + ":" + change.type + ":" + fingerprint;
     statements.push(db.prepare("INSERT INTO publication_events (publication_id, event_key, event_type, previous_status, new_status, occurred_at, detected_at, notify_eligible, change_snapshot_json) SELECT id, ?, ?, ?, ?, NULL, ?, ?, ? FROM publications WHERE source_id = ? AND external_id = ? AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0) ON CONFLICT (event_key) DO NOTHING")
-      .bind(eventKey, change.type, change.previousStatus, change.newStatus, now, canNotify ? 1 : 0, canonical(change.snapshot), sourceId, incoming.external_id, runId, sourceId, incoming.external_id));
+      .bind(eventKey, change.type, change.previousStatus, change.newStatus, now, eventNotifyEligible ? 1 : 0, canonical(change.snapshot), sourceId, incoming.external_id, runId, sourceId, incoming.external_id));
   }
   statements.push(
     db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0").bind(runId, sourceId, incoming.external_id),

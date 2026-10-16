@@ -10,6 +10,7 @@ from collectors.ingestion_client import (
     USER_AGENT,
     chunks,
     collection_complete,
+    filter_incremental_hearings,
     prepare_records,
     proposed_checkpoints,
     upload,
@@ -75,10 +76,13 @@ class FakeHTTPResponse:
 
 class ClientTests(unittest.TestCase):
     def test_prepares_historical_hearing_without_live_fetch(self):
-        result = prepare_records(hearing_output(), "hoeringsportalen", "historical")[0]
+        value = hearing_output()
+        value["publications"][0]["updated_at_raw"] = "2026-10-16T10:11:12.123456+00:00"
+        result = prepare_records(value, "hoeringsportalen", "historical")[0]
         self.assertTrue(result["historical"])
         self.assertEqual(result["source_updated_at"], "2026-10-16T10:11:12.123456Z")
         self.assertEqual(result["source_metadata"]["feed_codes"], ["immigration_ministry", "immigration_category"])
+        self.assertEqual(result["source_updated_at_raw"], "2026-10-16T10:11:12.123456+00:00")
         self.assertEqual(result["normalized_snapshot"]["content_text"], "Proposed changes")
         self.assertEqual(result["ruleset_version"], "1.1")
 
@@ -108,6 +112,39 @@ class ClientTests(unittest.TestCase):
         result = proposed_checkpoints(hearing_output(), "hoeringsportalen", current)
         self.assertEqual(result["immigration_ministry"], {"timestamp": "2026-10-16T10:11:12.123456Z", "id": 71507})
         self.assertEqual(result["immigration_category"], {"timestamp": "2026-10-14T00:00:00Z", "id": 2})
+
+    def test_incremental_filter_uses_independent_checkpoints_and_includes_uninitialized_feed(self):
+        records = prepare_records(hearing_output(), "hoeringsportalen", "incremental")
+        both = records[0]
+        both["source_metadata"]["feed_codes"] = ["immigration_ministry", "immigration_category"]
+        current = {"streams": [
+            {"stream": "immigration_ministry", "checkpoint": {"timestamp": "2026-10-16T10:11:12.123456Z", "id": 71507}},
+            {"stream": "immigration_category", "checkpoint": None},
+        ]}
+        self.assertEqual(filter_incremental_hearings(records, current), records)
+
+        current["streams"][1]["checkpoint"] = {"timestamp": "2026-10-16T10:11:12.123456Z", "id": 71507}
+        self.assertEqual(filter_incremental_hearings(records, current), [])
+
+        current["streams"][0]["checkpoint"] = {"timestamp": "2026-10-16T11:11:12.123456+01:00", "id": 71507}
+        self.assertEqual(filter_incremental_hearings(records, current), [])
+
+    def test_incremental_filter_keeps_cursor_overlap_and_new_records_only(self):
+        records = prepare_records(hearing_output(), "hoeringsportalen", "incremental")
+        current = {"streams": [
+            {"stream": "immigration_ministry", "checkpoint": {"timestamp": "2026-10-16T10:11:12.123456Z", "id": 71506}},
+            {"stream": "immigration_category", "checkpoint": {"timestamp": "2026-10-16T10:11:12.123456Z", "id": 71507}},
+        ]}
+        self.assertEqual(filter_incremental_hearings(records, current), records)
+        current["streams"][0]["checkpoint"] = {"timestamp": "2026-10-16T10:11:12.123456Z", "id": 71507}
+        self.assertEqual(filter_incremental_hearings(records, current), [])
+
+    def test_missing_invalid_feed_cursor_fails_closed_or_includes_full_feed(self):
+        records = prepare_records(hearing_output(), "hoeringsportalen", "incremental")
+        self.assertEqual(filter_incremental_hearings(records, {"streams": []}), records)
+        current = {"streams": [{"stream": "immigration_ministry", "checkpoint": {"timestamp": "invalid", "id": 1}}]}
+        with self.assertRaisesRegex(IngestionError, "checkpoint"):
+            filter_incremental_hearings(records, current)
 
     def test_oda_checkpoints_preserve_fractional_precision_and_prior_empty_stream(self):
         value = oda_output()
@@ -141,6 +178,28 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(start["proposed_checkpoints"]["immigration_ministry"]["id"], 71507)
         self.assertEqual(start["proposed_checkpoints"]["immigration_category"], None)
         self.assertEqual(json.loads(requests[2].data)["records"][0]["source"], "hoeringsportalen")
+
+    def test_upload_sends_empty_batch_when_both_feed_windows_are_unchanged(self):
+        value = hearing_output()
+        checkpoint = {"timestamp": "2026-10-16T10:11:12.123456Z", "id": 71507}
+        responses = [
+            {"source": "hoeringsportalen", "streams": [
+                {"stream": "immigration_ministry", "checkpoint": checkpoint},
+                {"stream": "immigration_category", "checkpoint": checkpoint},
+            ]},
+            {"accepted": True, "status": "OPEN"},
+            {"accepted": True, "accepted_records": 0},
+            {"run_id": "run", "status": "COMMITTED", "processed_records": 0, "checkpoints_advanced": True},
+        ]
+        requests = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            return FakeHTTPResponse(responses.pop(0))
+
+        result = upload(value, source="hoeringsportalen", mode="incremental", endpoint="https://ingest.example", token="test-only-token", run_id="run", opener=opener)
+        self.assertEqual(result["accepted_records"], 0)
+        self.assertEqual(json.loads(requests[2].data)["records"], [])
 
     def test_dry_run_does_not_send_http_and_reports_incomplete_status(self):
         opener = Mock(side_effect=AssertionError("dry run must not perform HTTP"))

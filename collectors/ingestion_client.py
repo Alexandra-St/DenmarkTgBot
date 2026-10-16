@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -96,8 +97,10 @@ def prepare_records(value: object, source: str, mode: str, run_diagnostics: obje
             if not isinstance(feed_codes, list) or not all(code in HEARING_FEEDS for code in feed_codes):
                 raise IngestionError("Høringsportalen record has invalid feed membership")
             metadata = {key: row.get(key) for key in ("author", "feed_codes")}
+            metadata["updated_at_raw"] = row.get("updated_at_raw", row.get("updated_at"))
             metadata["content_text"] = content
-            raw_updated = row.get("updated_at") if isinstance(row.get("updated_at"), str) else None
+            raw_updated_value = row.get("updated_at_raw", row.get("updated_at"))
+            raw_updated = raw_updated_value if isinstance(raw_updated_value, str) else None
             snapshot = {"title": title, "content_text": content, "documents": [], "stages": [], "votes": []}
             publication_type = None
             status = None
@@ -166,6 +169,11 @@ def _cursor(value: object, source: str) -> dict[str, Any] | None:
     return {"timestamp": timestamp, "id": entity_id}
 
 
+def _cursor_key(value: Mapping[str, Any]) -> tuple[datetime, int]:
+    timestamp = datetime.fromisoformat(str(value["timestamp"]).replace("Z", "+00:00"))
+    return timestamp.astimezone(timezone.utc), int(value["id"])
+
+
 def proposed_checkpoints(value: object, source: str, current: object) -> dict[str, dict[str, Any] | None]:
     current_rows = _dict(current)
     saved: dict[str, dict[str, Any] | None] = {}
@@ -191,11 +199,44 @@ def proposed_checkpoints(value: object, source: str, current: object) -> dict[st
         previous = saved.get(name)
         if candidate is None:
             proposed[name] = previous
-        elif previous is None or (candidate["timestamp"], candidate["id"]) >= (previous["timestamp"], previous["id"]):
+        elif previous is None or _cursor_key(candidate) >= _cursor_key(previous):
             proposed[name] = candidate
         else:
             proposed[name] = previous
     return proposed
+
+
+def filter_incremental_hearings(records: list[dict[str, Any]], current: object) -> list[dict[str, Any]]:
+    """Keep records ahead of at least one independent feed checkpoint.
+
+    An unset feed checkpoint intentionally includes its full current window.
+    Equal cursor pairs are considered already observed.
+    """
+    saved: dict[str, dict[str, Any] | None] = {}
+    for item in _rows(_dict(current).get("streams")):
+        name = item.get("stream")
+        if name in HEARING_FEEDS:
+            saved[str(name)] = _cursor(item.get("checkpoint"), "hoeringsportalen")
+
+    selected: list[dict[str, Any]] = []
+    for record in records:
+        feeds = _dict(record.get("source_metadata")).get("feed_codes")
+        if not isinstance(feeds, list) or not feeds:
+            selected.append(record)
+            continue
+        timestamp = record.get("source_updated_at")
+        external_id = record.get("external_id")
+        if not _utc(timestamp) or not isinstance(external_id, str) or not external_id.isdigit():
+            raise IngestionError("publication has an invalid incremental cursor")
+        candidate = (datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc), int(external_id))
+        if any(
+            feed not in HEARING_FEEDS
+            or saved.get(feed) is None
+            or candidate > _cursor_key(saved[feed])
+            for feed in feeds
+        ):
+            selected.append(record)
+    return selected
 
 
 def chunks(records: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -266,6 +307,12 @@ def upload(value: object, *, source: str, mode: str, endpoint: str, token: str, 
         raise IngestionError("set INGEST_API_URL and INGEST_API_TOKEN, or use --dry-run")
     state_url = endpoint.rstrip("/") + "/internal/source-states?source=" + source
     state = _request(state_url, token, "GET", None, opener)
+    if source == "hoeringsportalen" and mode == "incremental":
+        records = filter_incremental_hearings(records, state)
+        batches = chunks(records)
+        counts = {}
+        for item in records:
+            counts[item["relevance"]] = counts.get(item["relevance"], 0) + 1
     checkpoints = proposed_checkpoints(value, source, state)
     _request(endpoint.rstrip("/") + "/internal/ingest", token, "POST", {
         "action": "start", "run_id": run_id, "source": source, "mode": mode,

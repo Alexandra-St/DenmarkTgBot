@@ -51,6 +51,7 @@ class Consultation:
     author: str | None
     content_text: str | None
     feed_codes: tuple[str, ...]
+    updated_at_raw: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         result = asdict(self)
@@ -206,6 +207,7 @@ def parse_feed(xml_data: bytes | str, feed_code: str) -> ParseResult:
                 author=author,
                 content_text=_content_text(entry.find(f"{ATOM}content")),
                 feed_codes=(feed_code,),
+                updated_at_raw=updated_raw,
             )
         )
     return ParseResult(tuple(parsed_entries), len(root.findall(f"{ATOM}entry")), invalid_entries, invalid_timestamps)
@@ -292,6 +294,7 @@ def deduplicate(entries: list[Consultation] | tuple[Consultation, ...]) -> list[
             author=selected.author,
             content_text=selected.content_text,
             feed_codes=feeds,
+            updated_at_raw=selected.updated_at_raw,
         )
         LOGGER.info("Duplicate consultation %s merged from feeds %s", entry.external_id, ",".join(feeds))
 
