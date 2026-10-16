@@ -6,7 +6,7 @@ A free, open-source Telegram bot project for monitoring official Danish legislat
 
 ## Current status
 
-Phase 1.0.4 prepares Telegram onboarding, language selection, a localized menu, About, and notification settings for production. User preferences use the existing D1 schema. Source monitoring, News, Archive, and notification delivery are not implemented. Production deployment and Telegram webhook registration are pending.
+Phase 1.0.4 prepares Telegram onboarding, language selection, a localized menu, About, and notification settings for production. The production D1 database is created in the EU and its initial schema is applied. Worker deployment and Telegram webhook registration are pending. Source monitoring, News, Archive, and notification delivery are not implemented.
 
 ## Technology stack
 
