@@ -27,3 +27,15 @@ The earlier block is not reproducible now, so its precise trigger is unresolved.
 ## Manual workflow and cost
 
 `.github/workflows/hoeringsportalen-incremental.yml` is `workflow_dispatch` only, with an explicit production-ingestion confirmation input. No schedule or notification delivery is enabled. Configure `INGEST_API_URL` as a GitHub Actions variable and `INGEST_API_TOKEN` as a GitHub Actions secret. The workflow uses Python's standard library, GitHub-hosted runners, a ten-minute timeout, and a concurrency lock. Before considering a schedule, assess the 25-entry window risk, add failure alerting, and verify the repository's available GitHub Actions minutes. No paid service is required by this workflow.
+
+## Future automatic pipeline (not enabled)
+
+Recommended free scheduler: GitHub Actions scheduled workflow for Høringsportalen, with the workflow file committed to the default branch and its current concurrency lock retained. A possible starting cadence is three runs per day at minute 17, for example, 17 6,14,22 * * * UTC, avoiding the top of the hour. This is only a proposal; no schedule has been added. A scheduled run would also need a separately reviewed condition because today's manual workflow requires the confirm_production_ingestion input.
+
+The collection workflow is capped at ten minutes. Three runs daily would have a worst-case budget of 930 runner minutes in a 31-day month, before other repository workflows. GitHub Free currently includes 2,000 standard-runner minutes per month for private repositories; standard GitHub-hosted runner use in public repositories is free. Check the account's remaining allowance before activation. GitHub documents that scheduled runs can be delayed or dropped during high load, particularly near the hour, so a schedule is best effort rather than a delivery guarantee ([billing and included usage](https://docs.github.com/en/billing/concepts/product-billing/github-actions), [schedule event limitations](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)).
+
+The intended end-to-end path is:
+
+Official Høringsportalen feeds → collect both feeds → validate, deduplicate, and classify with ruleset 1.1 → submit complete bounded batches → Worker persists and compares semantic snapshots → eligible events enter the idempotent notification queue → separately gated Telegram delivery.
+
+Today, only the manual collect/classify/ingest workflow exists. The notification queue and delivery components are local code and are not called from ingestion, a route, or a schedule. Before future activation, add failure reporting for collection and commit failures, verify checkpoints and committed run status, invoke queue preparation only after a successful commit, and keep delivery behind its own explicit cutoff and enable flag. Maintain a single logical sender; rows in SENDING after interruption require manual review. No automatic monitoring, notification queueing, or delivery is enabled by this documentation change.

@@ -22,7 +22,10 @@ export interface NotificationQueueResult {
 function activationCutoff(value: string | undefined): Date | null {
   if (!value || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value)) return null;
   const parsed = new Date(value);
-  return Number.isFinite(parsed.getTime()) ? parsed : null;
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 19) !== value.slice(0, 19)) return null;
+  const fraction = /\.(\d{1,3})Z$/.exec(value)?.[1];
+  if (fraction && parsed.toISOString().slice(20, 23) !== fraction.padEnd(3, "0")) return null;
+  return parsed;
 }
 
 /** Create durable pending rows only after an explicit activation cutoff is configured and reached. */

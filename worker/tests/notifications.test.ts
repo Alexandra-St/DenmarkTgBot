@@ -1,15 +1,25 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
+import { handleIngestionRequest } from "../src/ingestion.ts";
 import {
   deliverPendingNotifications,
   formatNotification,
   prepareNotificationQueue,
 } from "../src/notifications.ts";
 
+const batchExecute = Symbol("batchExecute");
+
 class LocalD1Fixture {
-  private readonly sqlite = new DatabaseSync(":memory:");
+  private readonly sqlite: DatabaseSync;
+  constructor(path = ":memory:") {
+    this.sqlite = new DatabaseSync(path);
+    this.sqlite.exec("PRAGMA foreign_keys = ON");
+  }
   exec(sql: string): void { this.sqlite.exec(sql); }
   prepare(sql: string) {
     const statement = this.sqlite.prepare(sql);
@@ -31,7 +41,26 @@ class LocalD1Fixture {
         const result = statement.run(...values);
         return { success: true, meta: { changes: result.changes, last_row_id: Number(result.lastInsertRowid) } };
       },
+      [batchExecute]: () => {
+        const result = statement.run(...values);
+        return { success: true, meta: { changes: result.changes, last_row_id: Number(result.lastInsertRowid) } };
+      },
     };
+  }
+  async batch(statements: Array<Record<PropertyKey, unknown>>) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const results = statements.map((statement) => {
+        const execute = statement[batchExecute];
+        if (typeof execute !== "function") throw new Error("invalid local D1 statement");
+        return (execute as () => unknown)();
+      });
+      this.sqlite.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
   }
   close(): void { this.sqlite.close(); }
 }
@@ -76,6 +105,7 @@ test("activation cutoff fails closed when missing, invalid, or not yet reached",
     await addEvent(db, { id: "1" });
     assert.deepEqual(await prepareNotificationQueue({ DB: db as never }, now), { eligible: false, queued: 0 });
     assert.deepEqual(await prepareNotificationQueue({ DB: db as never, NOTIFICATION_ACTIVATION_CUTOFF: "not-a-date" }, now), { eligible: false, queued: 0 });
+    assert.deepEqual(await prepareNotificationQueue({ DB: db as never, NOTIFICATION_ACTIVATION_CUTOFF: "2026-02-30T00:00:00Z" }, now), { eligible: false, queued: 0 });
     assert.deepEqual(await prepareNotificationQueue({ DB: db as never, NOTIFICATION_ACTIVATION_CUTOFF: "2026-10-17T00:00:00Z" }, now), { eligible: false, queued: 0 });
     const rows = await db.prepare("SELECT COUNT(*) AS count FROM notifications").first<{ count: number }>();
     assert.equal(rows?.count, 0);
@@ -102,6 +132,11 @@ test("delivery-state migration preserves existing notification records", async (
     assert.deepEqual({ ...preserved }, { telegram_id: 77, event_id: 1, status: "PENDING", attempts: 0 });
     const table = await db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='notifications'").first<{ sql: string }>();
     assert.match(table?.sql ?? "", /'SENDING'/u);
+    const user = await db.prepare("SELECT language, notify_direct, notify_potential FROM users WHERE telegram_id = 77")
+      .first<{ language: string; notify_direct: number; notify_potential: number }>();
+    assert.deepEqual({ ...user }, { language: "uk", notify_direct: 1, notify_potential: 0 });
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM publications").first<{ count: number }>())?.count, 1);
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM publication_events").first<{ count: number }>())?.count, 1);
   } finally { db.close(); }
 });
 
@@ -204,6 +239,26 @@ test("Telegram timeout/error is terminal and is not retried automatically", asyn
   } finally { db.close(); }
 });
 
+for (const [name, error] of [
+  ["Telegram rejection", new Error("Telegram rejected the request")],
+  ["network failure", new TypeError("network unavailable")],
+] as const) {
+  test(name + " is terminal and is never resent", async () => {
+    const db = await fixture();
+    try {
+      const eventId = await addEvent(db, { id: name.replaceAll(" ", "-") });
+      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
+        .bind(eventId, now.toISOString()).run();
+      let calls = 0;
+      const env = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_ACTIVATION_CUTOFF: cutoff };
+      const mock = { async sendMessage() { calls += 1; throw error; } };
+      assert.deepEqual(await deliverPendingNotifications(env, mock, now), { enabled: true, sent: 0, failed: 1 });
+      assert.deepEqual(await deliverPendingNotifications(env, mock, now), { enabled: true, sent: 0, failed: 0 });
+      assert.equal(calls, 1);
+    } finally { db.close(); }
+  });
+}
+
 test("concurrent dispatchers claim a notification once; invalid URLs are never sent", async () => {
   const db = await fixture();
   try {
@@ -230,4 +285,155 @@ test("concurrent dispatchers claim a notification once; invalid URLs are never s
     assert.equal(invalidResult.failed, 1);
     assert.equal(calls, 1, "invalid official URL is never sent");
   } finally { db.close(); }
+});
+
+test("a row left SENDING by process interruption is not automatically resent", async () => {
+  const db = await fixture();
+  try {
+    const eventId = await addEvent(db, { id: "interrupted" });
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, attempts, created_at) VALUES (1, ?, 'SENDING', 1, ?)")
+      .bind(eventId, now.toISOString()).run();
+    let calls = 0;
+    const result = await deliverPendingNotifications({
+      DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_ACTIVATION_CUTOFF: cutoff,
+    }, { async sendMessage() { calls += 1; } }, now);
+    assert.deepEqual(result, { enabled: true, sent: 0, failed: 0 });
+    assert.equal(calls, 0);
+    const row = await db.prepare("SELECT status, attempts FROM notifications WHERE event_id = ?")
+      .bind(eventId).first<{ status: string; attempts: number }>();
+    assert.deepEqual({ ...row }, { status: "SENDING", attempts: 1 });
+  } finally { db.close(); }
+});
+
+test("local end-to-end: historical baseline, incremental changes, preference queue, and mock delivery", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "denmarktgbot-notification-e2e-"));
+  const db = new LocalD1Fixture(join(directory, "temporary-d1.sqlite"));
+  const token = "local-e2e-only-token";
+  const env = { DB: db as never, INGEST_API_TOKEN: token };
+  const invoke = async (body: Record<string, unknown>) => {
+    const response = await handleIngestionRequest(new Request("https://local.test/internal/ingest", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }), env as never);
+    return { status: response.status, body: await response.json() as Record<string, unknown> };
+  };
+  const cursor = (timestamp: string, id: number) => ({ timestamp, id });
+  const checkpoints = (timestamp: string, id: number) => ({
+    immigration_ministry: cursor(timestamp, id),
+    immigration_category: cursor(timestamp, id),
+  });
+  const rawPublication = (
+    id: number,
+    changed = false,
+  ) => {
+    const title = (id === 101 ? "Forslag om Ukrainesærloven" : id === 102 ? "Udlændingeloven om opholdstilladelser" : "Vejtrafikregler " + id)
+      + (changed ? " — updated" : "");
+    return {
+      external_id: String(id), title,
+      url: "https://hoeringsportalen.dk/Hearing/Details/" + id,
+      content_text: changed ? "Revised consultation text" : "Original consultation text",
+      source_updated_at: changed ? "2026-10-16T10:00:00.000Z" : "2026-09-01T10:00:00.000Z",
+      updated_at: changed ? "2026-10-16T10:00:00Z" : "2026-09-01T10:00:00Z",
+      updated_at_raw: changed ? "2026-10-16T10:00:00Z" : "2026-09-01T10:00:00Z",
+      author: "Official ministry", feed_codes: ["immigration_ministry", "immigration_category"],
+      complete: true,
+    };
+  };
+  const classify = (publications: Array<Record<string, unknown>>, mode: "historical" | "incremental") => {
+    const script = "import json,sys; from collectors.ingestion_client import prepare_records; print(json.dumps(prepare_records(json.load(sys.stdin), 'hoeringsportalen', '" + mode + "')))";
+    return JSON.parse(execFileSync("python3", ["-c", script], {
+      cwd: new URL("../../", import.meta.url).pathname,
+      input: JSON.stringify({ publications }),
+      encoding: "utf8",
+    })) as Array<Record<string, unknown>>;
+  };
+  const run = async (
+    runId: string,
+    mode: "historical" | "incremental",
+    records: Array<Record<string, unknown>>,
+    checkpointSet: Record<string, unknown>,
+  ) => {
+    const started = await invoke({
+      action: "start", run_id: runId, source: "hoeringsportalen", mode,
+      expected_batches: 1, collection_complete: true, proposed_checkpoints: checkpointSet,
+    });
+    assert.ok(started.status === 201 || started.body.idempotent === true, JSON.stringify(started.body));
+    const submitted = await invoke({ action: "batch", run_id: runId, batch_index: 0, records });
+    assert.equal(submitted.status, 201, JSON.stringify(submitted.body));
+    let committed = await invoke({ action: "commit", run_id: runId });
+    for (let attempt = 0; committed.body.status !== "COMMITTED" && attempt < 5; attempt += 1) {
+      assert.equal(committed.body.status, "COMMITTING");
+      committed = await invoke({ action: "commit", run_id: runId });
+    }
+    assert.equal(committed.body.status, "COMMITTED", JSON.stringify(committed.body));
+  };
+
+  try {
+    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql"]) {
+      db.exec(await readFile(new URL("../migrations/" + migration, import.meta.url), "utf8"));
+    }
+    const timestamp = new Date().toISOString();
+    await db.prepare("INSERT INTO users (telegram_id, language, notify_direct, notify_potential, created_at, updated_at) VALUES (1001, 'uk', 1, 0, ?, ?), (1002, 'ru', 0, 1, ?, ?), (1003, 'uk', 0, 0, ?, ?)")
+      .bind(timestamp, timestamp, timestamp, timestamp, timestamp, timestamp).run();
+
+    const historicalRaw = Array.from({ length: 25 }, (_, index) => rawPublication(101 + index));
+    const historical = classify(historicalRaw, "historical");
+    assert.deepEqual(historical.slice(0, 3).map((row) => row.relevance), ["DIRECT", "POTENTIAL", "IRRELEVANT"]);
+    await run("00000000-0000-4000-8000-000000000101", "historical", historical,
+      checkpoints("2026-09-01T10:00:00.000Z", 125));
+    const baseline = await db.prepare("SELECT COUNT(*) AS count FROM source_ingestion_baselines").first<{ count: number }>();
+    const historicalRows = await db.prepare("SELECT COUNT(*) AS count FROM publications WHERE historical = 1").first<{ count: number }>();
+    const historicalEvents = await db.prepare("SELECT COUNT(*) AS count FROM publication_events WHERE event_type = 'FIRST_SEEN' AND notify_eligible = 0").first<{ count: number }>();
+    assert.equal(baseline?.count, 1);
+    assert.equal(historicalRows?.count, 25);
+    assert.equal(historicalEvents?.count, 25);
+
+    const activationCutoff = new Date(Date.now() - 5_000).toISOString();
+    const incrementalRaw = historicalRaw.map((item, index) => index < 2
+      ? rawPublication(Number(item.external_id), true)
+      : item);
+    const incremental = classify(incrementalRaw, "incremental");
+    await run("00000000-0000-4000-8000-000000000102", "incremental", incremental,
+      checkpoints("2026-10-16T10:00:00.000Z", 125));
+    const semanticEvents = await db.prepare("SELECT event_type, COUNT(*) AS count FROM publication_events WHERE event_type != 'FIRST_SEEN' GROUP BY event_type ORDER BY event_type")
+      .all<{ event_type: string; count: number }>();
+    assert.deepEqual(semanticEvents.results.map((row) => ({ ...row })), [
+      { event_type: "CONTENT_CHANGED", count: 2 },
+      { event_type: "TITLE_CHANGED", count: 2 },
+    ]);
+
+    const envWithCutoff = {
+      DB: db as never,
+      NOTIFICATION_ACTIVATION_CUTOFF: activationCutoff,
+      NOTIFICATION_DELIVERY_ENABLED: "true",
+    };
+    assert.deepEqual(await prepareNotificationQueue({ DB: db as never }, new Date()), { eligible: false, queued: 0 });
+    assert.deepEqual(await prepareNotificationQueue(envWithCutoff, new Date()), { eligible: true, queued: 4 });
+    assert.deepEqual(await prepareNotificationQueue(envWithCutoff, new Date()), { eligible: true, queued: 0 });
+    const candidateRows = await db.prepare("SELECT u.telegram_id, u.language, p.relevance, e.event_type FROM notifications n JOIN users u ON u.telegram_id=n.telegram_id JOIN publication_events e ON e.id=n.event_id JOIN publications p ON p.id=e.publication_id ORDER BY u.telegram_id, e.event_type")
+      .all<{ telegram_id: number; language: string; relevance: string; event_type: string }>();
+    assert.equal(candidateRows.results.length, 4);
+    assert.ok(candidateRows.results.filter((row) => row.telegram_id === 1001).every((row) => row.language === "uk" && row.relevance === "DIRECT"));
+    assert.ok(candidateRows.results.filter((row) => row.telegram_id === 1002).every((row) => row.language === "ru" && row.relevance === "POTENTIAL"));
+    assert.equal(candidateRows.results.some((row) => row.telegram_id === 1003), false);
+
+    const sent: Array<{ chatId: number; text: string }> = [];
+    const delivery = await deliverPendingNotifications(envWithCutoff, {
+      async sendMessage(chatId, text) { sent.push({ chatId, text }); },
+    }, new Date());
+    assert.deepEqual(delivery, { enabled: true, sent: 4, failed: 0 });
+    assert.equal(sent.length, 4);
+    assert.equal(sent.filter((item) => item.chatId === 1001 && item.text.includes("не юридична консультація")).length, 2);
+    assert.equal(sent.filter((item) => item.chatId === 1002 && item.text.includes("не юридическая консультация")).length, 2);
+    assert.ok(sent.every((item) => item.text.includes("https://hoeringsportalen.dk/Hearing/Details/")));
+    const states = await db.prepare("SELECT status, COUNT(*) AS count FROM notifications GROUP BY status").all<{ status: string; count: number }>();
+    assert.deepEqual(states.results.map((row) => ({ ...row })), [{ status: "SENT", count: 4 }]);
+    const oldFirstSeenNotifications = await db.prepare("SELECT COUNT(*) AS count FROM notifications n JOIN publication_events e ON e.id=n.event_id WHERE e.event_type='FIRST_SEEN'")
+      .first<{ count: number }>();
+    assert.equal(oldFirstSeenNotifications?.count, 0);
+  } finally {
+    db.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

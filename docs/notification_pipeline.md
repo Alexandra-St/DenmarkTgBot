@@ -15,6 +15,12 @@ Høringsportalen FIRST_SEEN is explicitly excluded even if a row is accidentally
 
 The activation cutoff is a manual future policy value, not a setting activated by this phase. Existing preferences are read only.
 
+## Local integration verification
+
+The end-to-end test uses a disposable file-backed SQLite database with the D1 schema and all migrations. It runs the real ingestion handler, prepares records with the existing Python ruleset 1.1 ingestion client, imports 25 historical Høringsportalen records, then submits a complete incremental window with two changed publications. The test verifies the baseline and first-seen suppression, detects the title/content events, queues only matching DIRECT/POTENTIAL user preferences in Ukrainian/Russian, and completes mock-only deliveries. No external source or Telegram request is made.
+
+Migration 0005 is also tested from an empty database and against the previous schema with existing user preferences, publication, event, and PENDING notification rows; those rows and values remain intact.
+
 ## Delivery and message content
 
 The separate deliverPendingNotifications component uses a Telegram client interface so local tests use mocks. It rechecks the activation cutoff, freshness, event eligibility, publication history/completeness, category preference, and Høringsportalen first-seen restriction immediately before sending. It validates official HTTPS hosts and fails closed for unknown event types or invalid URLs.
@@ -26,5 +32,12 @@ Migration 0005_notification_delivery_claim.sql adds SENDING. A dispatcher claims
 ## Retry and delivery limits
 
 Telegram sendMessage and D1 status persistence cannot form one transaction. If Telegram accepts a message but the response times out, the bot cannot know whether delivery occurred. The pipeline does not retry failed sends automatically, avoiding a possible duplicate at the cost of a possibly missed notification. A process crash after claiming leaves SENDING for manual review; automatic lease recovery/retry is intentionally not implemented. Exactly-once delivery cannot be guaranteed by this design.
+
+## Future monitoring sequence
+
+The future sequence is: official Høringsportalen feeds → collection of both feeds → validation, deduplication, and ruleset 1.1 classification → bounded incremental ingestion → semantic change detection → idempotent notification queue → separately gated Telegram delivery. The current GitHub Actions workflow is manual only; the queue and delivery functions are not integrated into it or into Worker routes.
+
+GitHub Actions scheduled workflows are the recommended free starting point, with a proposed three runs per day at minute 17 (17 6,14,22 * * * UTC). This cadence is a proposal only; no schedule was enabled. Keep the existing concurrency group and ten-minute timeout. Three maximum-length runs per day would use up to 930 minutes in a 31-day month. GitHub Free currently includes 2,000 standard-runner minutes monthly for private repositories, while standard hosted runners are free for public repositories; verify account usage and budget before enabling a schedule. GitHub notes scheduled runs may be delayed or dropped under high load, especially near the hour ([billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions), [schedule limitations](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)).
+
 
 Before any future production activation, review the activation cutoff, migration state, categories, stale-event window, stuck SENDING recovery procedure, and an explicit manual delivery enablement. No scheduling or production delivery is enabled by this phase.
