@@ -4,7 +4,9 @@ import type { TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "../
 import type { TelegramClient } from "../telegram.ts";
 import type { PublicationRepository, ArchiveFilter } from "../../database/publications.ts";
 import { MAX_PUBLICATION_PAGE } from "../../database/publications.ts";
+import type { SourceStatusRepository } from "../../database/source_status.ts";
 import { parseArchiveFilter, publicationDetailScreen, publicationListScreen } from "../publications.ts";
+import { sourceStatusScreen } from "../source_status.ts";
 import {
   backToMainKeyboard,
   languageKeyboard,
@@ -122,6 +124,7 @@ async function processCallback(
   repository: UserRepository,
   telegram: TelegramClient,
   publications?: PublicationRepository,
+  sourceStatus?: SourceStatusRepository,
   metrics?: CallbackMetrics,
 ): Promise<void> {
   const message = callback.message;
@@ -223,10 +226,16 @@ async function processCallback(
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, invalid.text, invalid.keyboard));
     }
   } else if (data === "menu:about") {
+    let lastSuccessfulHoeringsportalenRun: string | null = null;
+    try {
+      lastSuccessfulHoeringsportalenRun = await sourceStatus?.lastSuccessfulHoeringsportalenRun() ?? null;
+    } catch {
+      // About must stay available even if source metadata cannot be read.
+    }
     await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(
       message.chat.id,
       message.message_id,
-      t(language, "aboutText"),
+      `${t(language, "aboutText")}\n\n${sourceStatusScreen(language, lastSuccessfulHoeringsportalenRun)}`,
       backToMainKeyboard(language),
     ));
   }
@@ -237,6 +246,7 @@ async function handleCallback(
   repository: UserRepository,
   telegram: TelegramClient,
   publications?: PublicationRepository,
+  sourceStatus?: SourceStatusRepository,
 ): Promise<void> {
   const started = performance.now();
   const metrics: CallbackMetrics = { callback_ack_ms: 0, user_lookup_ms: 0, publication_lookup_ms: 0, telegram_edit_ms: 0 };
@@ -246,7 +256,7 @@ async function handleCallback(
     .then(() => "ok" as const, () => "telegram_api_error" as const);
   let processingError: unknown;
   try {
-    await processCallback(callback, repository, telegram, publications, metrics);
+    await processCallback(callback, repository, telegram, publications, sourceStatus, metrics);
   } catch (error) {
     processingError = error;
   }
@@ -271,13 +281,14 @@ export async function handleTelegramUpdate(
   repository: UserRepository,
   telegram: TelegramClient,
   publications?: PublicationRepository,
+  sourceStatus?: SourceStatusRepository,
 ): Promise<void> {
   if (update.message) {
     await handleMessage(update.message, repository, telegram);
     return;
   }
   if (update.callback_query) {
-    await handleCallback(update.callback_query, repository, telegram, publications);
+    await handleCallback(update.callback_query, repository, telegram, publications, sourceStatus);
   }
   // Unsupported Telegram update types are intentionally ignored.
 }

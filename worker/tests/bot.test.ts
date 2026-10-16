@@ -3,6 +3,7 @@ import { test } from "node:test";
 import worker from "../src/index.ts";
 import { handleTelegramUpdate } from "../src/bot/handlers/webhook.ts";
 import { D1UserRepository, type Language, type UserPreferences, type UserRepository } from "../src/database/users.ts";
+import type { SourceStatusRepository } from "../src/database/source_status.ts";
 import { TelegramApi, type TelegramClient } from "../src/bot/telegram.ts";
 import { languageKeyboard, settingsLanguageKeyboard } from "../src/bot/keyboards/index.ts";
 
@@ -26,6 +27,12 @@ class MemoryRepository implements UserRepository {
     const user = this.users.get(id);
     if (user) user[preference === "direct" ? "notify_direct" : "notify_potential"] = enabled ? 1 : 0;
   }
+}
+
+class MemorySourceStatus implements SourceStatusRepository {
+  private readonly timestamp: string | null;
+  constructor(timestamp: string | null) { this.timestamp = timestamp; }
+  async lastSuccessfulHoeringsportalenRun(): Promise<string | null> { return this.timestamp; }
 }
 
 class MemoryTelegram implements TelegramClient {
@@ -175,13 +182,13 @@ test("explicit preference callbacks are idempotent and DIRECT/POTENTIAL stay ind
 
 test("About and unknown callbacks are handled in selected language", async () => {
   for (const [id, language, expected] of [
-    [400, "ru", [/бесплатный информационный бот/, /Høringsportalen/, /Folketinget ещё не собраны/, /мониторинг и уведомления не включены/, /Telegram ID/, /не является юридической консультацией/]],
-    [401, "uk", [/безкоштовний інформаційний бот/, /Høringsportalen/, /Folketinget ще не зібрані/, /моніторинг і сповіщення не ввімкнені/, /Telegram ID/, /не є юридичною консультацією/]],
+    [400, "ru", [/бесплатный информационный бот/, /Høringsportalen/, /Folketinget: мониторинг пока не активен/, /автоматические уведомления пока отключены/i, /Telegram ID/, /не является юридической консультацией/]],
+    [401, "uk", [/безкоштовний інформаційний бот/, /Høringsportalen/, /Folketinget: моніторинг ще не активний/, /автоматичні сповіщення наразі вимкнені/i, /Telegram ID/, /не є юридичною консультацією/]],
   ] as const) {
     const repo = new MemoryRepository();
     const telegram = new MemoryTelegram();
     await handleTelegramUpdate(callback(id, `lang:${language}`), repo, telegram);
-    await handleTelegramUpdate(callback(id, "menu:about"), repo, telegram);
+    await handleTelegramUpdate(callback(id, "menu:about"), repo, telegram, undefined, new MemorySourceStatus(new Date().toISOString()));
     const about = telegram.edited.at(-1)!.text;
     for (const phrase of expected) assert.match(about, phrase);
     assert.ok(Array.from(about).length <= 4096, "About screen fits Telegram message limit");
@@ -194,6 +201,20 @@ test("About and unknown callbacks are handled in selected language", async () =>
     await handleTelegramUpdate(callback(id, "future:unknown"), repo, telegram);
     assert.equal(telegram.edited.length, count);
   }
+});
+
+test("About shows unknown Høringsportalen status when source metadata fails", async () => {
+  const repo = new MemoryRepository();
+  const telegram = new MemoryTelegram();
+  await handleTelegramUpdate(callback(402, "lang:ru"), repo, telegram);
+  const brokenSourceStatus: SourceStatusRepository = {
+    async lastSuccessfulHoeringsportalenRun() { throw new Error("database unavailable"); },
+  };
+  await handleTelegramUpdate(callback(402, "menu:about"), repo, telegram, undefined, brokenSourceStatus);
+  const text = telegram.edited.at(-1)!.text;
+  assert.match(text, /Høringsportalen: неизвестен/);
+  assert.match(text, /Folketinget: мониторинг пока не активен/);
+  assert.ok(Array.from(text).length <= 4096);
 });
 
 test("D1 repository uses the existing user fields and independent defaults", async () => {
