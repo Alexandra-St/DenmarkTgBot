@@ -19,6 +19,7 @@ from collectors.relevance import RULESET_VERSION, classify
 
 MAX_BATCH_BYTES = 220 * 1024
 MAX_BATCH_RECORDS = 50
+USER_AGENT = "DenmarkTgBot-IngestionClient/1.0"
 ODA_STREAMS = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
 HEARING_FEEDS = ("immigration_ministry", "immigration_category")
 _UTC = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?(?:Z|[+-]\d\d:\d\d)$")
@@ -222,7 +223,7 @@ def _request(endpoint: str, token: str, method: str, payload: object | None, ope
     body = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         endpoint, data=body, method=method,
-        headers={"Authorization": "Bearer " + token, "Accept": "application/json", **({"Content-Type": "application/json"} if body is not None else {})},
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": USER_AGENT, **({"Content-Type": "application/json"} if body is not None else {})},
     )
     for attempt in range(3):
         try:

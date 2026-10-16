@@ -7,6 +7,7 @@ from urllib.error import HTTPError
 
 from collectors.ingestion_client import (
     IngestionError,
+    USER_AGENT,
     chunks,
     collection_complete,
     prepare_records,
@@ -135,6 +136,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result["accepted_records"], 1)
         self.assertEqual(len(requests), 4)
         self.assertTrue(all(request.get_header("Authorization") == "Bearer test-only-token" for request in requests))
+        self.assertTrue(all(request.get_header("User-agent") == USER_AGENT for request in requests))
         start = json.loads(requests[1].data)
         self.assertEqual(start["proposed_checkpoints"]["immigration_ministry"]["id"], 71507)
         self.assertEqual(start["proposed_checkpoints"]["immigration_category"], None)

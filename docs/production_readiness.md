@@ -10,7 +10,14 @@ The reviewed Worker build is deployed at `https://denmarktgbot.alexandra-strona.
 
 The Worker has all required secret names: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, and `INGEST_API_TOKEN`. Existing Telegram secret values were not read or changed. The new ingestion token is stored in a permission-restricted local file outside the repository; its value is not recorded here.
 
-Post-deployment read-only D1 checks confirmed the original user/source counts and aggregated preferences were unchanged, publications and notifications remain empty, and no source baseline is initialized. No ingestion run, historical import, notification, or Telegram update was sent. The only initial health probe failure used Python's default User-Agent and received Cloudflare 1010; repeating the request with a standard User-Agent returned the expected HTTP 200.
+Post-deployment read-only D1 checks confirmed the original user/source counts and aggregated preferences were unchanged, publications and notifications remain empty, and no source baseline is initialized. The initial authenticated Python request used the default User-Agent and received Cloudflare 1010. Adding the explicit application User-Agent `DenmarkTgBot-IngestionClient/1.0` allowed the same authenticated read-only request to return HTTP 200; authentication and WAF settings were unchanged.
+
+## First production historical collection — 2026-10-16
+
+- **Høringsportalen:** both official ATOM feeds completed. 50 entries parsed, with 25 cross-feed duplicates merged into 25 unique publications. All IDs, official HTTPS URLs, and updated timestamps passed validation; no entries were skipped. Historical dry-run with ruleset 1.1 was complete and `would_submit=true`: 25 records in 1 batch (DIRECT 3, POTENTIAL 10, IRRELEVANT 12), all notification-blocked as historical. This is only the feeds' bounded recent selection, not a complete archive. The two proposed feed checkpoints are independent and both end at ID 71554 / `2026-09-29T06:47:21.000000Z`.
+- **Folketinget:** the configured 30-day historical scan did not complete. The ODA TLS handshake stalled during collection; the attempt was interrupted before any result was written. Its output is incomplete and was not dry-run or imported. No partial data was used to initialize a baseline.
+- **Production import:** no ingestion request was sent. No historical run or baseline was created. The production write remains pending an explicit approval gate for the durable import. Pre-import state was still 1 user, 2 sources, 0 publications, 0 publication events, 0 notifications, 0 source states, 0 source baselines, and no ingestion runs.
+- **Backup:** a fresh remote D1 export was restored locally and passed SQLite `integrity_check`; the restored schema contains the expected user/source/publication and ingestion tables. The backup and source snapshots remain outside the repository with restricted permissions.
 
 ## Before first import
 
