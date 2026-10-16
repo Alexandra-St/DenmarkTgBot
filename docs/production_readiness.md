@@ -4,51 +4,20 @@
 
 The collector-to-Worker flow passed locally against a temporary Wrangler D1 database. The local run applied migrations `0001`–`0004`, imported historical fixture records for both sources, then accepted an incremental Folketinget run. A first incremental run is rejected until that source has a committed historical baseline.
 
-Production migration inventory was checked read-only on 2026-10-16. Wrangler reported `0002_ingestion.sql`, `0003_ingestion_safety.sql`, and `0004_historical_baseline_gate.sql` as pending; `SELECT name FROM d1_migrations` returned only `0001_initial_schema.sql`. Therefore `0001` is applied and `0002`–`0004` are pending. The checked-in `worker/wrangler.jsonc` points to Worker `denmarktgbot` and D1 `denmarktgbot-db` (`1bbb417b-2b54-4f77-85ec-d3b94be9c0c8`). It contains no `INGEST_API_TOKEN` binding; the secret's presence is not confirmed. No production data was modified: no migration was applied, Worker deployed, source collected, Telegram call made, or secret changed.
+Production was checked and updated on 2026-10-16. The checked-in `worker/wrangler.jsonc` and Cloudflare account match Worker `denmarktgbot` and D1 `denmarktgbot-db` (`1bbb417b-2b54-4f77-85ec-d3b94be9c0c8`). Migrations `0001_initial_schema.sql` through `0004_historical_baseline_gate.sql` are recorded as applied; Wrangler reports no pending migrations.
 
-## Before any production run
+The reviewed Worker build is deployed at `https://denmarktgbot.alexandra-strona.workers.dev`, version `f6562445-5f6a-4075-b695-5e3f4b09a3bc`. `GET /health` returned HTTP 200. Unauthenticated `POST /internal/ingest`, `GET /internal/source-states`, and `POST /telegram/webhook` each returned HTTP 401. Invalid ingestion authorization returned 401. Authenticated read-only source-state requests returned HTTP 200 for both sources, with no state rows/checkpoints initialized.
 
-1. Review this checklist and approve the production change window. Confirm the Cloudflare account is on the intended free plan and the Worker/D1 names and ID above match the dashboard.
-2. Run the local checks from the repository root:
+The Worker has all required secret names: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, and `INGEST_API_TOKEN`. Existing Telegram secret values were not read or changed. The new ingestion token is stored in a permission-restricted local file outside the repository; its value is not recorded here.
 
-   ```sh
-   python3 -m unittest discover -s tests -v
-   cd worker
-   npm run typecheck
-   npm test
-   ```
+Post-deployment read-only D1 checks confirmed the original user/source counts and aggregated preferences were unchanged, publications and notifications remain empty, and no source baseline is initialized. No ingestion run, historical import, notification, or Telegram update was sent. The only initial health probe failure used Python's default User-Agent and received Cloudflare 1010; repeating the request with a standard User-Agent returned the expected HTTP 200.
 
-3. From `worker/`, recheck the remote migration inventory immediately before any approved change. These are read-only commands:
+## Before first import
 
-   ```sh
-   npx wrangler d1 migrations list denmarktgbot-db --remote
-   npx wrangler d1 execute denmarktgbot-db --remote --command "SELECT name FROM d1_migrations ORDER BY name"
-   ```
-
-   Verified on 2026-10-16: `0001_initial_schema.sql` is applied; `0002_ingestion.sql`, `0003_ingestion_safety.sql`, and `0004_historical_baseline_gate.sql` are pending. Wrangler's list output shows pending migrations; the read-only query confirms the applied migration names. Stop if a fresh inventory differs. Do not recreate the database or edit the migration history.
-
-4. Back up the existing D1 database to a restricted location and verify the export exists before continuing. Do not place it in the repository:
-
-   ```sh
-   npx wrangler d1 export denmarktgbot-db --remote --output=/secure/backups/denmarktgbot-before-ingestion-baseline.sql
-   ```
-
-5. After reviewing the three pending migration files and getting explicit change approval, apply the pending migrations in order. Wrangler applies the migration files that remain pending:
-
-   ```sh
-   npx wrangler d1 migrations apply denmarktgbot-db --remote
-   npx wrangler d1 migrations list denmarktgbot-db --remote
-   ```
-
-6. Configure `INGEST_API_TOKEN` as a Worker Secret in the Cloudflare dashboard. Use a newly generated secret, distinct from every Telegram credential. Never paste it into a command, repository file, or chat. Verify the secret **name** in the dashboard without copying its value.
-7. Deploy the reviewed Worker build from `worker/`:
-
-   ```sh
-   npm run deploy
-   curl --fail --show-error https://denmarktgbot.alexandra-strona.workers.dev/health
-   ```
-
-   The health response must be HTTP 200. Verify `POST /internal/ingest` and `GET /internal/source-states` return HTTP 401 without authorization. Then verify an authorized `GET /internal/source-states?source=folketinget` and `...?source=hoeringsportalen` using the operator's protected local environment; never print the token.
+1. Run the local checks from the repository root: `python3 -m unittest discover -s tests -v`, then from `worker/`: `npm run typecheck` and `npm test`. All checks passed before deployment (119 Python tests, 23 Worker tests, typecheck passed).
+2. Keep the first collection manually initiated. Collect both sources, inspect completeness and diagnostics, and run uploader `--dry-run` before any write.
+3. Run historical mode first for each source independently. Do not run incremental mode until that source's historical run reports `COMMITTED` and `checkpoints_advanced: true`; D1 enforces this order. Historical records/events remain ineligible for notifications.
+4. Do not schedule collection or enable notification delivery in this phase. The ingestion token is ready, but no import has been run.
 
 ## Historical-first import
 
