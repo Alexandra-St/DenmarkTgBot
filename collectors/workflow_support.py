@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
             mode = validate_execution_mode(
                 os.environ.get("GITHUB_EVENT_NAME", ""),
                 os.environ.get("CONFIRM_PRODUCTION_INGESTION", "false"),
-                os.environ.get("HOERINGSPORTAL_AUTOMATION_ENABLED", ""),
+                os.environ.get("HOERINGSPORTALEN_AUTOMATION_ENABLED", ""),
             )
         except WorkflowGateError as exc:
             print(f"workflow gate: {exc}", file=sys.stderr)
