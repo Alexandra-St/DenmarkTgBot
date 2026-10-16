@@ -2,6 +2,9 @@ import type { Language, UserPreferences, UserRepository } from "../../database/u
 import { t } from "../../localization/index.ts";
 import type { TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "../../types/telegram.ts";
 import type { TelegramClient } from "../telegram.ts";
+import type { PublicationRepository, ArchiveFilter } from "../../database/publications.ts";
+import { MAX_PUBLICATION_PAGE } from "../../database/publications.ts";
+import { parseArchiveFilter, publicationDetailScreen, publicationListScreen } from "../publications.ts";
 import {
   backToMainKeyboard,
   languageKeyboard,
@@ -51,6 +54,22 @@ async function showNotificationSettings(
   );
 }
 
+async function showPublicationList(
+  telegram: TelegramClient,
+  publications: PublicationRepository,
+  chatId: number,
+  messageId: number,
+  language: Language,
+  context: { kind: "news"; page: number } | { kind: "archive"; filter: ArchiveFilter; page: number },
+): Promise<void> {
+  const screen = await publicationListScreen(publications, language, context);
+  await telegram.editMessage(chatId, messageId, screen.text, screen.keyboard);
+}
+
+function invalidPublicationNavigation(language: Language): { text: string; keyboard: ReturnType<typeof backToMainKeyboard> } {
+  return { text: t(language, "publicationNotFound"), keyboard: backToMainKeyboard(language) };
+}
+
 async function handleStart(
   message: TelegramMessage,
   repository: UserRepository,
@@ -75,6 +94,7 @@ async function handleCallback(
   callback: TelegramCallbackQuery,
   repository: UserRepository,
   telegram: TelegramClient,
+  publications?: PublicationRepository,
 ): Promise<void> {
   await telegram.answerCallback(callback.id);
   const message = callback.message;
@@ -140,12 +160,41 @@ async function handleCallback(
     if (!updated) throw new Error("User disappeared after preference update");
     await showNotificationSettings(telegram, message.chat.id, message.message_id, updated);
   } else if (data === "menu:news" || data === "menu:archive") {
-    await telegram.editMessage(
-      message.chat.id,
-      message.message_id,
-      t(language, "unavailable"),
-      backToMainKeyboard(language),
-    );
+    if (!publications) {
+      await telegram.editMessage(message.chat.id, message.message_id, t(language, "unavailable"), backToMainKeyboard(language));
+    } else if (data === "menu:news") {
+      await showPublicationList(telegram, publications, message.chat.id, message.message_id, language, { kind: "news", page: 0 });
+    } else {
+      await showPublicationList(telegram, publications, message.chat.id, message.message_id, language, { kind: "archive", filter: "all", page: 0 });
+    }
+  } else if (/^(?:news:page:|archive:|pub:|menu:news|menu:archive)/u.test(data)) {
+    if (!publications || new TextEncoder().encode(data).length > 64) {
+      const invalid = invalidPublicationNavigation(language);
+      await telegram.editMessage(message.chat.id, message.message_id, invalid.text, invalid.keyboard);
+      return;
+    }
+    const newsPage = /^news:page:(0|[1-9]\d{0,3})$/u.exec(data);
+    const archiveFilter = /^archive:filter:(all|direct|potential):0$/u.exec(data);
+    const archivePage = /^archive:page:(all|direct|potential):(0|[1-9]\d{0,3})$/u.exec(data);
+    const detail = /^pub:d:([1-9]\d{0,15}):(news|archive):(all|direct|potential):(0|[1-9]\d{0,3})$/u.exec(data);
+    if (newsPage && Number(newsPage[1]) <= MAX_PUBLICATION_PAGE) {
+      await showPublicationList(telegram, publications, message.chat.id, message.message_id, language, { kind: "news", page: Number(newsPage[1]) });
+    } else if (archiveFilter) {
+      const filter = parseArchiveFilter(archiveFilter[1])!;
+      await showPublicationList(telegram, publications, message.chat.id, message.message_id, language, { kind: "archive", filter, page: 0 });
+    } else if (archivePage && Number(archivePage[2]) <= MAX_PUBLICATION_PAGE) {
+      const filter = parseArchiveFilter(archivePage[1])!;
+      await showPublicationList(telegram, publications, message.chat.id, message.message_id, language, { kind: "archive", filter, page: Number(archivePage[2]) });
+    } else if (detail && Number.isSafeInteger(Number(detail[1])) && Number(detail[4]) <= MAX_PUBLICATION_PAGE && (detail[2] !== "news" || detail[3] === "all")) {
+      const context = detail[2] === "news"
+        ? { kind: "news" as const, page: Number(detail[4]) }
+        : { kind: "archive" as const, filter: parseArchiveFilter(detail[3])!, page: Number(detail[4]) };
+      const screen = await publicationDetailScreen(publications, language, Number(detail[1]), context);
+      await telegram.editMessage(message.chat.id, message.message_id, screen.text, screen.keyboard);
+    } else {
+      const invalid = invalidPublicationNavigation(language);
+      await telegram.editMessage(message.chat.id, message.message_id, invalid.text, invalid.keyboard);
+    }
   } else if (data === "menu:about") {
     await telegram.editMessage(
       message.chat.id,
@@ -160,13 +209,14 @@ export async function handleTelegramUpdate(
   update: TelegramUpdate,
   repository: UserRepository,
   telegram: TelegramClient,
+  publications?: PublicationRepository,
 ): Promise<void> {
   if (update.message) {
     await handleMessage(update.message, repository, telegram);
     return;
   }
   if (update.callback_query) {
-    await handleCallback(update.callback_query, repository, telegram);
+    await handleCallback(update.callback_query, repository, telegram, publications);
   }
   // Unsupported Telegram update types are intentionally ignored.
 }

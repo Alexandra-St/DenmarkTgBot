@@ -173,14 +173,16 @@ test("explicit preference callbacks are idempotent and DIRECT/POTENTIAL stay ind
   assert.match(telegram.edited.at(-1)!.text, /Настройки/);
 });
 
-test("menus, placeholders, About, and unknown callbacks are handled in selected language", async () => {
+test("About and unknown callbacks are handled in selected language", async () => {
   const repo = new MemoryRepository();
   const telegram = new MemoryTelegram();
   await handleTelegramUpdate(callback(400, "lang:ru"), repo, telegram);
   await handleTelegramUpdate(callback(400, "menu:news"), repo, telegram);
   assert.match(telegram.edited.at(-1)!.text, /Мониторинг ещё не запущен/);
   await handleTelegramUpdate(callback(400, "menu:about"), repo, telegram);
-  assert.match(telegram.edited.at(-1)!.text, /https:\/\/www\.ft\.dk/);
+  assert.match(telegram.edited.at(-1)!.text, /Høringsportalen/);
+  assert.match(telegram.edited.at(-1)!.text, /Folketinget ещё ожидается/);
+  assert.match(telegram.edited.at(-1)!.text, /Мониторинг и уведомления отключены/);
   const count = telegram.edited.length;
   await handleTelegramUpdate(callback(400, "future:unknown"), repo, telegram);
   assert.equal(telegram.edited.length, count);

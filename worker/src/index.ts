@@ -1,6 +1,7 @@
 import { handleTelegramUpdate } from "./bot/handlers/webhook.ts";
 import { TelegramApi } from "./bot/telegram.ts";
 import { D1UserRepository } from "./database/users.ts";
+import { D1PublicationRepository } from "./database/publications.ts";
 import type { TelegramUpdate } from "./types/telegram.ts";
 import { handleIngestionRequest, handleSourceStatesRequest } from "./ingestion.ts";
 
@@ -63,8 +64,9 @@ export default {
 
     try {
       const repository = new D1UserRepository(env.DB);
+      const publications = new D1PublicationRepository(env.DB);
       const telegram = new TelegramApi(env.TELEGRAM_BOT_TOKEN);
-      await handleTelegramUpdate(update, repository, telegram);
+      await handleTelegramUpdate(update, repository, telegram, publications);
       return new Response(null, { status: 200 });
     } catch {
       // Do not log update contents or Telegram credentials; Telegram can retry a 5xx.
