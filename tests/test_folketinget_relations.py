@@ -6,7 +6,7 @@ import unittest
 from dataclasses import asdict, replace
 from unittest.mock import Mock
 
-from collectors.folketinget import Cursor, ODA_ROOT, ODataPageError, ScanMetadata, ScanResult
+from collectors.folketinget import Cursor, ODA_ROOT, ODataHTTPError, ODataPageError, ScanMetadata, ScanResult
 from collectors.folketinget_models import (
     Afstemning,
     Dokument,
@@ -21,7 +21,7 @@ from collectors.folketinget_models import (
     normalize_sagstrin,
     normalize_sagsstatus,
 )
-from collectors.folketinget_relations import assemble_cases, load_case, load_cases
+from collectors.folketinget_relations import _bulk_scan_groups, assemble_cases, load_case, load_cases
 
 
 STAMP = "2026-10-14T08:46:08.6566667"
@@ -254,6 +254,53 @@ class HydrationTests(unittest.TestCase):
         self.assertIsNone(result.case)
         self.assertFalse(result.complete)
         self.assertIn("case_not_found", [item.code for item in result.diagnostics])
+
+    def test_http_400_for_oversized_or_group_splits_into_bounded_successful_requests(self) -> None:
+        mapping = {case_id: {case_id} for case_id in range(1, 41)}
+
+        class OdaLikeClient:
+            sizes = []
+
+            def scan(self, collection, *, filter, select, max_pages):
+                ids = [int(value) for value in re.findall(r"sagid eq (\d+)", filter)]
+                self.sizes.append(len(ids))
+                if len(ids) > 16:
+                    partial = successful_scan([], page_count=0)
+                    raise ODataPageError(
+                        0, replace(partial, metadata=replace(partial.metadata, complete=False)),
+                        "request failed", cause=ODataHTTPError("HTTP 400", status_code=400),
+                    )
+                return successful_scan([{"id": 1000 + item, "sagid": item, "opdateringsdato": STAMP} for item in ids])
+
+        client = OdaLikeClient()
+        rows, diagnostics, complete = _bulk_scan_groups(client, "Sagstrin", "sagid", mapping, workers=2, batch_size=40)
+        self.assertTrue(complete)
+        self.assertEqual(len(rows), 40)
+        self.assertEqual(diagnostics, [])
+        self.assertEqual(client.sizes.count(40), 1)
+        self.assertEqual(sorted(size for size in client.sizes if size != 40), [8, 16, 16])
+
+    def test_http_400_on_small_group_fails_closed_without_retrying_invalid_filter(self) -> None:
+        mapping = {case_id: {case_id} for case_id in range(1, 9)}
+
+        class InvalidFilterClient:
+            calls = 0
+
+            def scan(self, collection, *, filter, select, max_pages):
+                self.calls += 1
+                partial = successful_scan([], page_count=0)
+                raise ODataPageError(
+                    0, replace(partial, metadata=replace(partial.metadata, complete=False)),
+                    "request failed", cause=ODataHTTPError("HTTP 400", status_code=400),
+                )
+
+        client = InvalidFilterClient()
+        rows, diagnostics, complete = _bulk_scan_groups(client, "SagDokument", "sagid", mapping, workers=1, batch_size=8)
+        self.assertEqual(rows, [])
+        self.assertFalse(complete)
+        self.assertEqual(client.calls, 1)
+        self.assertTrue(diagnostics)
+        self.assertIn("HTTP_400", diagnostics[0].message)
 
     def test_bulk_hydration_preserves_relationships_with_bounded_query_count(self) -> None:
         cases = [sag(index, statusid=25) for index in (1, 2, 3)]

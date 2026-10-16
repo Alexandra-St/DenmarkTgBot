@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from typing import Iterable, Mapping, Sequence, TypeVar
 
-from collectors.folketinget import ODA_ROOT, ODataClient, ODataError, ODataPageError, ScanResult
+from collectors.folketinget import ODA_ROOT, ODataClient, ODataError, ODataHTTPError, ODataPageError, ScanResult, build_url
 from collectors.folketinget_models import (
     Afstemning,
     CaseDocument,
@@ -291,6 +291,7 @@ _PROJECTIONS = {
     "Afstemning": "id,sagstrinid,nummer,vedtaget,konklusion,kommentar,mødeid,typeid,opdateringsdato",
     "Sagsstatus": "id,status,opdateringsdato",
 }
+_MAX_ADAPTIVE_GROUP_SIZE = 16
 
 
 def _groups(mapping: Mapping[int, set[int]], size: int = 40) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
@@ -314,26 +315,60 @@ def _bulk_scan_groups(
     if not groups:
         return [], [], True
 
-    def fetch(group: tuple[tuple[int, ...], tuple[int, ...]]) -> tuple[list[dict[str, object]], bool, tuple[int, ...], str | None]:
+    def fetch_smaller(ids: tuple[int, ...]) -> tuple[list[dict[str, object]], list[tuple[tuple[int, ...], str]]]:
+        id_mapping = {item: mapping[item] for item in ids}
+        rows: list[dict[str, object]] = []
+        failures: list[tuple[tuple[int, ...], str]] = []
+        for child in _groups(id_mapping, _MAX_ADAPTIVE_GROUP_SIZE):
+            child_rows, child_failures = fetch(child)
+            rows.extend(child_rows)
+            failures.extend(child_failures)
+        return rows, failures
+
+    def fetch(group: tuple[tuple[int, ...], tuple[int, ...]]) -> tuple[list[dict[str, object]], list[tuple[tuple[int, ...], str]]]:
         ids, case_ids = group
         expression = " or ".join(f"{field} eq {item}" for item in ids)
+        url_length = len(build_url(collection, {
+            "$filter": f"({expression})",
+            "$select": "id,opdateringsdato",
+            "$orderby": "opdateringsdato desc,id desc",
+            "$top": 1,
+        }))
         try:
             result = client.scan(collection, filter=f"({expression})", select=_PROJECTIONS[collection], max_pages=100)
-            return list(result.records), result.metadata.complete, case_ids, None
+            LOGGER.info("ODA bulk group entity=%s ids=%d url_chars=%d status=%s", collection, len(ids), url_length, "complete" if result.metadata.complete else "incomplete")
+            return list(result.records), [] if result.metadata.complete else [(case_ids, "incomplete_scan")]
+        except ODataHTTPError as exc:
+            status = exc.status_code
+            if status == 400 and len(ids) > _MAX_ADAPTIVE_GROUP_SIZE:
+                LOGGER.warning("ODA bulk group entity=%s ids=%d url_chars=%d status=400 action=split", collection, len(ids), url_length)
+                return fetch_smaller(ids)
+            category = f"HTTP_{status}" if status is not None else "HTTP_error"
+            LOGGER.warning("ODA bulk group entity=%s ids=%d url_chars=%d status=%s action=fail", collection, len(ids), url_length, category)
+            return [], [(case_ids, category)]
         except ODataPageError as exc:
-            return list(exc.partial_result.records), False, case_ids, type(exc.cause).__name__ if exc.cause else "page_error"
+            if isinstance(exc.cause, ODataHTTPError) and exc.cause.status_code == 400 and len(ids) > _MAX_ADAPTIVE_GROUP_SIZE:
+                LOGGER.warning("ODA bulk group entity=%s ids=%d url_chars=%d status=400 action=split", collection, len(ids), url_length)
+                return fetch_smaller(ids)
+            category = type(exc.cause).__name__ if exc.cause else "page_error"
+            if isinstance(exc.cause, ODataHTTPError) and exc.cause.status_code is not None:
+                category = f"HTTP_{exc.cause.status_code}"
+            LOGGER.warning("ODA bulk group entity=%s ids=%d url_chars=%d status=%s action=fail", collection, len(ids), url_length, category)
+            return list(exc.partial_result.records), [(case_ids, category)]
         except ODataError as exc:
-            return [], False, case_ids, type(exc).__name__
+            category = type(exc).__name__
+            LOGGER.warning("ODA bulk group entity=%s ids=%d url_chars=%d status=%s action=fail", collection, len(ids), url_length, category)
+            return [], [(case_ids, category)]
 
     with ThreadPoolExecutor(max_workers=min(workers, len(groups))) as pool:
         results = list(pool.map(fetch, groups))
     rows: list[dict[str, object]] = []
     diagnostics: list[Diagnostic] = []
     complete = True
-    for group_rows, group_complete, case_ids, error in results:
+    for group_rows, failed_groups in results:
         rows.extend(group_rows)
-        complete = complete and group_complete
-        if not group_complete:
+        complete = complete and not failed_groups
+        for case_ids, error in failed_groups:
             for case_id in case_ids:
                 diagnostics.append(_diag(
                     "related_page_failed", collection,

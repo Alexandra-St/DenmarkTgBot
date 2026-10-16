@@ -39,7 +39,9 @@ class ODataNetworkError(ODataError):
 
 
 class ODataHTTPError(ODataError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        self.status_code = status_code
+        super().__init__(message)
 
 
 class ODataJSONError(ODataError):
@@ -266,6 +268,7 @@ class ODataClient:
         attempts = self.retries + 1
         last_failure = "request failed"
         for attempt in range(1, attempts + 1):
+            last_status: int | None = None
             request_timeout = min(self.timeout, self._remaining())
             retryable = False
             try:
@@ -277,6 +280,7 @@ class ODataClient:
                         raise ODataHTTPError("ODA response used an unsupported redirect")
                     if status != 200:
                         last_failure = f"HTTP {status}"
+                        last_status = status
                         retryable = status == 429 or 500 <= status <= 599
                     else:
                         payload = result.read()
@@ -294,6 +298,7 @@ class ODataClient:
                         return rows
             except HTTPError as exc:
                 last_failure = f"HTTP {exc.code}"
+                last_status = exc.code
                 retryable = exc.code == 429 or 500 <= exc.code <= 599
             except (URLError, TimeoutError, ConnectionError, OSError, HTTPException) as exc:
                 last_failure = type(exc).__name__
@@ -303,7 +308,9 @@ class ODataClient:
 
             if not retryable or attempt == attempts:
                 error_type = ODataHTTPError if last_failure.startswith("HTTP ") else ODataNetworkError
-                raise error_type(f"ODA {collection} request failed: {last_failure}")
+                if error_type is ODataHTTPError:
+                    raise ODataHTTPError(f"ODA {collection} request failed: {last_failure}", status_code=last_status)
+                raise ODataNetworkError(f"ODA {collection} request failed: {last_failure}")
             delay = min(0.25 * (2 ** (attempt - 1)), 2.0)
             if delay >= self._remaining():
                 raise ODataDeadlineError("ODA collection deadline exceeded")

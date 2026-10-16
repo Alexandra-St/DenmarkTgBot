@@ -34,3 +34,13 @@ The six stream checkpoints remain independent. This collector does not persist o
 5. Stop before production ingestion for explicit review and approval. Never manually write checkpoints; only the normal durable commit path may initialize them.
 
 No production collection, D1 write, or deployment was performed for this change.
+
+## Bulk-filter failure diagnosis — 2026-10-16
+
+The first real collection log and JSON snapshot showed 242 affected cases. Relationship hydration made seven groups for each of `Sagstrin` and `SagDokument`: six groups of 40 IDs failed on their initial upper-bound request (page 0, one request), while the final two-ID group succeeded. The failed IDs produced HTTP-error diagnostics; the log did not retain the HTTP status or request length. Reconstructing the exact query shape from the saved diagnostics gives URL lengths of 843–885 characters for `Sagstrin` and 846–888 for `SagDokument`.
+
+Bounded HTTPS probes to official `oda.ft.dk` reproduced HTTP 400 for 40-ID grouped OR filters on both entities. Equivalent filters with 8, 12, and 16 IDs returned HTTP 200. Probe URL lengths were 885/888 characters for 40 IDs and 429/432 for 16 IDs. The evidence identifies an ODA rejection of these oversized OR groups; it does not distinguish a filter-complexity limit from a URL-length limit. No response body or full query URL was retained.
+
+Bulk lookups now preserve HTTP status codes and split a group into at most 16 IDs only after HTTP 400 and only when the original group exceeds that proven working size. Other failures are not retried. A 400 at 16 IDs or fewer remains a blocking error. Logs report entity, group size, URL character count, status category, and whether a split occurred; they do not include URLs or IDs.
+
+The same historical snapshot also reported `ODataPaginationError` for streams `Dokument`, `Sag`, `SagDokument`, and `Sagstrin`. Its log stored only the exception class, not the specific cursor/order condition. That separate stream-pagination cause remains uncertain and will still prevent a complete collection. The next safe validation is a bounded read-only bulk hydration of the previously affected case IDs, followed by a separate small pagination diagnosis; do not rerun the full 30-day collection until the stream-pagination failure is understood.

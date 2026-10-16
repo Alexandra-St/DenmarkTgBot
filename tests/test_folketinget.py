@@ -78,6 +78,15 @@ class URLAndTransportTests(unittest.TestCase):
         self.assertFalse(caught.exception.partial_result.metadata.complete)
         self.assertEqual(len(caught.exception.partial_result.records), 1)
 
+    def test_scan_preserves_http_status_in_page_error_for_bounded_adaptation(self) -> None:
+        opener = Mock(side_effect=HTTPError("url", 400, "bad request", {}, io.BytesIO(b"")))
+        with self.assertRaises(ODataPageError) as caught:
+            ODataClient(retries=0, opener=opener).scan("Sagstrin", filter="(sagid eq 1 or sagid eq 2)")
+        self.assertIsInstance(caught.exception.cause, ODataHTTPError)
+        self.assertEqual(caught.exception.cause.status_code, 400)  # type: ignore[union-attr]
+        self.assertEqual(caught.exception.page_number, 0)
+        self.assertEqual(caught.exception.partial_result.metadata.request_count, 1)
+
     def test_query_parameters_are_encoded_and_bounded(self) -> None:
         url = build_url("Sag", {"$filter": "titel eq 'A & B'", "$select": "id,titel", "$top": 3})
         self.assertEqual(urlparse(url).scheme, "https")
@@ -130,6 +139,7 @@ class URLAndTransportTests(unittest.TestCase):
         with self.assertRaises(ODataHTTPError) as error:
             ODataClient(opener=opener).fetch_page("Sag", {"$top": 1})
         self.assertIn("404", str(error.exception))
+        self.assertEqual(error.exception.status_code, 404)
         self.assertNotIn("private data", str(error.exception))
         opener.assert_called_once()
 
