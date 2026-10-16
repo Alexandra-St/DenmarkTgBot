@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send one existing Ukrainian beta tester the current localized welcome."""
+"""Send one non-owner beta tester the current localized welcome."""
 
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ from typing import Callable, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 DATABASE = "denmarktgbot-db"
 SQL = "SELECT telegram_id, language FROM users;"
-MARKER = Path.home() / ".local" / "state" / "denmarktgbot" / "existing-user-welcome-attempt.marker"
+OWNER_TELEGRAM_ID = 91378486
+# Deliberately separate from the marker used by the earlier recipient-selection attempt.
+MARKER = Path.home() / ".local" / "state" / "denmarktgbot" / "beta-tester-welcome-attempt-v2.marker"
 MESSAGE_PATTERN = re.compile(r'^\s*firstTimeWelcome:\s*("(?:\\.|[^"\\])*")\s*,?\s*$', re.MULTILINE)
 
 
@@ -28,15 +30,17 @@ class SafeUtilityError(Exception):
     """An error whose message is safe to show in the terminal."""
 
 
-def localized_welcome(source: Path | None = None) -> str:
-    source = source or ROOT / "worker" / "src" / "localization" / "uk.ts"
+def localized_welcome(language: str, source: Path | None = None) -> str:
+    if language not in ("uk", "ru"):
+        raise SafeUtilityError("The recipient has an unsupported saved language.")
+    source = source or ROOT / "worker" / "src" / "localization" / f"{language}.ts"
     match = MESSAGE_PATTERN.search(source.read_text(encoding="utf-8"))
     if not match:
-        raise SafeUtilityError("Could not read firstTimeWelcome from the Ukrainian localization source.")
+        raise SafeUtilityError("Could not read firstTimeWelcome from the saved-language localization source.")
     try:
         return json.loads(match.group(1))
     except json.JSONDecodeError as exc:
-        raise SafeUtilityError("The Ukrainian welcome string is not a valid quoted string.") from exc
+        raise SafeUtilityError("The welcome string is not a valid quoted string.") from exc
 
 
 def _json_payload(output: str) -> object:
@@ -71,19 +75,24 @@ def rows_from_wrangler(output: str) -> list[dict[str, object]]:
     raise SafeUtilityError("Wrangler returned an unexpected result format.")
 
 
-def select_ukrainian_recipient(rows: Sequence[dict[str, object]]) -> int:
+def select_beta_recipient(rows: Sequence[dict[str, object]]) -> tuple[int, str]:
     if len(rows) != 2:
         raise SafeUtilityError("Expected exactly two registered users; no message was sent.")
-    languages = [row.get("language") for row in rows]
-    if any(language not in ("ru", "uk") for language in languages) or sorted(languages) != ["ru", "uk"]:
-        raise SafeUtilityError("Expected one Russian and one Ukrainian user; no message was sent.")
-    matches = [row for row in rows if row.get("language") == "uk"]
+    owners = [row for row in rows if row.get("telegram_id") == OWNER_TELEGRAM_ID]
+    if len(owners) != 1:
+        raise SafeUtilityError("Could not uniquely verify the owner account; no message was sent.")
+    matches = [row for row in rows if row.get("telegram_id") != OWNER_TELEGRAM_ID]
     if len(matches) != 1:
-        raise SafeUtilityError("Expected exactly one Ukrainian-language recipient; no message was sent.")
+        raise SafeUtilityError("Could not uniquely identify the non-owner account; no message was sent.")
     recipient = matches[0].get("telegram_id")
+    language = matches[0].get("language")
     if isinstance(recipient, bool) or not isinstance(recipient, int) or recipient <= 0:
-        raise SafeUtilityError("The matching account has an invalid identifier; no message was sent.")
-    return recipient
+        raise SafeUtilityError("The non-owner account has an invalid identifier; no message was sent.")
+    if recipient == OWNER_TELEGRAM_ID:
+        raise SafeUtilityError("Owner account is blocked from receiving this message.")
+    if language not in ("uk", "ru"):
+        raise SafeUtilityError("The non-owner account has an unsupported saved language.")
+    return recipient, language
 
 
 def read_production_users() -> list[dict[str, object]]:
@@ -130,6 +139,8 @@ def create_private_attempt_marker(path: Path = MARKER) -> None:
 
 
 def send_telegram_once(token: str, recipient: int, text: str, *, timeout: float = 15) -> None:
+    if recipient == OWNER_TELEGRAM_ID:
+        raise SafeUtilityError("Owner account is blocked from receiving this message.")
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
         data=json.dumps({"chat_id": recipient, "text": text}, ensure_ascii=False).encode("utf-8"),
@@ -157,6 +168,8 @@ def attempt_once(
     marker_path: Path,
     sender: Callable[[str, int, str], None] = send_telegram_once,
 ) -> None:
+    if recipient == OWNER_TELEGRAM_ID:
+        raise SafeUtilityError("Owner account is blocked from receiving this message.")
     create_private_attempt_marker(marker_path)
     sender(token, recipient, text)
 
@@ -170,10 +183,10 @@ def main() -> int:
     try:
         if MARKER.exists():
             raise SafeUtilityError("A welcome-send attempt marker already exists; refusing to send again.")
-        recipient = select_ukrainian_recipient(read_production_users())
-        text = localized_welcome()
-        print("Verified exactly one Ukrainian-language account among the two registered users. Account ID is hidden.")
-        confirmation = input("Send the Ukrainian welcome once to that account? Type SEND to continue: ").strip()
+        recipient, language = select_beta_recipient(read_production_users())
+        text = localized_welcome(language)
+        print(f"Verified two accounts; selected the non-owner account using saved language {language}. Account ID is hidden.")
+        confirmation = input(f"Send the saved-language welcome once? Type SEND to continue: ").strip()
         if confirmation != "SEND":
             print("Cancelled. No message was sent.")
             return 0
