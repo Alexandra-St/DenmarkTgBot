@@ -67,10 +67,19 @@ class ODataDeadlineError(ODataError):
 class ODataPageError(ODataError):
     """A failed page with an explicitly incomplete, inspectable result."""
 
-    def __init__(self, page_number: int, result: "ScanResult", reason: str, cause: ODataError | None = None) -> None:
+    def __init__(
+        self,
+        page_number: int,
+        result: "ScanResult",
+        reason: str,
+        cause: ODataError | None = None,
+        *,
+        request_url_chars: int | None = None,
+    ) -> None:
         self.page_number = page_number
         self.partial_result = result
         self.cause = cause
+        self.request_url_chars = request_url_chars
         super().__init__(f"ODA scan failed at page {page_number}: {reason}")
 
 
@@ -349,6 +358,7 @@ class ODataClient:
         requests = 0
         last_cursor: Cursor | None = None
         upper: Cursor | None = None
+        last_request_url_chars: int | None = None
 
         def result(complete: bool) -> ScanResult:
             ordered = tuple(item[1] for item in sorted(output.values(), key=lambda item: item[0]))
@@ -363,16 +373,15 @@ class ODataClient:
 
         try:
             self._remaining()
+            high_bound_params = {
+                "$filter": filter,
+                "$select": "id,opdateringsdato",
+                "$orderby": "opdateringsdato desc,id desc",
+                "$top": 1,
+            }
+            last_request_url_chars = len(build_url(collection, high_bound_params))
             try:
-                high_rows = self.fetch_page(
-                    collection,
-                    {
-                        "$filter": filter,
-                        "$select": "id,opdateringsdato",
-                        "$orderby": "opdateringsdato desc,id desc",
-                        "$top": 1,
-                    },
-                )
+                high_rows = self.fetch_page(collection, high_bound_params)
             except ODataError:
                 requests += 1
                 raise
@@ -395,12 +404,13 @@ class ODataClient:
                 }
                 if select is not None:
                     params["$select"] = select
+                last_request_url_chars = len(build_url(collection, params))
                 try:
                     rows = self.fetch_page(collection, params)
                     requests += 1
                 except ODataError as exc:
                     requests += 1
-                    raise ODataPageError(pages + 1, result(False), str(exc), cause=exc) from exc
+                    raise ODataPageError(pages + 1, result(False), str(exc), cause=exc, request_url_chars=last_request_url_chars) from exc
                 if not rows:
                     return result(True)
                 pages += 1
@@ -423,17 +433,17 @@ class ODataClient:
                 if last_cursor == upper:
                     return result(True)
                 if max_pages is not None and pages >= max_pages:
-                    raise ODataPageError(pages + 1, result(False), "configured page limit reached", cause=ODataPaginationError("configured page limit reached"))
+                    raise ODataPageError(pages + 1, result(False), "configured page limit reached", cause=ODataPaginationError("configured page limit reached"), request_url_chars=last_request_url_chars)
                 # Deliberately continue after short pages: the upper-bounded range,
                 # not the page length, determines completion.
         except ODataPageError:
             raise
         except (ODataCursorError, ODataPaginationError) as exc:
             if pages:
-                raise ODataPageError(pages, result(False), str(exc), cause=exc) from exc
+                raise ODataPageError(pages, result(False), str(exc), cause=exc, request_url_chars=last_request_url_chars) from exc
             raise
         except ODataError as exc:
-            raise ODataPageError(pages, result(False), str(exc), cause=exc) from exc
+            raise ODataPageError(pages, result(False), str(exc), cause=exc, request_url_chars=last_request_url_chars) from exc
 
 
 __all__ = [

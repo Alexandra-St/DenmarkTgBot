@@ -264,7 +264,7 @@ class HydrationTests(unittest.TestCase):
             def scan(self, collection, *, filter, select, max_pages):
                 ids = [int(value) for value in re.findall(r"sagid eq (\d+)", filter)]
                 self.sizes.append(len(ids))
-                if len(ids) > 16:
+                if len(ids) > 8:
                     partial = successful_scan([], page_count=0)
                     raise ODataPageError(
                         0, replace(partial, metadata=replace(partial.metadata, complete=False)),
@@ -278,7 +278,7 @@ class HydrationTests(unittest.TestCase):
         self.assertEqual(len(rows), 40)
         self.assertEqual(diagnostics, [])
         self.assertEqual(client.sizes.count(40), 1)
-        self.assertEqual(sorted(size for size in client.sizes if size != 40), [8, 16, 16])
+        self.assertEqual(sorted(size for size in client.sizes if size != 40), [8, 8, 8, 8, 8])
 
     def test_http_400_on_small_group_fails_closed_without_retrying_invalid_filter(self) -> None:
         mapping = {case_id: {case_id} for case_id in range(1, 9)}

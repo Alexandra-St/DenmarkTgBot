@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from typing import Iterable, Mapping, Sequence, TypeVar
 
-from collectors.folketinget import ODA_ROOT, ODataClient, ODataError, ODataHTTPError, ODataPageError, ScanResult, build_url
+from collectors.folketinget import ODA_ROOT, ODataClient, ODataError, ODataHTTPError, ODataPageError, ODataPaginationError, ScanResult, build_url
 from collectors.folketinget_models import (
     Afstemning,
     CaseDocument,
@@ -291,7 +291,26 @@ _PROJECTIONS = {
     "Afstemning": "id,sagstrinid,nummer,vedtaget,konklusion,kommentar,mødeid,typeid,opdateringsdato",
     "Sagsstatus": "id,status,opdateringsdato",
 }
-_MAX_ADAPTIVE_GROUP_SIZE = 16
+_MAX_ADAPTIVE_GROUP_SIZE = 8
+
+
+def _page_error_category(error: ODataPageError) -> str:
+    cause = error.cause
+    if isinstance(cause, ODataHTTPError) and cause.status_code is not None:
+        category = f"HTTP_{cause.status_code}"
+    elif isinstance(cause, ODataPaginationError):
+        detail = str(cause).lower()
+        if "cursor did not advance" in detail:
+            category = "cursor_not_advanced"
+        elif "exceeded the captured upper bound" in detail:
+            category = "above_captured_upper_bound"
+        elif "page limit" in detail:
+            category = "page_limit"
+        else:
+            category = "pagination_error"
+    else:
+        category = type(cause).__name__ if cause else "page_error"
+    return f"{category}:page={error.page_number}:url_chars={error.request_url_chars or 'unknown'}"
 
 
 def _groups(mapping: Mapping[int, set[int]], size: int = 40) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
@@ -350,10 +369,9 @@ def _bulk_scan_groups(
             if isinstance(exc.cause, ODataHTTPError) and exc.cause.status_code == 400 and len(ids) > _MAX_ADAPTIVE_GROUP_SIZE:
                 LOGGER.warning("ODA bulk group entity=%s ids=%d url_chars=%d status=400 action=split", collection, len(ids), url_length)
                 return fetch_smaller(ids)
-            category = type(exc.cause).__name__ if exc.cause else "page_error"
-            if isinstance(exc.cause, ODataHTTPError) and exc.cause.status_code is not None:
-                category = f"HTTP_{exc.cause.status_code}"
-            LOGGER.warning("ODA bulk group entity=%s ids=%d url_chars=%d status=%s action=fail", collection, len(ids), url_length, category)
+            category = _page_error_category(exc)
+            failing_url_chars = exc.request_url_chars or url_length
+            LOGGER.warning("ODA bulk group entity=%s ids=%d url_chars=%d status=%s action=fail", collection, len(ids), failing_url_chars, category)
             return list(exc.partial_result.records), [(case_ids, category)]
         except ODataError as exc:
             category = type(exc).__name__

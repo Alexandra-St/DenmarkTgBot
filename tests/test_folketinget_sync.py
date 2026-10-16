@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from collectors.folketinget import Cursor, ODataClient, ODataPageError, ODataPaginationError, ScanMetadata, ScanResult
 from collectors.folketinget_relations import BulkHydrationResult
-from collectors.folketinget_sync import _affected_cases, _scan, collect, parse_checkpoints
+from collectors.folketinget_sync import _affected_cases, _page_failure_category, _scan, collect, parse_checkpoints
 
 STAMP = "2026-10-14T08:46:08.6566667"
 
@@ -154,6 +154,15 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(scan.records, (complete_row,))
         self.assertEqual(rows, [complete_row])
         self.assertEqual(status, "complete_after_precision_retry")
+
+    def test_page_failure_diagnostics_distinguish_pagination_reasons_without_ids(self):
+        metadata = ScanMetadata("Dokument", 1, 1, Cursor(STAMP, 9), Cursor(STAMP, 8), False, 3)
+        partial = ScanResult(({"id": 8, "opdateringsdato": STAMP},), metadata)
+        repeated = ODataPageError(2, partial, "unsafe detail omitted", ODataPaginationError("ODA page cursor did not advance"), request_url_chars=653)
+        above_bound = ODataPageError(2, partial, "unsafe detail omitted", ODataPaginationError("ODA page exceeded the captured upper bound"), request_url_chars=660)
+        self.assertEqual(_page_failure_category(repeated), "incomplete:cursor_not_advanced:page=2:url_chars=653")
+        self.assertEqual(_page_failure_category(above_bound), "incomplete:above_captured_upper_bound:page=2:url_chars=660")
+        self.assertNotIn("8", _page_failure_category(repeated))
 
     def test_incomplete_stream_never_offers_candidate_checkpoint(self):
         class Broken(FakeClient):

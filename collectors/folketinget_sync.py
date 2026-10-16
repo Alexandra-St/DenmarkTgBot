@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
-from collectors.folketinget import COLLECTIONS, Cursor, ODataClient, ODataError, ODataPageError, ODataPaginationError, ScanResult
+from collectors.folketinget import COLLECTIONS, Cursor, ODataClient, ODataError, ODataHTTPError, ODataPageError, ODataPaginationError, ScanResult
 from collectors.folketinget_models import Diagnostic
 from collectors.folketinget_relations import load_cases
 
@@ -32,6 +32,26 @@ _REF_SELECT = {
     "Sagstrin": "id,opdateringsdato,sagid",
     "Sag": "id,opdateringsdato,statusid",
 }
+
+
+def _page_failure_category(error: ODataPageError) -> str:
+    cause = error.cause
+    if isinstance(cause, ODataHTTPError) and cause.status_code is not None:
+        category = f"HTTP_{cause.status_code}"
+    elif isinstance(cause, ODataPaginationError):
+        detail = str(cause).lower()
+        if "cursor did not advance" in detail:
+            category = "cursor_not_advanced"
+        elif "exceeded the captured upper bound" in detail:
+            category = "above_captured_upper_bound"
+        elif "page limit" in detail:
+            category = "page_limit"
+        else:
+            category = "pagination_error"
+    else:
+        category = type(cause).__name__ if cause else "page_error"
+    url_chars = error.request_url_chars if error.request_url_chars is not None else "unknown"
+    return f"incomplete:{category}:page={error.page_number}:url_chars={url_chars}"
 
 
 @dataclass(frozen=True)
@@ -88,7 +108,7 @@ def _scan(client: ODataClient, name: str, floor: str, max_pages: int, precision_
             if precision_conflict and attempts < precision_retries:
                 attempts += 1
                 continue
-            return exc.partial_result, partial, f"incomplete: {type(exc.cause).__name__ if exc.cause else 'page_error'}"
+            return exc.partial_result, partial, _page_failure_category(exc)
         except ODataError as exc:
             return None, partial, f"failed: {type(exc).__name__}"
 
