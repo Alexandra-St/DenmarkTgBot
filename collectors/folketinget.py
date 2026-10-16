@@ -61,9 +61,10 @@ class ODataPaginationError(ODataError):
 class ODataPageError(ODataError):
     """A failed page with an explicitly incomplete, inspectable result."""
 
-    def __init__(self, page_number: int, result: "ScanResult", reason: str) -> None:
+    def __init__(self, page_number: int, result: "ScanResult", reason: str, cause: ODataError | None = None) -> None:
         self.page_number = page_number
         self.partial_result = result
+        self.cause = cause
         super().__init__(f"ODA scan failed at page {page_number}: {reason}")
 
 
@@ -359,7 +360,7 @@ class ODataClient:
                     requests += 1
                 except ODataError as exc:
                     requests += 1
-                    raise ODataPageError(pages + 1, result(False), str(exc)) from exc
+                    raise ODataPageError(pages + 1, result(False), str(exc), cause=exc) from exc
                 if not rows:
                     return result(True)
                 pages += 1
@@ -381,7 +382,9 @@ class ODataClient:
                 # not the page length, determines completion.
         except ODataPageError:
             raise
-        except (ODataCursorError, ODataPaginationError):
+        except (ODataCursorError, ODataPaginationError) as exc:
+            if pages:
+                raise ODataPageError(pages, result(False), str(exc), cause=exc) from exc
             raise
         except ODataError as exc:
             requests += 1

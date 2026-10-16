@@ -227,11 +227,14 @@ class PaginationTests(unittest.TestCase):
 
     def test_nonadvancing_cursor_and_out_of_order_page_fail(self) -> None:
         opener = Mock(side_effect=[response([row(3, T1)]), response([row(1, T1), row(1, T1)])])
-        with self.assertRaises(ODataPaginationError):
+        with self.assertRaises(ODataPageError) as raised:
             ODataClient(opener=opener).scan("Sag")
+        self.assertIsInstance(raised.exception.cause, ODataPaginationError)
+        self.assertFalse(raised.exception.partial_result.metadata.complete)
         opener = Mock(side_effect=[response([row(3, T1)]), response([row(2, T1), row(1, T1)])])
-        with self.assertRaises(ODataPaginationError):
+        with self.assertRaises(ODataPageError) as raised:
             ODataClient(opener=opener).scan("Sag")
+        self.assertIsInstance(raised.exception.cause, ODataPaginationError)
 
     def test_malformed_timestamp_or_id_fails_as_cursor_error(self) -> None:
         for bad in ("not-a-date", "2026-10-14T08:46:08.12345678", "2026-02-31T00:00:00"):
@@ -254,8 +257,19 @@ class PaginationTests(unittest.TestCase):
 
     def test_page_response_above_upper_bound_fails(self) -> None:
         opener = Mock(side_effect=[response([row(1, T1)]), response([row(2, T2)])])
-        with self.assertRaises(ODataPaginationError):
+        with self.assertRaises(ODataPageError) as raised:
             ODataClient(opener=opener).scan("Sag")
+        self.assertIsInstance(raised.exception.cause, ODataPaginationError)
+
+    def test_inconsistent_timestamp_precision_fails_closed_with_partial_result(self) -> None:
+        precise = "2026-10-14T08:46:08.6566667"
+        rounded = "2026-10-14T08:46:08.657"
+        opener = Mock(side_effect=[response([row(1, precise)]), response([row(1, rounded)])])
+        with self.assertRaises(ODataPageError) as raised:
+            ODataClient(opener=opener).scan("Sag")
+        self.assertIsInstance(raised.exception.cause, ODataPaginationError)
+        self.assertEqual(raised.exception.partial_result.metadata.upper_bound.timestamp, precise)  # type: ignore[union-attr]
+        self.assertFalse(raised.exception.partial_result.metadata.complete)
 
     def test_output_order_is_deterministic_by_source_timestamp_then_id(self) -> None:
         high = row(9, T2)
