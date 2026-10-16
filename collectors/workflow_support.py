@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -41,7 +42,7 @@ def _load(path: str) -> Any:
         return None
 
 
-def render_summary(collection: Any, ingestion: Any, *, run_id: str, mode: str, gate_status: str, collect_status: str, ingest_status: str) -> str:
+def render_summary(collection: Any, ingestion: Any, *, run_id: str, mode: str, gate_status: str, collect_status: str, ingest_status: str, notifications: Any = None, notification_status: str = "not_run") -> str:
     feeds = collection.get("feeds", {}) if isinstance(collection, dict) else {}
     feed_lines = []
     for feed in ("immigration_ministry", "immigration_category"):
@@ -81,6 +82,24 @@ def render_summary(collection: Any, ingestion: Any, *, run_id: str, mode: str, g
         f"- Relevance: DIRECT {relevance.get('DIRECT', 0)}, POTENTIAL {relevance.get('POTENTIAL', 0)}, IRRELEVANT {relevance.get('IRRELEVANT', 0)}",
         f"- Ingestion: `{reported_ingestion}`",
     ]
+    if isinstance(notifications, dict):
+        # Only emit allowlisted aggregate fields; never copy arbitrary response data.
+        allowed_statuses = {"disabled", "manual_skipped", "not_run", "blocked", "failed", "eligible", "worker_gate_closed", "disabled", "completed", "completed_with_failures"}
+        queue_status = notifications.get("queue_status")
+        delivery_status = notifications.get("delivery_status")
+        safe_queue = queue_status if queue_status in allowed_statuses else "unknown"
+        safe_delivery = delivery_status if delivery_status in allowed_statuses else "unknown"
+        queued = notifications.get("queued", 0)
+        sent = notifications.get("sent", 0)
+        failed = notifications.get("failed", 0)
+        rows.extend([
+            f"- Notification orchestration: `{notification_status}`",
+            f"- Queue: `{safe_queue}` (queued {queued if isinstance(queued, int) and queued >= 0 else 0})",
+            f"- Delivery: `{safe_delivery}` (sent {sent if isinstance(sent, int) and sent >= 0 else 0}, failed {failed if isinstance(failed, int) and failed >= 0 else 0})",
+        ])
+        category = notifications.get("error_category")
+        if isinstance(category, str) and re.fullmatch(r"[a-z_]{1,60}", category):
+            rows.append(f"- Notification error category: `{category}`")
     if mode == "dry_run":
         rows.append("- Production write: **No** (dry-run mode does not call the Worker)")
     if isinstance(ingestion, dict) and isinstance(ingestion.get("run_id"), str):
@@ -101,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = sub.add_parser("summary")
     summary.add_argument("--collection", default="")
     summary.add_argument("--ingestion", default="")
+    summary.add_argument("--notifications", default="")
     args = parser.parse_args(argv)
     if args.command == "gate":
         try:
@@ -127,6 +147,8 @@ def main(argv: list[str] | None = None) -> int:
         gate_status=os.environ.get("GATE_STATUS", "not_run"),
         collect_status=os.environ.get("COLLECT_STATUS", "not_run"),
         ingest_status=os.environ.get("INGEST_STATUS", "not_run"),
+        notifications=_load(args.notifications),
+        notification_status=os.environ.get("NOTIFICATION_STATUS", "not_run"),
     )
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:

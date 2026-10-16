@@ -526,6 +526,17 @@ test("local end-to-end: historical baseline, incremental changes, preference que
     const oldFirstSeenNotifications = await db.prepare("SELECT COUNT(*) AS count FROM notifications n JOIN publication_events e ON e.id=n.event_id WHERE e.event_type='FIRST_SEEN'")
       .first<{ count: number }>();
     assert.equal(oldFirstSeenNotifications?.count, 0);
+
+    const eventCountBeforeRepeat = (await db.prepare("SELECT COUNT(*) AS count FROM publication_events").first<{ count: number }>())?.count;
+    await run("00000000-0000-4000-8000-000000000103", "incremental", incremental,
+      checkpoints("2026-10-16T10:00:00.000Z", 125));
+    const eventCountAfterRepeat = (await db.prepare("SELECT COUNT(*) AS count FROM publication_events").first<{ count: number }>())?.count;
+    assert.equal(eventCountAfterRepeat, eventCountBeforeRepeat, "unchanged snapshots create no semantic events");
+    assert.deepEqual(await prepareNotificationQueue(envWithCutoff, "00000000-0000-4000-8000-000000000103", new Date()), { eligible: true, queued: 0 });
+    const repeatedDelivery = await deliverPendingNotifications(envWithCutoff, {
+      async sendMessage() { throw new Error("no new event should be delivered"); },
+    }, new Date());
+    assert.deepEqual(repeatedDelivery, { enabled: true, sent: 0, failed: 0 });
   } finally {
     db.close();
     await rm(directory, { recursive: true, force: true });
