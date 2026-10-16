@@ -272,6 +272,27 @@ class PaginationTests(unittest.TestCase):
             ODataClient(opener=opener).scan("Sag")
         self.assertIsInstance(raised.exception.cause, ODataPaginationError)
 
+    def test_repeated_cursor_on_next_page_fails_closed_with_seven_digit_filter(self) -> None:
+        repeated = row(1, T1)
+        opener = Mock(side_effect=[
+            response([row(2, T2)]),
+            response([repeated]),
+            response([repeated]),
+        ])
+        with self.assertRaises(ODataPageError) as raised:
+            ODataClient(page_size=1, opener=opener, retries=0).scan("Dokument")
+
+        self.assertIsInstance(raised.exception.cause, ODataPaginationError)
+        partial = raised.exception.partial_result
+        self.assertFalse(partial.metadata.complete)
+        self.assertEqual(partial.metadata.page_count, 2)
+        self.assertEqual([item["id"] for item in partial.records], [1])
+        second_page_filter = parse_qs(
+            urlparse(opener.call_args_list[2].args[0].full_url).query
+        )["$filter"][0]
+        self.assertIn(f"opdateringsdato gt datetime'{T1}'", second_page_filter)
+        self.assertIn(f"opdateringsdato eq datetime'{T1}' and id gt 1", second_page_filter)
+
     def test_malformed_timestamp_or_id_fails_as_cursor_error(self) -> None:
         for bad in ("not-a-date", "2026-10-14T08:46:08.12345678", "2026-02-31T00:00:00"):
             opener = Mock(side_effect=[response([row(1, bad)])])
