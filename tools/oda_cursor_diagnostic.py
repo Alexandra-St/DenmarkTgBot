@@ -14,10 +14,18 @@ import signal
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, build_opener
+
+# Direct execution puts this file's directory on sys.path, not the repository
+# root. Add the root explicitly so `python3 tools/oda_cursor_diagnostic.py` works
+# without a caller-provided PYTHONPATH.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from collectors.folketinget import (
     COLLECTIONS,
