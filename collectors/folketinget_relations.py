@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from typing import Iterable, Mapping, Sequence, TypeVar
 
-from collectors.folketinget import ODA_ROOT, ODataClient, ODataError, ODataPageError
+from collectors.folketinget import ODA_ROOT, ODataClient, ODataError, ODataPageError, ScanResult
 from collectors.folketinget_models import (
     Afstemning,
     CaseDocument,
@@ -40,6 +42,14 @@ class HydrationResult:
 
 
 _Model = TypeVar("_Model")
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class BulkHydrationResult:
+    cases: tuple[LegislativeCase, ...]
+    diagnostics: tuple[Diagnostic, ...]
+    complete: bool
 
 
 def _record_key(record: object) -> int:
@@ -273,6 +283,165 @@ def _chunks(values: Sequence[int], size: int = 50) -> Iterable[Sequence[int]]:
         yield values[start : start + size]
 
 
+_PROJECTIONS = {
+    "Sag": "id,nummer,titel,statusid,typeid,kategoriid,opdateringsdato,retsinformationsurl",
+    "Sagstrin": "id,sagid,titel,dato,typeid,statusid,opdateringsdato",
+    "SagDokument": "id,sagid,dokumentid,bilagsnummer,frigivelsesdato,rolleid,opdateringsdato",
+    "Dokument": "id,titel,dato,modtagelsesdato,frigivelsesdato,opdateringsdato",
+    "Afstemning": "id,sagstrinid,nummer,vedtaget,konklusion,kommentar,mødeid,typeid,opdateringsdato",
+    "Sagsstatus": "id,status,opdateringsdato",
+}
+
+
+def _groups(mapping: Mapping[int, set[int]], size: int = 40) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    ids = sorted(mapping)
+    return [
+        (tuple(batch), tuple(sorted({case_id for item in batch for case_id in mapping[item]})))
+        for batch in _chunks(ids, size)
+    ]
+
+
+def _bulk_scan_groups(
+    client: ODataClient,
+    collection: str,
+    field: str,
+    mapping: Mapping[int, set[int]],
+    *,
+    workers: int = 4,
+    batch_size: int = 40,
+) -> tuple[list[dict[str, object]], list[Diagnostic], bool]:
+    groups = _groups(mapping, batch_size)
+    if not groups:
+        return [], [], True
+
+    def fetch(group: tuple[tuple[int, ...], tuple[int, ...]]) -> tuple[list[dict[str, object]], bool, tuple[int, ...], str | None]:
+        ids, case_ids = group
+        expression = " or ".join(f"{field} eq {item}" for item in ids)
+        try:
+            result = client.scan(collection, filter=f"({expression})", select=_PROJECTIONS[collection], max_pages=100)
+            return list(result.records), result.metadata.complete, case_ids, None
+        except ODataPageError as exc:
+            return list(exc.partial_result.records), False, case_ids, type(exc.cause).__name__ if exc.cause else "page_error"
+        except ODataError as exc:
+            return [], False, case_ids, type(exc).__name__
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(groups))) as pool:
+        results = list(pool.map(fetch, groups))
+    rows: list[dict[str, object]] = []
+    diagnostics: list[Diagnostic] = []
+    complete = True
+    for group_rows, group_complete, case_ids, error in results:
+        rows.extend(group_rows)
+        complete = complete and group_complete
+        if not group_complete:
+            for case_id in case_ids:
+                diagnostics.append(_diag(
+                    "related_page_failed", collection,
+                    f"bulk relationship lookup failed ({error or 'incomplete_scan'})",
+                    entity_id=case_id,
+                ))
+    LOGGER.info(
+        "ODA relationship progress entity=%s groups=%d records=%d complete=%s",
+        collection, len(groups), len(rows), str(complete).lower(),
+    )
+    return rows, diagnostics, complete
+
+
+def load_cases(
+    client: ODataClient,
+    case_ids: Sequence[int],
+    *,
+    workers: int = 4,
+    batch_size: int = 40,
+) -> BulkHydrationResult:
+    """Hydrate many cases in bounded ID groups, avoiding per-case ODA requests."""
+    ids = sorted(set(case_ids))
+    if any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in ids):
+        raise ValueError("case_ids must contain positive integers")
+    if workers < 1 or workers > 6 or batch_size < 1 or batch_size > 100:
+        raise ValueError("invalid bulk hydration limits")
+    if not ids:
+        return BulkHydrationResult((), (), True)
+
+    diagnostics: list[Diagnostic] = []
+    complete = True
+    case_mapping = {item: {item} for item in ids}
+    raw_sags, found, ok = _bulk_scan_groups(client, "Sag", "id", case_mapping, workers=workers, batch_size=batch_size)
+    diagnostics.extend(found)
+    complete = complete and ok
+    sag_batch = _as_batch(raw_sags, "Sag")
+    diagnostics.extend(sag_batch.diagnostics)
+    sags = [item for item in (sag_batch.record or ()) if isinstance(item, Sag) and item.id in case_mapping]
+    sag_ids = {item.id for item in sags}
+    for missing_id in sorted(set(ids) - sag_ids):
+        diagnostics.append(_diag("case_not_found", "Sag", "requested case was not returned", entity_id=missing_id))
+        complete = False
+
+    stages_raw, stages_diags, stages_ok = _bulk_scan_groups(
+        client, "Sagstrin", "sagid", case_mapping, workers=workers, batch_size=batch_size,
+    )
+    links_raw, links_diags, links_ok = _bulk_scan_groups(
+        client, "SagDokument", "sagid", case_mapping, workers=workers, batch_size=batch_size,
+    )
+    diagnostics.extend(stages_diags)
+    diagnostics.extend(links_diags)
+    complete = complete and stages_ok and links_ok
+    stages_batch = _as_batch(stages_raw, "Sagstrin")
+    links_batch = _as_batch(links_raw, "SagDokument")
+    diagnostics.extend(stages_batch.diagnostics)
+    diagnostics.extend(links_batch.diagnostics)
+    stages = [item for item in (stages_batch.record or ()) if isinstance(item, Sagstrin)]
+    links = [item for item in (links_batch.record or ()) if isinstance(item, SagDokument)]
+
+    document_mapping: dict[int, set[int]] = {}
+    for item in links:
+        document_mapping.setdefault(item.dokumentid, set()).add(item.sagid)
+    stage_mapping: dict[int, set[int]] = {}
+    for item in stages:
+        stage_mapping.setdefault(item.id, set()).add(item.sagid)
+    status_mapping: dict[int, set[int]] = {}
+    for item in sags:
+        if item.statusid is not None:
+            status_mapping.setdefault(item.statusid, set()).add(item.id)
+
+    docs_raw, docs_diags, docs_ok = _bulk_scan_groups(
+        client, "Dokument", "id", document_mapping, workers=workers, batch_size=batch_size,
+    )
+    votes_raw, votes_diags, votes_ok = _bulk_scan_groups(
+        client, "Afstemning", "sagstrinid", stage_mapping, workers=workers, batch_size=batch_size,
+    )
+    statuses_raw, statuses_diags, statuses_ok = _bulk_scan_groups(
+        client, "Sagsstatus", "id", status_mapping, workers=workers, batch_size=batch_size,
+    )
+    diagnostics.extend(docs_diags)
+    diagnostics.extend(votes_diags)
+    diagnostics.extend(statuses_diags)
+    complete = complete and docs_ok and votes_ok and statuses_ok
+    docs_batch = _as_batch(docs_raw, "Dokument")
+    votes_batch = _as_batch(votes_raw, "Afstemning")
+    statuses_batch = _as_batch(statuses_raw, "Sagsstatus")
+    diagnostics.extend(docs_batch.diagnostics)
+    diagnostics.extend(votes_batch.diagnostics)
+    diagnostics.extend(statuses_batch.diagnostics)
+    documents = [item for item in (docs_batch.record or ()) if isinstance(item, Dokument)]
+    votes = [item for item in (votes_batch.record or ()) if isinstance(item, Afstemning)]
+    statuses = [item for item in (statuses_batch.record or ()) if isinstance(item, Sagsstatus)]
+
+    assembled = assemble_cases(
+        sags, stages=stages, document_links=links, documents=documents,
+        votes=votes, statuses=statuses, diagnostics=diagnostics,
+    )
+    by_id = {int(item.external_id): item for item in assembled.cases}
+    missing = sorted(set(ids) - set(by_id))
+    results = tuple(by_id[item] for item in sorted(by_id))
+    complete = complete and not missing and all(item.complete for item in results)
+    LOGGER.info(
+        "ODA hydration progress cases_requested=%d cases_returned=%d complete=%s",
+        len(ids), len(results), str(complete).lower(),
+    )
+    return BulkHydrationResult(results, assembled.diagnostics, complete)
+
+
 def load_case(client: ODataClient, case_id: int) -> HydrationResult:
     """Fetch one case and its related rows using bounded, ID-filtered requests."""
     if isinstance(case_id, bool) or not isinstance(case_id, int) or case_id <= 0:
@@ -365,4 +534,4 @@ def load_case(client: ODataClient, case_id: int) -> HydrationResult:
     return HydrationResult(selected, final_diagnostics, complete)
 
 
-__all__ = ["AssemblyResult", "HydrationResult", "assemble_cases", "load_case"]
+__all__ = ["AssemblyResult", "BulkHydrationResult", "HydrationResult", "assemble_cases", "load_case", "load_cases"]

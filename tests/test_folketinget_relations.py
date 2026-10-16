@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import json
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from unittest.mock import Mock
 
 from collectors.folketinget import Cursor, ODA_ROOT, ODataPageError, ScanMetadata, ScanResult
@@ -21,7 +21,7 @@ from collectors.folketinget_models import (
     normalize_sagstrin,
     normalize_sagsstatus,
 )
-from collectors.folketinget_relations import assemble_cases, load_case
+from collectors.folketinget_relations import assemble_cases, load_case, load_cases
 
 
 STAMP = "2026-10-14T08:46:08.6566667"
@@ -254,6 +254,60 @@ class HydrationTests(unittest.TestCase):
         self.assertIsNone(result.case)
         self.assertFalse(result.complete)
         self.assertIn("case_not_found", [item.code for item in result.diagnostics])
+
+    def test_bulk_hydration_preserves_relationships_with_bounded_query_count(self) -> None:
+        cases = [sag(index, statusid=25) for index in (1, 2, 3)]
+        stages = [stage(100 + item.id, item.id) for item in cases]
+        links = [link(200 + item.id, item.id, 300 + item.id) for item in cases]
+        docs = [document(300 + item.id) for item in cases]
+        votes = [vote(400 + item.id, 100 + item.id) for item in cases]
+        status_rows = [status(25, "Vedtaget")]
+        datasets = {
+            "Sag": [asdict(item) for item in cases],
+            "Sagstrin": [asdict(item) for item in stages],
+            "SagDokument": [asdict(item) for item in links],
+            "Dokument": [asdict(item) for item in docs],
+            "Afstemning": [asdict(item) for item in votes],
+            "Sagsstatus": [asdict(item) for item in status_rows],
+        }
+        class BulkClient:
+            calls = 0
+
+            def scan(self, collection, *, filter, select, max_pages):
+                self.calls += 1
+                field = "sagid" if collection in {"Sagstrin", "SagDokument"} else "sagstrinid" if collection == "Afstemning" else "statusid" if collection == "Sag" and "statusid eq" in filter else "id"
+                ids = {int(value) for value in re.findall(rf"{field} eq (\d+)", filter)}
+                selected = [item for item in datasets[collection] if item["id"] in ids] if field == "id" else [item for item in datasets[collection] if item.get(field) in ids]
+                return successful_scan(selected)
+
+        client = BulkClient()
+        result = load_cases(client, [1, 2, 3])
+        self.assertTrue(result.complete)
+        self.assertEqual([item.external_id for item in result.cases], ["1", "2", "3"])
+        self.assertTrue(all(item.status.name == "Vedtaget" for item in result.cases))
+        self.assertTrue(all(len(item.documents) == 1 and len(item.votes) == 1 for item in result.cases))
+        self.assertEqual(client.calls, 6, "bulk lookup uses six OData scans for these cases")
+
+    def test_bulk_hydration_failure_keeps_partial_case_but_marks_run_incomplete(self) -> None:
+        datasets = {
+            "Sag": [{"id": 1, "nummer": "L 1", "titel": "Proposal", "typeid": 1, "kategoriid": 1, "statusid": None, "retsinformationsurl": None, "opdateringsdato": STAMP}],
+            "Sagstrin": [], "SagDokument": [], "Dokument": [], "Afstemning": [], "Sagsstatus": [],
+        }
+
+        class FailingBulkClient:
+            def scan(self, collection, *, filter, select, max_pages):
+                if collection == "Sagstrin":
+                    partial = successful_scan([], page_count=1)
+                    raise ODataPageError(2, replace(partial, metadata=replace(partial.metadata, complete=False)), "timeout")
+                field = "sagid" if collection in {"Sagstrin", "SagDokument"} else "id"
+                ids = {int(value) for value in re.findall(rf"{field} eq (\d+)", filter)}
+                return successful_scan([item for item in datasets[collection] if item["id"] in ids])
+
+        result = load_cases(FailingBulkClient(), [1])
+        self.assertFalse(result.complete)
+        self.assertEqual(len(result.cases), 1)
+        self.assertFalse(result.cases[0].complete)
+        self.assertIn("related_page_failed", [item.code for item in result.diagnostics])
 
 
 if __name__ == "__main__":

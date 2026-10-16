@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from threading import Barrier, BrokenBarrierError, Lock
 from unittest.mock import patch
 
 from collectors.folketinget import Cursor, ODataClient, ODataPageError, ODataPaginationError, ScanMetadata, ScanResult
+from collectors.folketinget_relations import BulkHydrationResult
 from collectors.folketinget_sync import _affected_cases, _scan, collect, parse_checkpoints
 
 STAMP = "2026-10-14T08:46:08.6566667"
@@ -24,13 +26,18 @@ class FakeClient:
         if self.failed and collection == "Sag" and self.sag_calls == 1:
             metadata = ScanMetadata(collection, 0, 0, None, None, False, 1)
             raise ODataPageError(1, ScanResult((), metadata), "cursor did not advance", ODataPaginationError("ODA page cursor did not advance"))
-        rows = {"Sag": ({"id": 10, "opdateringsdato": STAMP},)}.get(collection, ())
+        rows = {"Sag": ({"id": 10, "nummer": "L 10", "titel": "Forslag", "typeid": 1, "kategoriid": 1, "statusid": None, "retsinformationsurl": None, "opdateringsdato": STAMP},)}.get(collection, ())
         upper = Cursor(STAMP, 10) if rows else None
         metadata = ScanMetadata(collection, 1 if rows else 0, len(rows), upper, upper, True, 2 if rows else 1)
         return ScanResult(rows, metadata)
 
 
 class SyncTests(unittest.TestCase):
+    @staticmethod
+    def hydration_result(case=None, *, complete=True, diagnostics=()):
+        cases = (case,) if case is not None else ()
+        return BulkHydrationResult(cases, diagnostics, complete)
+
     def test_changed_entities_resolve_to_affected_case_ids_by_official_foreign_keys(self):
         changes = {
             "Sag": ({"id": 1},),
@@ -40,12 +47,12 @@ class SyncTests(unittest.TestCase):
             "Afstemning": ({"id": 7, "sagstrinid": 8}, {"id": 9, "sagstrinid": None}),
             "Sagsstatus": ({"id": 10},),
         }
-        refs = [
-            ([{"sagid": 11}], True),  # documents -> SagDokument
-            ([{"sagid": 12}], True),  # votes -> Sagstrin
-            ([{"id": 13}], True),     # status -> Sag
-        ]
-        with patch("collectors.folketinget_sync._collect_refs", side_effect=refs):
+        refs = {
+            "SagDokument": ([{"sagid": 11}], True),
+            "Sagstrin": ([{"sagid": 12}], True),
+            "Sag": ([{"id": 13}], True),
+        }
+        with patch("collectors.folketinget_sync._collect_refs", side_effect=lambda _client, entity, *_args: refs[entity]):
             cases, diagnostics, complete = _affected_cases(object(), changes)
         self.assertEqual(cases, {1, 3, 5, 11, 12, 13})
         self.assertTrue(complete)
@@ -58,10 +65,42 @@ class SyncTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_checkpoints({"Unknown": {"timestamp": STAMP, "id": 10}})
 
+    def test_six_stream_scans_use_bounded_parallel_workers_and_required_projections(self):
+        streams = {"Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"}
+        rendezvous = Barrier(4)
+        lock = Lock()
+        first_stream_calls = 0
+        select_by_stream = {}
+
+        class ParallelClient:
+            def scan(self, collection, *, filter=None, select=None, **_kwargs):
+                nonlocal first_stream_calls
+                is_stream_scan = collection in streams and "opdateringsdato ge datetime'" in (filter or "")
+                if is_stream_scan:
+                    with lock:
+                        first_stream_calls += 1
+                        position = first_stream_calls
+                        select_by_stream[collection] = select
+                    if position <= 4:
+                        try:
+                            rendezvous.wait(timeout=2)
+                        except BrokenBarrierError as exc:
+                            raise AssertionError("stream scans did not overlap") from exc
+                metadata = ScanMetadata(collection, 0, 0, None, None, True, 1)
+                return ScanResult((), metadata)
+
+        with patch("collectors.folketinget_sync.load_cases", return_value=self.hydration_result()):
+            result = collect(ParallelClient(), mode="historical", max_workers=4)
+        self.assertTrue(result["complete"])
+        self.assertEqual(set(select_by_stream), streams)
+        self.assertEqual(select_by_stream["Sag"], "id,opdateringsdato,statusid")
+        self.assertEqual(select_by_stream["Afstemning"], "id,opdateringsdato,sagstrinid")
+        self.assertEqual(set(result["streams"]), streams)
+
     def test_historical_collection_marks_cases_historical_and_never_notify_eligible(self):
         client = FakeClient()
-        hydration = type("H", (), {"case": type("C", (), {"to_dict": lambda self: {"external_id": "10", "complete": True}})(), "diagnostics": (), "complete": True})()
-        with patch("collectors.folketinget_sync.load_case", return_value=hydration):
+        case = type("C", (), {"to_dict": lambda self: {"external_id": "10", "complete": True}})()
+        with patch("collectors.folketinget_sync.load_cases", return_value=self.hydration_result(case)):
             result = collect(client, mode="historical", max_pages=2)
         self.assertTrue(result["historical"])
         self.assertTrue(result["complete"])
@@ -73,7 +112,7 @@ class SyncTests(unittest.TestCase):
     def test_incremental_missing_stream_checkpoint_uses_configured_historical_lookback(self):
         client = FakeClient()
         with patch("collectors.folketinget_sync._floor", return_value="LOOKBACK_FLOOR"):
-            with patch("collectors.folketinget_sync.load_case", return_value=type("H", (), {"case": None, "diagnostics": (), "complete": True})()):
+            with patch("collectors.folketinget_sync.load_cases", return_value=self.hydration_result()):
                 result = collect(client, mode="incremental", checkpoints={"Sag": Cursor(STAMP, 10)}, days=21, overlap_hours=36)
         for name in {"Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"}:
             self.assertIn("LOOKBACK_FLOOR", client.filters[name][0])
@@ -81,8 +120,8 @@ class SyncTests(unittest.TestCase):
 
     def test_incremental_notification_eligibility_is_unknown(self):
         client = FakeClient()
-        hydration = type("H", (), {"case": type("C", (), {"to_dict": lambda self: {"external_id": "10", "complete": True}})(), "diagnostics": (), "complete": True})()
-        with patch("collectors.folketinget_sync.load_case", return_value=hydration):
+        case = type("C", (), {"to_dict": lambda self: {"external_id": "10", "complete": True}})()
+        with patch("collectors.folketinget_sync.load_cases", return_value=self.hydration_result(case)):
             result = collect(client, mode="incremental", checkpoints={})
         self.assertIsNone(result["cases"][0]["notify_eligible"])
         self.assertFalse(result["cases"][0]["historical"])
@@ -90,7 +129,7 @@ class SyncTests(unittest.TestCase):
 
     def test_cursor_precision_retry_restarts_stream_without_offering_checkpoint(self):
         client = FakeClient(failed=True)
-        with patch("collectors.folketinget_sync.load_case", return_value=type("H", (), {"case": None, "diagnostics": (), "complete": True})()):
+        with patch("collectors.folketinget_sync.load_cases", return_value=self.hydration_result()):
             result = collect(client, mode="historical", max_pages=2, precision_retries=1)
         self.assertTrue(result["streams"]["Sag"]["complete"])
         self.assertEqual(result["committable_checkpoints"], {})
@@ -129,9 +168,10 @@ class SyncTests(unittest.TestCase):
 
     def test_relation_or_hydration_failure_keeps_partial_output_without_checkpoints(self):
         client = FakeClient()
-        hydration = type("H", (), {"case": type("C", (), {"to_dict": lambda self: {"external_id": "10", "complete": False}})(), "diagnostics": (), "complete": False})()
+        case = type("C", (), {"to_dict": lambda self: {"external_id": "10", "complete": False}})()
+        hydration = self.hydration_result(case, complete=False)
         with patch("collectors.folketinget_sync._collect_refs", return_value=([], False)):
-            with patch("collectors.folketinget_sync.load_case", return_value=hydration):
+            with patch("collectors.folketinget_sync.load_cases", return_value=hydration):
                 result = collect(client, mode="historical")
         self.assertFalse(result["complete"])
         self.assertEqual(result["cases"][0]["external_id"], "10")
@@ -148,7 +188,7 @@ class SyncTests(unittest.TestCase):
             return original(collection, **kwargs)
 
         client.scan = scan
-        with patch("collectors.folketinget_sync.load_case", return_value=type("H", (), {"case": None, "diagnostics": (), "complete": True})()):
+        with patch("collectors.folketinget_sync.load_cases", return_value=self.hydration_result()):
             result = collect(client, mode="historical")
         unresolved = next(item for item in result["diagnostics"] if item["code"] == "unresolved_vote")
         self.assertFalse(unresolved["blocking"])

@@ -25,6 +25,13 @@ Post-deployment read-only D1 checks confirmed the original user/source counts an
 - A previous interrupted full scan showed Python blocked in `ssl.py` at `SSLSocket.do_handshake`. Bounded probes now resolve `oda.ft.dk` to IPv4, use no configured proxy, and verify the HTTPS certificate normally. Python `urllib` and system curl each returned HTTP 200; curl TLS setup took about 0.14 seconds (`ssl_verify_result=0`). The production ODA client also returned one `Sag` row with `id` and `opdateringsdato` using a 5-second request timeout and 8-second process deadline.
 - No DNS, certificate, or single-request timeout failure reproduced. The new 30-day historical collection (72-hour overlap, page size 100, 25-page per-stream cap) did not serialize a result before its 600-second process deadline. It is incomplete; no classification, dry-run, or import was performed. The precise cause of the long-run stall remains unresolved. No code defect was reproduced, so no transport workaround was added.
 - Before any potential write, read-only checks confirmed no pending migrations, the authenticated ingestion API returned Folketinget state successfully, and its baseline/checkpoints were absent. Since collection did not pass completeness checks, no Folketinget write was sent. Production remains at 25 Høringsportalen publications, 0 Folketinget publications, 1 Høringsportalen baseline, 0 notifications, and unchanged user preferences.
+
+## Folketinget collector performance — 2026-10-16
+
+- The earlier 600-second historical run's precise stopping point remains unknown. Existing bounded probes did not reproduce DNS, TLS, certificate, or single-request failures.
+- Code review identified sequential work as the likely throughput bottleneck: six streams ran serially, followed by repeated per-case relationship requests. The collector now scans streams concurrently with a bounded pool, uses minimal change-stream projections, resolves relationships concurrently, and bulk-hydrates affected cases.
+- Per-request and whole-client deadlines are bounded. Progress logs contain counters only. Incomplete scans/hydration still block completion and expose no committable checkpoints. No classification semantics, D1 state, or notification behavior changed.
+- No production collection, write, or deployment was run. See `docs/folketinget_collector_performance.md` for the safe first-collection procedure. A real historical collection must still pass all completeness checks and a local dry-run before any separately approved production import.
 - Probe metadata, timeout status, and checksums are stored in the protected local source-snapshot directory, outside Git. Python tests passed 119/119; Worker typecheck passed and Worker tests passed 23/23.
 
 ## Before first import

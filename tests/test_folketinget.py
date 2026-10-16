@@ -12,6 +12,7 @@ from collectors.folketinget import (
     ODA_ROOT,
     ODataClient,
     ODataCursorError,
+    ODataDeadlineError,
     ODataHTTPError,
     ODataJSONError,
     ODataNetworkError,
@@ -152,6 +153,23 @@ class URLAndTransportTests(unittest.TestCase):
 
 
 class PaginationTests(unittest.TestCase):
+    def test_total_collection_deadline_bounds_each_request_and_preserves_partial_diagnostics(self) -> None:
+        clock = [0.0]
+        timeouts: list[float] = []
+
+        def opener(request, *, timeout):
+            timeouts.append(timeout)
+            clock[0] += 0.6
+            return response([row(2, T2)]) if len(timeouts) == 1 else response([row(1, T1)])
+
+        client = ODataClient(timeout=5, total_timeout=1, retries=0, opener=opener, clock=lambda: clock[0])
+        with self.assertRaises(ODataPageError) as caught:
+            client.scan("Sag")
+        self.assertIsInstance(caught.exception.cause, ODataDeadlineError)
+        self.assertEqual(caught.exception.partial_result.metadata.request_count, 2)
+        self.assertEqual(caught.exception.partial_result.metadata.page_count, 1)
+        self.assertTrue(all(0 < timeout <= 1 for timeout in timeouts))
+
     def test_keyset_pages_keep_timestamp_ties_and_seven_digit_precision(self) -> None:
         high = row(4, T1)
         first = [row(1, T1, "å"), row(2, T1, "æ")]

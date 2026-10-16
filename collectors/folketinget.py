@@ -58,6 +58,10 @@ class ODataPaginationError(ODataError):
     pass
 
 
+class ODataDeadlineError(ODataError):
+    """The collector's total wall-clock budget is exhausted."""
+
+
 class ODataPageError(ODataError):
     """A failed page with an explicitly incomplete, inspectable result."""
 
@@ -220,22 +224,35 @@ class ODataClient:
         self,
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        total_timeout: float = 480.0,
         retries: int = DEFAULT_RETRIES,
         page_size: int = DEFAULT_PAGE_SIZE,
         opener: Callable[..., object] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        if total_timeout <= 0:
+            raise ValueError("total_timeout must be positive")
         if retries < 0 or retries > 5:
             raise ValueError("retries must be between 0 and 5")
         if page_size < 1 or page_size > MAX_PAGE_SIZE:
             raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
         self.timeout = timeout
+        self.total_timeout = total_timeout
+        self._clock = clock
+        self._deadline = clock() + total_timeout
         self.retries = retries
         self.page_size = page_size
         self._opener = opener or build_opener(_ODAHTTPSRedirectHandler()).open
         self._sleep = sleep
+
+    def _remaining(self) -> float:
+        remaining = self._deadline - self._clock()
+        if remaining <= 0:
+            raise ODataDeadlineError("ODA collection deadline exceeded")
+        return remaining
 
     def fetch_page(self, collection: str, parameters: Mapping[str, object]) -> list[dict[str, object]]:
         """Fetch one bounded page and return raw entity dictionaries."""
@@ -249,9 +266,10 @@ class ODataClient:
         attempts = self.retries + 1
         last_failure = "request failed"
         for attempt in range(1, attempts + 1):
+            request_timeout = min(self.timeout, self._remaining())
             retryable = False
             try:
-                response = self._opener(request, timeout=self.timeout)
+                response = self._opener(request, timeout=request_timeout)
                 with response as result:  # type: ignore[attr-defined]
                     status = result.getcode()
                     final_url = result.geturl()
@@ -287,6 +305,8 @@ class ODataClient:
                 error_type = ODataHTTPError if last_failure.startswith("HTTP ") else ODataNetworkError
                 raise error_type(f"ODA {collection} request failed: {last_failure}")
             delay = min(0.25 * (2 ** (attempt - 1)), 2.0)
+            if delay >= self._remaining():
+                raise ODataDeadlineError("ODA collection deadline exceeded")
             LOGGER.warning("ODA %s request attempt %d/%d failed (%s); retrying", collection, attempt, attempts, last_failure)
             self._sleep(delay)
         raise ODataNetworkError(f"ODA {collection} request failed")  # unreachable guard
@@ -325,27 +345,37 @@ class ODataClient:
 
         def result(complete: bool) -> ScanResult:
             ordered = tuple(item[1] for item in sorted(output.values(), key=lambda item: item[0]))
+            LOGGER.info(
+                "ODA scan progress collection=%s complete=%s pages=%d records=%d requests=%d",
+                collection, str(complete).lower(), pages, records_fetched, requests,
+            )
             return ScanResult(
                 ordered,
                 ScanMetadata(collection, pages, records_fetched, upper, last_cursor, complete, requests),
             )
 
         try:
-            high_rows = self.fetch_page(
-                collection,
-                {
-                    "$filter": filter,
-                    "$select": "id,opdateringsdato",
-                    "$orderby": "opdateringsdato desc,id desc",
-                    "$top": 1,
-                },
-            )
+            self._remaining()
+            try:
+                high_rows = self.fetch_page(
+                    collection,
+                    {
+                        "$filter": filter,
+                        "$select": "id,opdateringsdato",
+                        "$orderby": "opdateringsdato desc,id desc",
+                        "$top": 1,
+                    },
+                )
+            except ODataError:
+                requests += 1
+                raise
             requests += 1
             if not high_rows:
                 return result(True)
             upper = _cursor_from_record(high_rows[0])
 
             while True:
+                self._remaining()
                 page_filter = _combine_filters(
                     filter,
                     _upper_filter(upper),
@@ -379,6 +409,10 @@ class ODataClient:
                     existing = output.get(cursor.entity_id)
                     if existing is None or cursor_key > existing[0]:
                         output[cursor.entity_id] = (cursor_key, row)
+                LOGGER.info(
+                    "ODA page progress collection=%s page=%d records=%d requests=%d",
+                    collection, pages, len(rows), requests,
+                )
                 if last_cursor == upper:
                     return result(True)
                 if max_pages is not None and pages >= max_pages:
@@ -392,8 +426,7 @@ class ODataClient:
                 raise ODataPageError(pages, result(False), str(exc), cause=exc) from exc
             raise
         except ODataError as exc:
-            requests += 1
-            raise ODataPageError(0, result(False), str(exc)) from exc
+            raise ODataPageError(pages, result(False), str(exc), cause=exc) from exc
 
 
 __all__ = [
@@ -401,6 +434,7 @@ __all__ = [
     "Cursor",
     "ODataClient",
     "ODataCursorError",
+    "ODataDeadlineError",
     "ODataError",
     "ODataHTTPError",
     "ODataJSONError",
