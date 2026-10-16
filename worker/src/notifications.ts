@@ -11,6 +11,9 @@ export interface NotificationEnv {
   NOTIFICATION_ACTIVATION_CUTOFF?: string;
   NOTIFICATION_DELIVERY_ENABLED?: string;
   NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF?: string;
+  NOTIFICATION_CANARY_ENABLED?: string;
+  NOTIFICATION_CANARY_ACTIVATION_CUTOFF?: string;
+  NOTIFICATION_CANARY_TELEGRAM_ID?: string;
 }
 
 export interface NotificationTelegramClient {
@@ -210,6 +213,54 @@ export interface DeliveryResult {
   enabled: boolean;
   sent: number;
   failed: number;
+}
+
+export interface CanaryRequest {
+  confirmation?: unknown;
+  request_id?: unknown;
+  recipient_id?: unknown;
+}
+
+export type CanaryResult = { status: "blocked" | "already_used" | "sent" | "failed" };
+
+const CANARY_MESSAGE = "🧪 DenmarkBot — тестовое уведомление";
+const CANARY_CONFIRMATION = "SEND_ONE_CANARY_MESSAGE";
+
+/**
+ * Send one fixed diagnostic message to one explicitly allowlisted account.
+ * The singleton D1 claim makes every attempt terminal, including ambiguous sends.
+ */
+export async function sendNotificationCanary(
+  env: NotificationEnv,
+  telegram: NotificationTelegramClient,
+  request: CanaryRequest,
+  now = new Date(),
+): Promise<CanaryResult> {
+  const rawRecipient = env.NOTIFICATION_CANARY_TELEGRAM_ID;
+  if (env.NOTIFICATION_CANARY_ENABLED !== "true" || !rawRecipient || !/^[1-9]\d{0,19}$/u.test(rawRecipient)) return { status: "blocked" };
+  const recipientId = Number(rawRecipient);
+  if (!Number.isSafeInteger(recipientId) || recipientId <= 0 || request.recipient_id !== recipientId) return { status: "blocked" };
+  if (request.confirmation !== CANARY_CONFIRMATION || typeof request.request_id !== "string" || !/^[0-9a-f-]{36}$/iu.test(request.request_id)) return { status: "blocked" };
+  const cutoff = activationCutoff(env.NOTIFICATION_CANARY_ACTIVATION_CUTOFF);
+  if (!cutoff || now.getTime() < cutoff.getTime()) return { status: "blocked" };
+
+  const claim = await env.DB.prepare(`
+    INSERT INTO notification_canary_attempts (singleton_id, telegram_id, request_id, status, created_at)
+    VALUES (1, ?, ?, 'SENDING', ?)
+    ON CONFLICT (singleton_id) DO NOTHING
+  `).bind(recipientId, request.request_id, now.toISOString()).run();
+  if ((claim.meta.changes ?? 0) !== 1) return { status: "already_used" };
+
+  try {
+    await telegram.sendMessage(recipientId, CANARY_MESSAGE);
+  } catch {
+    await env.DB.prepare("UPDATE notification_canary_attempts SET status = 'FAILED', completed_at = ?, last_error = 'telegram_delivery_ambiguous_or_failed' WHERE singleton_id = 1 AND status = 'SENDING'")
+      .bind(now.toISOString()).run();
+    return { status: "failed" };
+  }
+  const finalized = await env.DB.prepare("UPDATE notification_canary_attempts SET status = 'SENT', completed_at = ?, last_error = NULL WHERE singleton_id = 1 AND status = 'SENDING'")
+    .bind(now.toISOString()).run();
+  return (finalized.meta.changes ?? 0) === 1 ? { status: "sent" } : { status: "failed" };
 }
 
 /** One attempt only. A timeout is ambiguous, so failures are terminal to avoid duplicate sends. */

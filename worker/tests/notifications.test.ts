@@ -11,6 +11,7 @@ import {
   formatNotification,
   prepareNotificationQueue,
   previewNotifications,
+  sendNotificationCanary,
 } from "../src/notifications.ts";
 import worker from "../src/index.ts";
 
@@ -72,7 +73,7 @@ const cutoff = "2026-10-15T00:00:00.000Z";
 
 async function fixture(): Promise<LocalD1Fixture> {
   const db = new LocalD1Fixture();
-  for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql"]) {
+  for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql"]) {
     db.exec(await readFile(new URL("../migrations/" + migration, import.meta.url), "utf8"));
   }
   await db.prepare("INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at, completed_at) SELECT '00000000-0000-4000-8000-000000000001', id, 'incremental', 1, 1, 'COMMITTED', '{}', '{}', 'fixture', ?, ?, ? FROM sources WHERE code = 'hoeringsportalen'")
@@ -247,6 +248,144 @@ test("delivery route is protected and disabled unless separately enabled with it
     }), env);
     assert.equal(disabled.status, 200);
     assert.deepEqual(await disabled.json(), { enabled: false, sent: 0, failed: 0 });
+  } finally { db.close(); }
+});
+
+test("canary sends one fixed message only to the explicitly allowlisted recipient", async () => {
+  const db = await fixture();
+  try {
+    const env = {
+      DB: db as never,
+      NOTIFICATION_CANARY_ENABLED: "true",
+      NOTIFICATION_CANARY_ACTIVATION_CUTOFF: cutoff,
+      NOTIFICATION_CANARY_TELEGRAM_ID: "2",
+    };
+    const deliveries: Array<{ id: number; text: string }> = [];
+    const telegram = { async sendMessage(id: number, text: string) { deliveries.push({ id, text }); } };
+    const request = { confirmation: "SEND_ONE_CANARY_MESSAGE", request_id: "00000000-0000-4000-8000-000000000099", recipient_id: 2 };
+    assert.deepEqual(await sendNotificationCanary(env, telegram, request, now), { status: "sent" });
+    assert.deepEqual(deliveries, [{ id: 2, text: "🧪 DenmarkBot — тестовое уведомление" }]);
+    assert.deepEqual(await sendNotificationCanary(env, telegram, request, now), { status: "already_used" });
+    assert.deepEqual(await sendNotificationCanary(env, telegram, { ...request, request_id: "00000000-0000-4000-8000-000000000098" }, now), { status: "already_used" });
+    assert.equal(deliveries.length, 1, "repeated requests cannot duplicate the canary message");
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM notifications").first<{ count: number }>())?.count, 0);
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM publications").first<{ count: number }>())?.count, 0);
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM publication_events").first<{ count: number }>())?.count, 0);
+    const attempt = await db.prepare("SELECT telegram_id, status FROM notification_canary_attempts WHERE singleton_id = 1")
+      .first<{ telegram_id: number; status: string }>();
+    assert.deepEqual({ ...attempt }, { telegram_id: 2, status: "SENT" });
+  } finally { db.close(); }
+});
+
+test("concurrent canary requests atomically claim the single delivery slot", async () => {
+  const db = await fixture();
+  try {
+    const env = { DB: db as never, NOTIFICATION_CANARY_ENABLED: "true", NOTIFICATION_CANARY_ACTIVATION_CUTOFF: cutoff, NOTIFICATION_CANARY_TELEGRAM_ID: "2" };
+    let calls = 0;
+    const telegram = { async sendMessage() { calls += 1; await Promise.resolve(); } };
+    const request = (requestId: string) => ({ confirmation: "SEND_ONE_CANARY_MESSAGE", request_id: requestId, recipient_id: 2 });
+    const results = await Promise.all([
+      sendNotificationCanary(env, telegram, request("00000000-0000-4000-8000-000000000091"), now),
+      sendNotificationCanary(env, telegram, request("00000000-0000-4000-8000-000000000092"), now),
+    ]);
+    assert.deepEqual(results.map((result) => result.status).sort(), ["already_used", "sent"]);
+    assert.equal(calls, 1);
+  } finally { db.close(); }
+});
+
+test("canary fails closed for missing, invalid, expired, or mismatched configuration and confirmation", async () => {
+  const db = await fixture();
+  try {
+    const request = { confirmation: "SEND_ONE_CANARY_MESSAGE", request_id: "00000000-0000-4000-8000-000000000099", recipient_id: 2 };
+    let calls = 0;
+    const telegram = { async sendMessage() { calls += 1; } };
+    const configs = [
+      { env: {}, requestedRecipient: 2 },
+      { env: { NOTIFICATION_CANARY_ENABLED: "false", NOTIFICATION_CANARY_ACTIVATION_CUTOFF: cutoff, NOTIFICATION_CANARY_TELEGRAM_ID: "2" }, requestedRecipient: 2 },
+      { env: { NOTIFICATION_CANARY_ENABLED: "true", NOTIFICATION_CANARY_ACTIVATION_CUTOFF: "invalid", NOTIFICATION_CANARY_TELEGRAM_ID: "2" }, requestedRecipient: 2 },
+      { env: { NOTIFICATION_CANARY_ENABLED: "true", NOTIFICATION_CANARY_ACTIVATION_CUTOFF: "2026-10-17T00:00:00.000Z", NOTIFICATION_CANARY_TELEGRAM_ID: "2" }, requestedRecipient: 2 },
+      { env: { NOTIFICATION_CANARY_ENABLED: "true", NOTIFICATION_CANARY_ACTIVATION_CUTOFF: cutoff, NOTIFICATION_CANARY_TELEGRAM_ID: "" }, requestedRecipient: 2 },
+      { env: { NOTIFICATION_CANARY_ENABLED: "true", NOTIFICATION_CANARY_ACTIVATION_CUTOFF: cutoff, NOTIFICATION_CANARY_TELEGRAM_ID: "2" }, requestedRecipient: 3 },
+    ];
+    for (const { env, requestedRecipient } of configs) {
+      assert.deepEqual(await sendNotificationCanary({ DB: db as never, ...env } as never, telegram,
+        { ...request, recipient_id: requestedRecipient }, now), { status: "blocked" });
+    }
+    assert.deepEqual(await sendNotificationCanary({
+      DB: db as never, NOTIFICATION_CANARY_ENABLED: "true", NOTIFICATION_CANARY_ACTIVATION_CUTOFF: cutoff,
+      NOTIFICATION_CANARY_TELEGRAM_ID: "2",
+    }, telegram, { ...request, confirmation: "" }, now), { status: "blocked" });
+    assert.equal(calls, 0);
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM notification_canary_attempts").first<{ count: number }>())?.count, 0);
+  } finally { db.close(); }
+});
+
+test("canary route remains authenticated and inactive without its dedicated gates", async () => {
+  const db = await fixture();
+  try {
+    const token = "canary-route-local";
+    const fetch = worker.fetch as unknown as (request: Request, env: Record<string, unknown>) => Promise<Response>;
+    const env = { DB: db as never, INGEST_API_TOKEN: token, TELEGRAM_BOT_TOKEN: "mock-only" };
+    const body = JSON.stringify({ confirmation: "SEND_ONE_CANARY_MESSAGE", request_id: "00000000-0000-4000-8000-000000000099", recipient_id: 2 });
+    const unauthenticated = await fetch(new Request("https://local.test/internal/notifications/canary", { method: "POST", body }), env);
+    assert.equal(unauthenticated.status, 401);
+    const disabled = await fetch(new Request("https://local.test/internal/notifications/canary", {
+      method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body,
+    }), env);
+    assert.equal(disabled.status, 200);
+    assert.deepEqual(await disabled.json(), { status: "blocked" });
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM notification_canary_attempts").first<{ count: number }>())?.count, 0);
+
+    const originalFetch = globalThis.fetch;
+    const telegramCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = async (input, init) => {
+      telegramCalls.push({ url: String(input), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    try {
+      const activeEnv = {
+        ...env,
+        NOTIFICATION_CANARY_ENABLED: "true",
+        NOTIFICATION_CANARY_ACTIVATION_CUTOFF: cutoff,
+        NOTIFICATION_CANARY_TELEGRAM_ID: "2",
+      };
+      const regularDelivery = await fetch(new Request("https://local.test/internal/notifications/deliver", {
+        method: "POST", headers: { Authorization: "Bearer " + token },
+      }), activeEnv);
+      assert.deepEqual(await regularDelivery.json(), { enabled: false, sent: 0, failed: 0 });
+      assert.equal(telegramCalls.length, 0, "canary gates do not enable production-wide delivery");
+      const authorizedRequest = () => new Request("https://local.test/internal/notifications/canary", {
+        method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body,
+      });
+      const sent = await fetch(authorizedRequest(), activeEnv);
+      assert.deepEqual(await sent.json(), { status: "sent" });
+      const repeated = await fetch(authorizedRequest(), activeEnv);
+      assert.deepEqual(await repeated.json(), { status: "already_used" });
+      assert.equal(telegramCalls.length, 1);
+      assert.match(telegramCalls[0].url, /^https:\/\/api\.telegram\.org\/botmock-only\/sendMessage$/u);
+      assert.deepEqual(telegramCalls[0].body, { chat_id: 2, text: "🧪 DenmarkBot — тестовое уведомление" });
+      assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM publications").first<{ count: number }>())?.count, 0);
+      assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM publication_events").first<{ count: number }>())?.count, 0);
+      assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM notifications").first<{ count: number }>())?.count, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  } finally { db.close(); }
+});
+
+test("ambiguous canary failure is terminal and consumes the single attempt", async () => {
+  const db = await fixture();
+  try {
+    const env = { DB: db as never, NOTIFICATION_CANARY_ENABLED: "true", NOTIFICATION_CANARY_ACTIVATION_CUTOFF: cutoff, NOTIFICATION_CANARY_TELEGRAM_ID: "2" };
+    let calls = 0;
+    const telegram = { async sendMessage() { calls += 1; throw new Error("ambiguous timeout"); } };
+    const request = { confirmation: "SEND_ONE_CANARY_MESSAGE", request_id: "00000000-0000-4000-8000-000000000099", recipient_id: 2 };
+    assert.deepEqual(await sendNotificationCanary(env, telegram, request, now), { status: "failed" });
+    assert.deepEqual(await sendNotificationCanary(env, telegram, request, now), { status: "already_used" });
+    assert.equal(calls, 1);
+    const attempt = await db.prepare("SELECT status, last_error FROM notification_canary_attempts WHERE singleton_id = 1")
+      .first<{ status: string; last_error: string }>();
+    assert.deepEqual({ ...attempt }, { status: "FAILED", last_error: "telegram_delivery_ambiguous_or_failed" });
   } finally { db.close(); }
 });
 
@@ -462,7 +601,7 @@ test("local end-to-end: historical baseline, incremental changes, preference que
   };
 
   try {
-    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql"]) {
+    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql"]) {
       db.exec(await readFile(new URL("../migrations/" + migration, import.meta.url), "utf8"));
     }
     const timestamp = new Date().toISOString();

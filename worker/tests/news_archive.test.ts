@@ -53,7 +53,7 @@ const callback = (data: string, userId = 9001) => ({
 test("News and Archive read only complete relevant records from local D1", async () => {
   const db = new LocalD1Fixture();
   try {
-    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql"]) {
+    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql"]) {
       db.exec(await readFile(new URL(`../migrations/${migration}`, import.meta.url), "utf8"));
     }
     await new D1UserRepository(db).create(9001, "uk");

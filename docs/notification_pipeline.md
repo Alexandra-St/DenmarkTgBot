@@ -2,6 +2,8 @@
 
 The notification pipeline is connected to protected internal Worker routes and scheduled workflow orchestration code, but remains disabled by default. This phase changed local code only: no production configuration or database was changed, no workflow was triggered, and no Telegram message was sent.
 
+The separate single-recipient diagnostic canary is gated independently and is documented in [`notification_canary.md`](notification_canary.md). It does not create queue rows or affect normal delivery gates.
+
 ## Eligibility and queueing
 
 The authenticated `POST /internal/notifications/prepare` route accepts a run ID and creates PENDING rows only for events whose keys belong to that specific ingestion run. It first verifies that D1 records the run as `COMMITTED` and `incremental`; historical, open, blocked, and unrelated runs cannot create queue rows. It also requires `NOTIFICATION_QUEUE_ENABLED=true`. The queue function then creates PENDING rows only when:

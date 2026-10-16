@@ -4,7 +4,7 @@ import { D1UserRepository } from "./database/users.ts";
 import { D1PublicationRepository } from "./database/publications.ts";
 import type { TelegramUpdate } from "./types/telegram.ts";
 import { handleIngestionRequest, handleSourceStatesRequest, isIngestionRequestAuthorized } from "./ingestion.ts";
-import { deliverPendingNotifications, prepareNotificationQueue, previewNotifications, type NotificationEnv } from "./notifications.ts";
+import { deliverPendingNotifications, prepareNotificationQueue, previewNotifications, sendNotificationCanary, type NotificationEnv } from "./notifications.ts";
 
 interface Env {
   DB: D1Database;
@@ -15,6 +15,9 @@ interface Env {
   NOTIFICATION_ACTIVATION_CUTOFF?: string;
   NOTIFICATION_DELIVERY_ENABLED?: string;
   NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF?: string;
+  NOTIFICATION_CANARY_ENABLED?: string;
+  NOTIFICATION_CANARY_ACTIVATION_CUTOFF?: string;
+  NOTIFICATION_CANARY_TELEGRAM_ID?: string;
 }
 
 const json = (body: unknown, status = 200): Response =>
@@ -66,6 +69,17 @@ export default {
         if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "delivery_not_configured" }, 503);
         const result = await deliverPendingNotifications(notificationEnv, new TelegramApi(env.TELEGRAM_BOT_TOKEN));
         return json(result);
+      }
+      if (url.pathname === "/internal/notifications/canary") {
+        if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        let body: unknown;
+        try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+        if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "invalid_canary_request" }, 400);
+        // Do not consume the single-use attempt when Telegram is not configured.
+        if (!env.TELEGRAM_BOT_TOKEN) return json({ status: "blocked" });
+        return json(await sendNotificationCanary(notificationEnv, new TelegramApi(env.TELEGRAM_BOT_TOKEN), body as {
+          confirmation?: unknown; request_id?: unknown; recipient_id?: unknown;
+        }));
       }
       return json({ error: "Not Found" }, 404);
     }
