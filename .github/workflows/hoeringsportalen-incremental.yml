@@ -1,4 +1,4 @@
-name: Høringsportalen incremental collection (manual)
+name: Høringsportalen incremental collection
 
 on:
   workflow_dispatch:
@@ -8,6 +8,9 @@ on:
         required: true
         type: boolean
         default: false
+  # Future activation requires separate review and the automation enable gate:
+  # schedule:
+  #   - cron: '17 6,14,22 * * *'
 
 permissions:
   contents: read
@@ -18,7 +21,7 @@ concurrency:
 
 jobs:
   collect-and-submit:
-    if: ${{ inputs.confirm_production_ingestion }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.confirm_production_ingestion) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -26,10 +29,34 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check execution mode and safety gate
+        id: gate
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          CONFIRM_PRODUCTION_INGESTION: ${{ inputs.confirm_production_ingestion }}
+          HOERINGSPORTALEN_AUTOMATION_ENABLED: ${{ vars.HOERINGSPORTALEN_AUTOMATION_ENABLED }}
+        run: python -m collectors.workflow_support gate
       - name: Collect both official feeds
-        run: python -m collectors.main > "$RUNNER_TEMP/hoeringsportalen.json"
+        id: collect
+        continue-on-error: true
+        run: python -m collectors.main > "$RUNNER_TEMP/hoeringsportalen.json" 2> "$RUNNER_TEMP/collector.log"
       - name: Submit complete incremental run
+        id: ingest
+        if: ${{ steps.collect.outcome == 'success' }}
+        continue-on-error: true
         env:
           INGEST_API_URL: ${{ vars.INGEST_API_URL }}
           INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}
-        run: python -m collectors.ingestion_client "$RUNNER_TEMP/hoeringsportalen.json" --source hoeringsportalen --mode incremental
+          INGESTION_RUN_ID: ${{ steps.gate.outputs.run_id }}
+        run: python -m collectors.ingestion_client "$RUNNER_TEMP/hoeringsportalen.json" --source hoeringsportalen --mode incremental --run-id "$INGESTION_RUN_ID" > "$RUNNER_TEMP/ingestion.json" 2> "$RUNNER_TEMP/ingestion.log"
+      - name: Write safe run summary
+        if: ${{ always() }}
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GATE_STATUS: ${{ steps.gate.outcome || 'not_run' }}
+          COLLECT_STATUS: ${{ steps.collect.outcome || 'not_run' }}
+          INGEST_STATUS: ${{ steps.ingest.outcome || 'not_run' }}
+        run: python -m collectors.workflow_support summary --collection "$RUNNER_TEMP/hoeringsportalen.json" --ingestion "$RUNNER_TEMP/ingestion.json"
+      - name: Fail the run if collection or ingestion failed
+        if: ${{ always() && (steps.collect.outcome != 'success' || steps.ingest.outcome != 'success') }}
+        run: exit 1

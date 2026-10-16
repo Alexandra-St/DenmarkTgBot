@@ -145,6 +145,21 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(start["proposed_checkpoints"]["immigration_category"], None)
         self.assertEqual(json.loads(requests[2].data)["records"][0]["source"], "hoeringsportalen")
 
+    def test_blocked_commit_is_reported_as_non_success(self):
+        responses = [
+            {"source": "hoeringsportalen", "streams": []},
+            {"accepted": True, "status": "OPEN"},
+            {"accepted": True, "accepted_records": 1},
+            {"run_id": "run", "status": "BLOCKED", "processed_records": 0, "checkpoints_advanced": False},
+        ]
+
+        def opener(request, timeout):
+            return FakeHTTPResponse(responses.pop(0))
+
+        result = upload(hearing_output(), source="hoeringsportalen", mode="incremental", endpoint="https://ingest.example", token="test-only-token", run_id="run", opener=opener)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["checkpoints_advanced"])
+
     def test_upload_reconciles_all_current_feed_rows_even_when_checkpoints_are_unchanged(self):
         value = hearing_output()
         checkpoint = {"timestamp": "2026-10-16T10:11:12.123456Z", "id": 71507}
