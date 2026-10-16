@@ -20,6 +20,13 @@ Post-deployment read-only D1 checks confirmed the original user/source counts an
 - **Production safety:** users remain at 1 with the same aggregated preferences (`ru`, direct enabled, potential disabled); migrations remain at 4. Folketinget has no baseline or checkpoint. No Telegram messages were sent, secrets were not read or changed, and no Worker deployment or migration was performed.
 - **Backup:** a fresh remote D1 export was restored locally and passed SQLite `integrity_check`; the restored schema contains the expected user/source/publication and ingestion tables. The backup and source snapshots remain outside the repository with restricted permissions.
 
+## Folketinget TLS recovery — 2026-10-16
+
+- A previous interrupted full scan showed Python blocked in `ssl.py` at `SSLSocket.do_handshake`. Bounded probes now resolve `oda.ft.dk` to IPv4, use no configured proxy, and verify the HTTPS certificate normally. Python `urllib` and system curl each returned HTTP 200; curl TLS setup took about 0.14 seconds (`ssl_verify_result=0`). The production ODA client also returned one `Sag` row with `id` and `opdateringsdato` using a 5-second request timeout and 8-second process deadline.
+- No DNS, certificate, or single-request timeout failure reproduced. The new 30-day historical collection (72-hour overlap, page size 100, 25-page per-stream cap) did not serialize a result before its 600-second process deadline. It is incomplete; no classification, dry-run, or import was performed. The precise cause of the long-run stall remains unresolved. No code defect was reproduced, so no transport workaround was added.
+- Before any potential write, read-only checks confirmed no pending migrations, the authenticated ingestion API returned Folketinget state successfully, and its baseline/checkpoints were absent. Since collection did not pass completeness checks, no Folketinget write was sent. Production remains at 25 Høringsportalen publications, 0 Folketinget publications, 1 Høringsportalen baseline, 0 notifications, and unchanged user preferences.
+- Probe metadata, timeout status, and checksums are stored in the protected local source-snapshot directory, outside Git. Python tests passed 119/119; Worker typecheck passed and Worker tests passed 23/23.
+
 ## Before first import
 
 1. Run the local checks from the repository root: `python3 -m unittest discover -s tests -v`, then from `worker/`: `npm run typecheck` and `npm test`. All checks passed before deployment (119 Python tests, 23 Worker tests, typecheck passed).
