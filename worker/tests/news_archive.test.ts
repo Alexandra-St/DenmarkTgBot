@@ -6,6 +6,7 @@ import { handleTelegramUpdate } from "../src/bot/handlers/webhook.ts";
 import type { TelegramClient } from "../src/bot/telegram.ts";
 import { D1PublicationRepository } from "../src/database/publications.ts";
 import { D1UserRepository } from "../src/database/users.ts";
+import { validatedOfficialUrl } from "../src/bot/publications.ts";
 
 class CaptureTelegram implements TelegramClient {
   readonly edited: Array<{ text: string; keyboard?: unknown }> = [];
@@ -40,12 +41,12 @@ class LocalD1Fixture {
   close(): void { this.sqlite.close(); }
 }
 
-const callback = (data: string) => ({
+const callback = (data: string, userId = 9001) => ({
   callback_query: {
     id: `news-${data}`,
-    from: { id: 9001 },
+    from: { id: userId },
     data,
-    message: { message_id: 1, chat: { id: 9001 } },
+    message: { message_id: 1, chat: { id: userId } },
   },
 });
 
@@ -79,32 +80,100 @@ test("News and Archive read only complete relevant records from local D1", async
     assert.equal(await repo.findById(10), null, "incomplete source record must not be exposed");
     assert.equal(await repo.findById(12), null, "IRRELEVANT record must not be exposed");
 
-    const telegram = new CaptureTelegram();
-    await handleTelegramUpdate(callback("menu:news"), new D1UserRepository(db), telegram, repo);
-    assert.match(telegram.edited.at(-1)!.text, /Останні публікації/);
-    assert.match(telegram.edited.at(-1)!.text, /Danish title/);
-    const listMarkup = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ callback_data?: string }>> };
-    assert.equal(listMarkup.inline_keyboard.flat().filter((button) => button.callback_data?.startsWith("pub:d:")).length, 5);
-    await handleTelegramUpdate(callback("pub:d:1:news:all:0"), new D1UserRepository(db), telegram, repo);
-    assert.match(telegram.edited.at(-1)!.text, /Оригінальна назва: Danish title 1/);
-    const detailMarkup = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ url?: string }>> };
-    assert.equal(detailMarkup.inline_keyboard.flat().some((button) => button.url), false, "untrusted external host must not become a URL button");
-    await handleTelegramUpdate(callback("pub:d:2:news:all:0"), new D1UserRepository(db), telegram, repo);
-    const validMarkup = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ url?: string }>> };
-    assert.equal(validMarkup.inline_keyboard.flat().some((button) => button.url?.startsWith("https://hoeringsportalen.dk/")), true);
+    assert.equal(validatedOfficialUrl("hoeringsportalen", "https://hoeringsportalen.dk/hearing/1"), "https://hoeringsportalen.dk/hearing/1");
+    assert.equal(validatedOfficialUrl("hoeringsportalen", "http://hoeringsportalen.dk/hearing/1"), null);
+    assert.equal(validatedOfficialUrl("hoeringsportalen", "https://example.com/hearing/1"), null);
+    assert.equal(validatedOfficialUrl("hoeringsportalen", "https://hoeringsportalen.dk.example.com/hearing/1"), null);
+    assert.equal(validatedOfficialUrl("hoeringsportalen", "https://user@hoeringsportalen.dk/hearing/1"), null);
+    assert.equal(validatedOfficialUrl("unknown", "https://unknown.example/"), null);
+
+    const users = new D1UserRepository(db);
+    const localized = [
+      { id: 9001, language: "uk" as const, newsHeading: "Публікації з останньої доступної вибірки", archiveHeading: "Архів публікацій", empty: "У цій категорії поки немає публікацій", titleLabel: "Оригінальна назва" },
+      { id: 9002, language: "ru" as const, newsHeading: "Публикации из последней доступной выборки", archiveHeading: "Архив публикаций", empty: "В этой категории пока нет публикаций", titleLabel: "Оригинальное название" },
+    ];
+    await users.create(9002, "ru");
+    for (const fixture of localized) {
+      const telegram = new CaptureTelegram();
+      const click = (data: string) => handleTelegramUpdate(callback(data, fixture.id), users, telegram, repo);
+
+      await click("menu:news");
+      assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.newsHeading));
+      assert.match(telegram.edited.at(-1)!.text, /не обов’язково нові|не обязательно новые/u);
+      assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
+      assert.match(telegram.edited.at(-1)!.text, /Danish title/);
+      let markup = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data?: string }>> };
+      assert.equal(markup.inline_keyboard.flat().filter((button) => button.callback_data?.startsWith("pub:d:")).length, 5);
+      assert.ok(markup.inline_keyboard.flat().every((button) => !button.callback_data || new TextEncoder().encode(button.callback_data).length <= 64));
+
+      const nextNews = markup.inline_keyboard.flat().find((button) => button.text.includes("➡️"))!.callback_data!;
+      await click(nextNews);
+      const pageOneNews = telegram.edited.at(-1)!.text;
+      assert.match(pageOneNews, /Danish title 5/);
+      markup = telegram.edited.at(-1)!.keyboard as typeof markup;
+      const detailCallback = markup.inline_keyboard.flat().find((button) => button.callback_data?.startsWith("pub:d:"))!.callback_data!;
+      await click(detailCallback);
+      assert.match(telegram.edited.at(-1)!.text, new RegExp(`${fixture.titleLabel}: Danish title`));
+      assert.match(telegram.edited.at(-1)!.text, /а не юридична консультація|а не юридическая консультация/u);
+      const detailMarkup = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> };
+      assert.ok(detailMarkup.inline_keyboard.flat().some((button) => button.url?.startsWith("https://hoeringsportalen.dk/")));
+      await click(detailMarkup.inline_keyboard.flat().find((button) => button.text.includes("Назад"))!.callback_data!);
+      assert.equal(telegram.edited.at(-1)!.text, pageOneNews, "detail Back returns to the same News page");
+      await click("pub:d:1:news:all:1");
+      assert.equal((telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ url?: string }>> }).inline_keyboard.flat().some((button) => button.url), false, "non-official URL is never exposed");
+      await click("news:page:9999");
+      assert.match(telegram.edited.at(-1)!.text, /Наразі немає публікацій для показу|Сейчас нет публикаций для показа/u);
+      assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
+      await click("news:page:1");
+      markup = telegram.edited.at(-1)!.keyboard as typeof markup;
+      await click(markup.inline_keyboard.flat().find((button) => button.text.includes("⬅️"))!.callback_data!);
+      assert.match(telegram.edited.at(-1)!.text, /Danish title 11/);
+
+      await click("menu:archive");
+      assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.archiveHeading));
+      assert.match(telegram.edited.at(-1)!.text, /не обов’язково нові|не обязательно новые/u);
+      markup = telegram.edited.at(-1)!.keyboard as typeof markup;
+      const filterButton = (name: string) => markup.inline_keyboard.flat().find((button) => button.callback_data === `archive:filter:${name}:0`)!.callback_data!;
+      await click(filterButton("direct"));
+      assert.ok(telegram.edited.at(-1)!.text.includes("🟢"));
+      assert.equal(telegram.edited.at(-1)!.text.includes("🟡"), false, "DIRECT filter excludes POTENTIAL entries");
+      markup = telegram.edited.at(-1)!.keyboard as typeof markup;
+      assert.ok(markup.inline_keyboard.flat().some((button) => button.callback_data === "archive:filter:potential:0"));
+      await click("archive:filter:potential:0");
+      assert.ok(telegram.edited.at(-1)!.text.includes("🟡"));
+      assert.equal(telegram.edited.at(-1)!.text.includes("🟢"), false, "POTENTIAL filter excludes DIRECT entries");
+      await click("archive:filter:all:0");
+      markup = telegram.edited.at(-1)!.keyboard as typeof markup;
+      await click(markup.inline_keyboard.flat().find((button) => button.text.includes("➡️"))!.callback_data!);
+      const pageOneArchive = telegram.edited.at(-1)!.text;
+      assert.match(pageOneArchive, /Danish title 5/);
+      markup = telegram.edited.at(-1)!.keyboard as typeof markup;
+      const archiveDetail = markup.inline_keyboard.flat().find((button) => button.callback_data?.startsWith("pub:d:"))!.callback_data!;
+      await click(archiveDetail);
+      const detailBack = (telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data?: string }>> }).inline_keyboard.flat().find((button) => button.text.includes("Назад"))!.callback_data!;
+      await click(detailBack);
+      assert.equal(telegram.edited.at(-1)!.text, pageOneArchive, "detail Back returns to the same Archive filter and page");
+      markup = telegram.edited.at(-1)!.keyboard as typeof markup;
+      await click(markup.inline_keyboard.flat().find((button) => button.text.includes("⬅️"))!.callback_data!);
+      assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.archiveHeading));
+
+      await click("archive:page:potential:9999");
+      assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.empty));
+      assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
+      await click("pub:d:999:news:all:0");
+      assert.match(telegram.edited.at(-1)!.text, /більше не знайдено|больше не найдена/u);
+      await click("pub:d:2:archive:potential:0");
+      assert.match(telegram.edited.at(-1)!.text, /більше не знайдено|больше не найдена/u);
+      await click("archive:page:all:10000");
+      assert.match(telegram.edited.at(-1)!.text, /більше не знайдено|больше не найдена/u);
+      await click(`pub:${"x".repeat(80)}`);
+      assert.match(telegram.edited.at(-1)!.text, /більше не знайдено|больше не найдена/u);
+    }
 
     const notifications = await db.prepare("SELECT COUNT(*) AS count FROM notifications").first<{ count: number }>();
     const events = await db.prepare("SELECT COUNT(*) AS count FROM publication_events").first<{ count: number }>();
     assert.equal(notifications?.count, 0);
     assert.equal(events?.count, 0);
-    await handleTelegramUpdate(callback("pub:d:999:news:all:0"), new D1UserRepository(db), telegram, repo);
-    assert.match(telegram.edited.at(-1)!.text, /більше не знайдено/);
-    await handleTelegramUpdate(callback("pub:d:2:archive:potential:0"), new D1UserRepository(db), telegram, repo);
-    assert.match(telegram.edited.at(-1)!.text, /більше не знайдено/);
-    await handleTelegramUpdate(callback("archive:page:all:10000"), new D1UserRepository(db), telegram, repo);
-    assert.match(telegram.edited.at(-1)!.text, /більше не знайдено/);
-    await handleTelegramUpdate(callback(`pub:${"x".repeat(80)}`), new D1UserRepository(db), telegram, repo);
-    assert.match(telegram.edited.at(-1)!.text, /більше не знайдено/);
   } finally {
     db.close();
   }
