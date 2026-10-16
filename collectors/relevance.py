@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Mapping
 
-RULESET_VERSION = "1.0"
+RULESET_VERSION = "1.1"
 DIRECT = "DIRECT"
 POTENTIAL = "POTENTIAL"
 IRRELEVANT = "IRRELEVANT"
@@ -22,7 +22,7 @@ class RelevanceResult:
     matched_rules: tuple[str, ...]
     ruleset_version: str
     evidence_fields: tuple[str, ...]
-    diagnostics: tuple[str, ...]
+    diagnostics: tuple[object, ...]
     publication: dict[str, object]
     historical: object | None = None
     notify_eligible: object | None = None
@@ -237,7 +237,7 @@ def classify(publication: object) -> RelevanceResult:
     if document_direct and not unrelated_primary:
         direct_matches.extend(document_direct)
 
-    diagnostics: list[str] = []
+    diagnostics: list[object] = []
     rules: list[str] = []
     evidence_fields: list[str] = []
     if direct_matches:
@@ -255,7 +255,20 @@ def classify(publication: object) -> RelevanceResult:
         if unrelated_primary:
             allowed_texts = [item for item in texts if item[0] not in {"documents.title"}]
         potential = [(field, rule) for field, _, text in allowed_texts for rule in _potential_matches(text)]
-        if potential:
+        if suppressed_document_direct:
+            relevance = POTENTIAL
+            reason = "A related document has direct evidence, but the case title points to an unrelated subject; review the conflict."
+            rules.extend(rule for _, rule in document_direct)
+            rules.extend(("potential.conflicting_context_review", "negative.unrelated_primary_context", "negative.document_direct_suppressed"))
+            evidence_fields.extend(field for field, _ in document_direct)
+            diagnostics.append({
+                "code": "conflicting_context",
+                "message": "Direct document evidence conflicts with an unrelated primary title; classified POTENTIAL for review.",
+                "positive_rules": list(dict.fromkeys(rule for _, rule in document_direct)),
+                "negative_rules": list(dict.fromkeys([*negative_rules, "negative.unrelated_primary_context", "negative.document_direct_suppressed"])),
+                "evidence_fields": ["title", "documents.title"],
+            })
+        elif potential:
             relevance = POTENTIAL
             rules.extend(rule for _, rule in potential)
             evidence_fields.extend(field for field, _ in potential)
@@ -267,13 +280,6 @@ def classify(publication: object) -> RelevanceResult:
         else:
             relevance = IRRELEVANT
             reason = "No configured relevance rule matched the available publication text."
-        if suppressed_document_direct:
-            diagnostics.append("document_direct_suppressed_by_unrelated_primary_context")
-            rules.extend(rule for _, rule in document_direct)
-            rules.append("negative.document_direct_suppressed")
-            evidence_fields.extend(field for field, _ in document_direct)
-            if not potential:
-                reason = "A document title contains direct evidence, but the primary title identifies an unrelated topic."
 
     rules.extend(negative_rules)
     matched_rules = tuple(dict.fromkeys(rules))
@@ -285,7 +291,13 @@ def classify(publication: object) -> RelevanceResult:
     external_id = str(external_value) if external_value is not None and not isinstance(external_value, (dict, list, bool)) else None
     historical = record.get("historical")
     notify_eligible = record.get("notify_eligible")
-    if historical is True or ("insufficient_information" in diagnostics and notify_eligible is True):
+    incomplete_source = record.get("complete") is False
+    if incomplete_source:
+        diagnostics.append({
+            "code": "incomplete_source_data",
+            "message": "The source record is explicitly marked incomplete; classification uses available text only.",
+        })
+    if historical is True or incomplete_source or ("insufficient_information" in diagnostics and notify_eligible is True):
         notify_eligible = False
     return RelevanceResult(
         source=source,
@@ -299,7 +311,7 @@ def classify(publication: object) -> RelevanceResult:
         publication=record,
         historical=historical,
         notify_eligible=notify_eligible,
-        notification_blocked="insufficient_information" in diagnostics,
+        notification_blocked="insufficient_information" in diagnostics or incomplete_source,
     )
 
 

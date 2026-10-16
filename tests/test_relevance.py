@@ -52,13 +52,22 @@ class RelevanceTests(unittest.TestCase):
         self.assertEqual(result.relevance, DIRECT)
         self.assertIn("stages.title", result.evidence_fields)
 
-    def test_document_direct_is_suppressed_by_unrelated_primary_context(self):
+    def test_document_direct_conflict_is_potential_and_structured_for_review(self):
         for title in ("Dansk militær støtte til Ukraine", "Ændring af vejloven"):
             with self.subTest(title=title):
                 result = classify(publication(title, documents=[{"title": "Ukrainesærloven"}]))
-                self.assertEqual(result.relevance, IRRELEVANT)
-                self.assertIn("document_direct_suppressed_by_unrelated_primary_context", result.diagnostics)
+                self.assertEqual(result.relevance, POTENTIAL)
+                conflict = next(item for item in result.diagnostics if isinstance(item, dict) and item.get("code") == "conflicting_context")
+                self.assertEqual(conflict["positive_rules"], ["direct.ukraine_special_law"])
+                self.assertIn("negative.unrelated_primary_context", conflict["negative_rules"])
+                self.assertIn("negative.document_direct_suppressed", conflict["negative_rules"])
                 self.assertIn("direct.ukraine_special_law", result.matched_rules)
+                self.assertIn("negative.unrelated_primary_context", result.matched_rules)
+
+    def test_primary_direct_evidence_still_beats_conflicting_document_context(self):
+        result = classify(publication("Ukrainesærloven", documents=[{"title": "Dansk militær støtte til Ukraine"}]))
+        self.assertEqual(result.relevance, DIRECT)
+        self.assertNotIn("conflicting_context", [item.get("code") for item in result.diagnostics if isinstance(item, dict)])
 
     def test_general_immigration_rules_are_potential(self):
         result = classify(publication("Ændring af udlændingeloven om opholdstilladelser for udlændinge"))
@@ -154,12 +163,30 @@ class RelevanceTests(unittest.TestCase):
         incremental = classify(publication("Ukrainesærloven", historical=False, notify_eligible=None))
         self.assertIsNone(incremental.notify_eligible)
 
+    def test_incomplete_source_data_blocks_notification_without_changing_relevance(self):
+        for title, expected in (("Ukrainesærloven", DIRECT), ("Udlændingeloven om opholdstilladelser", POTENTIAL), ("Andre regler", IRRELEVANT)):
+            with self.subTest(title=title):
+                result = classify(publication(title, complete=False, historical=False, notify_eligible=True))
+                self.assertEqual(result.relevance, expected)
+                self.assertFalse(result.notify_eligible)
+                self.assertTrue(result.notification_blocked)
+                diagnostic = next(item for item in result.diagnostics if isinstance(item, dict) and item.get("code") == "incomplete_source_data")
+                self.assertIn("available text only", diagnostic["message"])
+
+    def test_complete_or_unspecified_source_completeness_does_not_block_notification(self):
+        for extra in ({"complete": True}, {}):
+            with self.subTest(extra=extra):
+                result = classify(publication("Ukrainesærloven", notify_eligible=True, **extra))
+                self.assertTrue(result.notify_eligible)
+                self.assertFalse(result.notification_blocked)
+                self.assertNotIn("incomplete_source_data", [item.get("code") for item in result.diagnostics if isinstance(item, dict)])
+
     def test_results_are_deterministic_and_include_required_fields(self):
         item = publication("Ukrainesærloven")
         first, second = classify(item).to_dict(), classify(item).to_dict()
         self.assertEqual(first, second)
         self.assertEqual(first["external_id"], "123")
-        self.assertEqual(first["ruleset_version"], "1.0")
+        self.assertEqual(first["ruleset_version"], "1.1")
         self.assertTrue(first["reason"])
         self.assertTrue(first["matched_rules"])
 

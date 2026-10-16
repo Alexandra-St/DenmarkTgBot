@@ -1,6 +1,6 @@
 # Rule-based publication relevance screening
 
-This is an offline, deterministic screening layer over normalized collector records. It does not change either collector, persist results, create events, or send notifications. It uses Python's standard library. The real Danish term `Ukrainesærloven` appears in the repository's Høringsportalen research example; the classifier test corpus is synthetic and is not presented as real legislation.
+This is an offline, deterministic screening layer over normalized collector records. It does not change either collector, persist results, create events, or send notifications. It uses Python's standard library. Real Danish examples and the scope of the live audit are documented in `docs/relevance_real_world_audit.md`; regression test examples are synthetic.
 
 ## Categories
 
@@ -21,7 +21,7 @@ The values match the existing D1 enum. They indicate possible relevance, not leg
 
 It does not use `feed_codes`, status, votes, dates, case type/category, author, or URLs as relevance evidence. Original fields and text are returned unchanged under `publication`. Matching applies Unicode NFC, case folding, whitespace collapse, and punctuation-to-word-boundary normalization, preserving Danish `æ`, `ø`, and `å`.
 
-Every result has `source`, `external_id`, `relevance`, a short `reason`, stable `matched_rules`, `ruleset_version`, `evidence_fields`, `diagnostics`, and the unchanged `publication`. An empty record uses enum-compatible `IRRELEVANT` plus `insufficient_information` and `notification_blocked: true`; it must not be treated as a reliably assessed irrelevant item. Historical records retain `historical: true` and cannot become notification-eligible. Incremental eligibility is passed through unchanged. The classifier never creates notifications.
+Every result has `source`, `external_id`, `relevance`, a short `reason`, stable `matched_rules`, `ruleset_version`, `evidence_fields`, `diagnostics`, and the unchanged `publication`. Ruleset version is `1.1`. An empty record uses enum-compatible `IRRELEVANT` plus `insufficient_information` and `notification_blocked: true`; it must not be treated as a reliably assessed irrelevant item. An input with `complete: false` adds a structured `incomplete_source_data` diagnostic and sets `notification_blocked: true` and `notify_eligible: false`, while retaining the classification based on available text. Historical records retain `historical: true` and cannot become notification-eligible. Incremental eligibility is passed through unchanged unless the source is explicitly incomplete or text is insufficient. The classifier never creates notifications.
 
 Example:
 
@@ -32,7 +32,7 @@ Example:
   "relevance": "DIRECT",
   "reason": "Explicit reference to Ukrainesærloven or Ukraine-specific protection.",
   "matched_rules": ["direct.ukraine_special_law"],
-  "ruleset_version": "1.0",
+  "ruleset_version": "1.1",
   "evidence_fields": ["title"],
   "diagnostics": [],
   "historical": true,
@@ -45,12 +45,12 @@ Example:
 ## Rule precedence
 
 1. Specific direct expressions are evaluated in the main title, Høringsportalen `content_text`, and Folketinget stage titles. Examples include inflected/hyphenated forms of `Ukrainesærloven`, `fordrevne fra Ukraine`, and Ukraine-linked `midlertidig beskyttelse`. `Ukraine` or `flygtninge` alone is insufficient.
-2. A related Folketinget document title can provide direct evidence when the primary title is generic. A document-only direct match is suppressed when the primary title clearly identifies an unrelated domain, such as military aid to Ukraine or a road law. Suppressed evidence and its diagnostic remain visible.
+2. A related Folketinget document title can provide direct evidence when the primary title is generic. If a document-only direct match conflicts with a primary title that clearly identifies an unrelated domain, the result is conservatively `POTENTIAL` for review. `conflicting_context` records the positive rules, negative rules, and evidence fields; `matched_rules` retains both the direct document evidence and unrelated-context marker. A direct match in the primary title still takes precedence.
 3. Direct evidence takes precedence over generic negative context. An explicit special-law title is not downgraded because the same record also mentions military or foreign-policy terms.
 4. Potential rules combine subject matter with affected population context, except immigration-specific residence terms and family reunification, which are inherently scoped to residence. Broad terms such as `arbejde`, `bolig`, and `uddannelse` do not qualify alone. General labor-market, housing-construction, and education-policy markers are recorded as negative evidence but do not override a positive population/topic combination.
 5. No readable title, content, stage title, or document title produces the insufficient-information diagnostic.
 
-Stable identifiers include `direct.ukraine_special_law`, `direct.displaced_from_ukraine`, `direct.ukraine_temporary_protection`, `potential.work_foreign_population`, `potential.housing_displaced_population`, and `negative.ukraine_foreign_policy_or_aid`. `matched_rules` preserves match order and removes duplicates; `evidence_fields` identifies where they matched.
+Stable identifiers include `direct.ukraine_special_law`, `direct.displaced_from_ukraine`, `direct.ukraine_temporary_protection`, `potential.work_foreign_population`, `potential.housing_displaced_population`, `negative.ukraine_foreign_policy_or_aid`, `negative.unrelated_primary_context`, and `negative.document_direct_suppressed`. `matched_rules` preserves match order and removes duplicates; `evidence_fields` identifies where they matched. Diagnostics are strings for legacy `insufficient_information` and structured objects for `conflicting_context` and `incomplete_source_data`.
 
 ## Offline batch evaluation
 
