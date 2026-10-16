@@ -3,9 +3,10 @@ import { test } from "node:test";
 import worker from "../src/index.ts";
 import { handleTelegramUpdate } from "../src/bot/handlers/webhook.ts";
 import { D1UserRepository, type Language, type UserPreferences, type UserRepository } from "../src/database/users.ts";
+import { t } from "../src/localization/index.ts";
 import type { SourceStatusRepository } from "../src/database/source_status.ts";
 import { TelegramApi, type TelegramClient } from "../src/bot/telegram.ts";
-import { languageKeyboard, settingsLanguageKeyboard } from "../src/bot/keyboards/index.ts";
+import { languageKeyboard, mainKeyboard, settingsLanguageKeyboard } from "../src/bot/keyboards/index.ts";
 
 class MemoryRepository implements UserRepository {
   readonly users = new Map<number, UserPreferences>();
@@ -40,11 +41,14 @@ class MemoryTelegram implements TelegramClient {
   readonly sent: Array<{ chatId: number; text: string; keyboard?: unknown }> = [];
   readonly edited: Array<{ chatId: number; messageId: number; text: string; keyboard?: unknown }> = [];
   readonly answered: string[] = [];
+  readonly events: Array<{ kind: "send" | "edit"; text: string; keyboard?: unknown }> = [];
   async sendMessage(chatId: number, text: string, keyboard?: unknown): Promise<void> {
     this.sent.push({ chatId, text, keyboard });
+    this.events.push({ kind: "send", text, keyboard });
   }
   async editMessage(chatId: number, messageId: number, text: string, keyboard?: unknown): Promise<void> {
     this.edited.push({ chatId, messageId, text, keyboard });
+    this.events.push({ kind: "edit", text, keyboard });
   }
   async answerCallback(id: string): Promise<void> {
     this.answered.push(id);
@@ -125,13 +129,21 @@ test("first language selection sends localized first-time welcome and then main 
     assert.equal(repo.users.get(id)?.language, language);
     assert.equal(repo.users.get(id)?.notify_direct, 1);
     assert.equal(repo.users.get(id)?.notify_potential, 0);
-    const welcome = telegram.sent.at(-1)!.text;
+    const welcome = telegram.sent.at(-2)!.text;
     assert.match(welcome, language === "uk" ? /Вітаємо в DenmarkBot/u : /Добро пожаловать в DenmarkBot/u);
     assert.match(welcome, language === "uk" ? /Høringsportalen/u : /Høringsportalen/u);
     assert.match(welcome, language === "uk" ? /Folketinget ще розробляється/u : /Folketinget ещё разрабатывается/u);
     assert.match(welcome, language === "uk" ? /Сповіщення поки тестуються й не надсилаються/u : /Уведомления пока тестируются и не отправляются/u);
     assert.ok(welcome.length < 4096);
-    assert.match(telegram.edited.at(-1)!.text, new RegExp(menuPrompt));
+    assert.equal(telegram.edited.at(-1)!.text, language === "uk" ? "Мову збережено." : "Язык сохранён.");
+    assert.deepEqual(telegram.edited.at(-1)!.keyboard, { inline_keyboard: [] });
+    assert.match(telegram.sent.at(-1)!.text, new RegExp(menuPrompt));
+    assert.ok((telegram.sent.at(-1)!.keyboard as { inline_keyboard: unknown[] }).inline_keyboard.length > 0);
+    const flow = telegram.events.slice(-3);
+    assert.deepEqual(flow.map(({ kind }) => kind), ["edit", "send", "send"]);
+    assert.match(flow[0].text, /Мову збережено|Язык сохранён/u);
+    assert.match(flow[1].text, /Добро пожаловать в DenmarkBot|Вітаємо в DenmarkBot/u);
+    assert.match(flow[2].text, new RegExp(menuPrompt));
     assert.equal(telegram.answered.length, 1);
   }
 });
@@ -152,7 +164,7 @@ test("repeated start does not duplicate users and returning users retain languag
   await handleTelegramUpdate(message(200, "/start"), repo, telegram);
   await handleTelegramUpdate(message(200, "/start@DenmarkForUABot"), repo, telegram);
   assert.equal(repo.creates, 1);
-  assert.equal(telegram.sent.length, 3);
+  assert.equal(telegram.sent.length, 4);
   assert.equal(telegram.sent.filter(({ text }) => text.includes("Добро пожаловать")).length, 1);
   assert.match(telegram.sent.at(-1)!.text, /Выберите раздел/);
 });
@@ -185,6 +197,25 @@ test("concurrent duplicate first language callbacks only send one welcome", asyn
   ]);
   assert.equal(repo.creates, 1);
   assert.equal(telegram.sent.filter(({ text }) => text.includes("Добро пожаловать в DenmarkBot")).length, 1);
+  assert.equal(telegram.sent.filter(({ text }) => /Выберите раздел/u.test(text)).length, 1);
+});
+
+test("/help shows the same localized instructions with the main menu for existing users", async () => {
+  for (const [id, language, expected] of [
+    [252, "uk", /Вітаємо в DenmarkBot/u],
+    [253, "ru", /Добро пожаловать в DenmarkBot/u],
+  ] as const) {
+    const repo = new MemoryRepository();
+    const telegram = new MemoryTelegram();
+    repo.users.set(id, { telegram_id: id, language, notify_direct: 0, notify_potential: 1 });
+    await handleTelegramUpdate(message(id, "/help@DenmarkForUABot"), repo, telegram);
+    assert.equal(telegram.sent.length, 1);
+    assert.match(telegram.sent[0].text, expected);
+    assert.equal(telegram.sent[0].text, t(language, "firstTimeWelcome"));
+    assert.deepEqual(telegram.sent[0].keyboard, mainKeyboard(language));
+    assert.equal(repo.users.get(id)?.notify_direct, 0);
+    assert.equal(repo.users.get(id)?.notify_potential, 1);
+  }
 });
 
 test("explicit preference callbacks are idempotent and DIRECT/POTENTIAL stay independent", async () => {
@@ -259,7 +290,8 @@ test("About shows unknown Høringsportalen status when source metadata fails", a
 test("D1 repository uses the existing user fields and independent defaults", async () => {
   const db = new MemoryD1();
   const repo = new D1UserRepository(db as never);
-  await repo.create(500, "uk");
+  assert.equal(await repo.create(500, "uk"), true);
+  assert.equal(await repo.create(500, "ru"), false);
   assert.deepEqual(await repo.find(500), {
     telegram_id: 500,
     language: "uk",
@@ -337,7 +369,7 @@ test("authenticated webhook persists both language choices, edits to main menu, 
       assert.equal(response.status, 200);
       assert.equal(db.users.get(id)?.language, language);
       assert.match(String(apiCalls.at(-1)?.payload.text), new RegExp(menuText));
-      assert.equal(apiCalls.at(-1)?.url.endsWith("/editMessageText"), true);
+      assert.equal(apiCalls.at(-1)?.url.endsWith("/sendMessage"), true);
 
       for (let count = 0; count < 2; count += 1) {
         const startResponse = await worker.fetch(
@@ -354,7 +386,7 @@ test("authenticated webhook persists both language choices, edits to main menu, 
       }
     }
     assert.equal(db.users.size, 2);
-    assert.equal(apiCalls.length, 10);
+    assert.equal(apiCalls.length, 12);
     assert.ok(apiCalls.every(({ url }) => url.startsWith("https://api.telegram.org/bottest-token/")));
   } finally {
     globalThis.fetch = oldFetch;

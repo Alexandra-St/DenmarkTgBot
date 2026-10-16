@@ -110,6 +110,17 @@ async function handleStart(
   else await telegram.sendMessage(message.chat.id, languageScreen("uk"), languageKeyboard("uk"));
 }
 
+async function handleHelp(
+  message: TelegramMessage,
+  repository: UserRepository,
+  telegram: TelegramClient,
+): Promise<void> {
+  if (!message.from || !validTelegramId(message.from.id) || !validTelegramId(message.chat?.id)) return;
+  const user = await repository.find(message.from.id);
+  if (user) await telegram.sendMessage(message.chat.id, t(user.language, "firstTimeWelcome"), mainKeyboard(user.language));
+  else await telegram.sendMessage(message.chat.id, languageScreen("uk"), languageKeyboard("uk"));
+}
+
 async function handleMessage(
   message: TelegramMessage,
   repository: UserRepository,
@@ -117,6 +128,7 @@ async function handleMessage(
 ): Promise<void> {
   const command = message.text?.trim().split(/\s+/, 1)[0]?.split("@")[0].toLowerCase();
   if (command === "/start") await handleStart(message, repository, telegram);
+  else if (command === "/help") await handleHelp(message, repository, telegram);
 }
 
 async function processCallback(
@@ -144,9 +156,24 @@ async function processCallback(
       ));
     } else {
       const created = await repository.create(callback.from.id, language);
-      if (created) await telegram.sendMessage(message.chat.id, t(language, "firstTimeWelcome"));
-      else await repository.updateLanguage(callback.from.id, language);
-      await showMain(telegram, message.chat.id, language, message.message_id, undefined, metrics);
+      if (!created) {
+        await repository.updateLanguage(callback.from.id, language);
+        await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(
+          message.chat.id,
+          message.message_id,
+          t(language, "languageSaved"),
+          { inline_keyboard: [] },
+        ));
+        return;
+      }
+      await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(
+        message.chat.id,
+        message.message_id,
+        t(language, "languageSaved"),
+        { inline_keyboard: [] },
+      ));
+      await telegram.sendMessage(message.chat.id, t(language, "firstTimeWelcome"));
+      await showMain(telegram, message.chat.id, language, undefined, undefined, metrics);
     }
     return;
   }
