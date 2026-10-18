@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import http.client
 import json
@@ -780,26 +781,51 @@ def manifest_page_json(
 
 def parse_manifest_page_output(output: str) -> str:
     """Decode a Base64-wrapped UTF-16LE JSON result from sqlcmd."""
-    lines = output.splitlines()
-    if len(lines) < 3 or lines[0].strip() != MANIFEST_BASE64_COLUMN_HEADER:
-        raise PocError("manifest_page_invalid")
-    if not re.fullmatch(r"\s*-{3,}\s*", lines[1]):
-        raise PocError("manifest_page_invalid")
+    lines = [line.removesuffix("\r") for line in output.split("\n")]
+    line_count = len(lines)
+    encoded_chars: int | None = None
+
+    def fail(stage: str, category: str) -> None:
+        diagnostic = f"manifest_page_parse_failure stage={stage} line_count={line_count}"
+        if encoded_chars is not None:
+            diagnostic += f" encoded_chars={encoded_chars}"
+        print(diagnostic, file=sys.stderr)
+        raise PocError(category)
+
+    while lines and not lines[0].strip(" \t"):
+        lines.pop(0)
+    while lines and not lines[-1].strip(" \t"):
+        lines.pop()
+    if len(lines) < 3 or lines[0].strip(" \t") != MANIFEST_BASE64_COLUMN_HEADER:
+        fail("header", "manifest_page_header_invalid")
+    if not re.fullmatch(r"[ \t]*-{3,}[ \t]*", lines[1]):
+        fail("separator", "manifest_page_separator_invalid")
+    if any(not line.strip(" \t") for line in lines[2:]):
+        fail("base64_format", "manifest_page_base64_format_invalid")
     # Formatting whitespace is safe to remove only after SQL encoded the payload.
     encoded = "".join(lines[2:])
     encoded = re.sub(r"[\t\n\r\v\f ]", "", encoded)
+    encoded_chars = len(encoded)
     if not encoded or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", encoded) or len(encoded) % 4:
-        raise PocError("manifest_page_invalid")
+        fail("base64_format", "manifest_page_base64_format_invalid")
     try:
         raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        fail("base64_decode", "manifest_page_base64_decode_failed")
+    if base64.b64encode(raw).decode("ascii") != encoded:
+        fail("base64_decode", "manifest_page_base64_decode_failed")
+    try:
         payload = raw.decode("utf-16-le", errors="strict")
+    except UnicodeDecodeError:
+        fail("utf16_decode", "manifest_page_utf16_decode_failed")
+    try:
         if len(payload.encode("utf-8", errors="strict")) > snapshot_manifest.MAX_BATCH_JSON_BYTES:
-            raise PocError("manifest_page_too_large")
+            fail("size", "manifest_page_too_large")
         snapshot_manifest._decode_json_page(payload)
-    except PocError:
-        raise
-    except (ValueError, UnicodeDecodeError, UnicodeEncodeError, snapshot_manifest.ManifestError):
-        raise PocError("manifest_page_invalid") from None
+    except UnicodeEncodeError:
+        fail("utf16_decode", "manifest_page_utf16_decode_failed")
+    except snapshot_manifest.ManifestError:
+        fail("json", "manifest_page_json_invalid")
     return payload
 
 

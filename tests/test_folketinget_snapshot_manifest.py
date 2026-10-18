@@ -250,11 +250,14 @@ class FolketingetManifestTests(unittest.TestCase):
             "null": None,
         }], ensure_ascii=False, separators=(",", ":"))
         encoded = base64.b64encode(payload.encode("utf-16-le")).decode("ascii")
-        wrapped = " ".join(encoded[index : index + 17] for index in range(0, len(encoded), 17))
-        sqlcmd_output = f"{poc.MANIFEST_BASE64_COLUMN_HEADER}\n{'-' * 32}\n{wrapped}\n"
+        wrapped = "\n\t".join(encoded[index : index + 17] for index in range(0, len(encoded), 17))
+        sqlcmd_output = (
+            f"\n  {poc.MANIFEST_BASE64_COLUMN_HEADER}  \n  {'-' * 32}  \n"
+            f"{wrapped}\n\n"
+        )
         self.assertEqual(poc.parse_manifest_page_output(sqlcmd_output), payload)
 
-    def test_manifest_base64_output_rejects_invalid_structure_and_payload(self) -> None:
+    def test_manifest_base64_parser_failures_have_safe_stage_categories(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(
             "folketinget_backup_poc_output_invalid_test", ROOT / "tools" / "folketinget_backup_poc.py"
         )
@@ -263,18 +266,28 @@ class FolketingetManifestTests(unittest.TestCase):
         poc_spec.loader.exec_module(poc)
         valid_prefix = f"{poc.MANIFEST_BASE64_COLUMN_HEADER}\n{'-' * 32}\n"
         malformed_outputs = (
-            f"wrong_header\n{'-' * 32}\nWwBd\n",
-            valid_prefix + "WwBd\nextra\n",
-            valid_prefix + "not-base64!\n",
-            valid_prefix + "WwB=\n",
-            valid_prefix + base64.b64encode(b"\x00").decode("ascii") + "\n",
-            valid_prefix + base64.b64encode("not JSON".encode("utf-16-le")).decode("ascii") + "\n",
+            (f"SECRET_HEADER\n{'-' * 32}\nWwBd\n", "manifest_page_header_invalid", "header"),
+            (f"{poc.MANIFEST_BASE64_COLUMN_HEADER}\nSECRET_SEPARATOR\nWwBd\n", "manifest_page_separator_invalid", "separator"),
+            (valid_prefix + "not-base64!\n", "manifest_page_base64_format_invalid", "base64_format"),
+            (valid_prefix + "AB==\n", "manifest_page_base64_decode_failed", "base64_decode"),
+            (valid_prefix + base64.b64encode(b"\x00").decode("ascii") + "\n", "manifest_page_utf16_decode_failed", "utf16_decode"),
+            (valid_prefix + base64.b64encode("not JSON".encode("utf-16-le")).decode("ascii") + "\n", "manifest_page_json_invalid", "json"),
+            (valid_prefix + "WwBd\nUNEXPECTED_LINE\n", "manifest_page_base64_format_invalid", "base64_format"),
         )
-        for malformed in malformed_outputs:
-            with self.subTest(malformed=malformed[:15]):
+        for malformed, category, stage in malformed_outputs:
+            with self.subTest(stage=stage):
+                diagnostic = StringIO()
                 with self.assertRaises(poc.PocError) as raised:
-                    poc.parse_manifest_page_output(malformed)
-                self.assertEqual(raised.exception.category, "manifest_page_invalid")
+                    with redirect_stderr(diagnostic):
+                        poc.parse_manifest_page_output(malformed)
+                self.assertEqual(raised.exception.category, category)
+                rendered = diagnostic.getvalue()
+                self.assertRegex(
+                    rendered,
+                    rf"^manifest_page_parse_failure stage={stage} line_count=\d+( encoded_chars=\d+)?\n$",
+                )
+                for private in ("SECRET_HEADER", "SECRET_SEPARATOR", "UNEXPECTED_LINE", "not JSON"):
+                    self.assertNotIn(private, rendered)
 
     def test_manifest_base64_decoded_size_limit_is_enforced(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(
@@ -284,12 +297,14 @@ class FolketingetManifestTests(unittest.TestCase):
         assert poc_spec.loader is not None
         poc_spec.loader.exec_module(poc)
         payload = '[{"c0000":"long enough"}]'
+        diagnostic = StringIO()
         with mock.patch.object(poc.snapshot_manifest, "MAX_BATCH_JSON_BYTES", 4):
-            with self.assertRaises(poc.PocError) as raised:
+            with redirect_stderr(diagnostic), self.assertRaises(poc.PocError) as raised:
                 poc.parse_manifest_page_output(sqlcmd_base64_output(poc, payload))
         self.assertEqual(raised.exception.category, "manifest_page_too_large")
+        self.assertIn("manifest_page_parse_failure stage=size", diagnostic.getvalue())
 
-    def test_manifest_base64_parse_failure_never_logs_raw_payload(self) -> None:
+    def test_manifest_base64_parse_diagnostic_never_logs_payload(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(
             "folketinget_backup_poc_output_no_log_test", ROOT / "tools" / "folketinget_backup_poc.py"
         )
@@ -301,7 +316,9 @@ class FolketingetManifestTests(unittest.TestCase):
         output = StringIO()
         with redirect_stdout(output), redirect_stderr(output), self.assertRaises(poc.PocError):
             poc.parse_manifest_page_output(bad)
-        self.assertEqual(output.getvalue(), "")
+        self.assertIn("manifest_page_parse_failure stage=json", output.getvalue())
+        self.assertNotIn(private_payload, output.getvalue())
+        self.assertNotIn(private_payload.encode("utf-16-le").hex(), output.getvalue())
 
     def test_sql_failure_logs_only_safe_entity_offset_code_and_category(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(
