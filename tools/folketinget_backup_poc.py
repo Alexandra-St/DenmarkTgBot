@@ -558,10 +558,14 @@ def restored_database_size(password: str) -> int:
 
 
 def parse_database_compatibility_level(output: str) -> int:
-    values = [line.strip() for line in output.splitlines() if line.strip() and not line.strip().startswith("(")]
-    if len(values) != 1 or not re.fullmatch(r"[0-9]{3}", values[0]):
+    numeric_values = [line.strip() for line in output.splitlines() if re.fullmatch(r"\s*[0-9]{3}\s*", line)]
+    try:
+        value = simple_value(output)
+    except PocError:
+        raise PocError("manifest_database_compatibility_invalid") from None
+    if len(numeric_values) != 1 or value != numeric_values[0]:
         raise PocError("manifest_database_compatibility_invalid")
-    level = int(values[0])
+    level = int(value, 10)
     if level not in SUPPORTED_COMPATIBILITY_LEVELS:
         raise PocError("manifest_database_compatibility_invalid")
     return level

@@ -289,7 +289,8 @@ class FolketingetManifestTests(unittest.TestCase):
         poc = importlib.util.module_from_spec(poc_spec)
         assert poc_spec.loader is not None
         poc_spec.loader.exec_module(poc)
-        self.assertEqual(poc.parse_database_compatibility_level("160\n(1 rows affected)\n"), 160)
+        realistic_sqlcmd_output = "compatibility_level\n-------------------\n160\n\n(1 rows affected)\n"
+        self.assertEqual(poc.parse_database_compatibility_level(realistic_sqlcmd_output), 160)
         poc.validate_manifest_compatibility_level(160)
         with self.assertRaises(poc.PocError) as raised:
             poc.parse_database_compatibility_level("not numeric")
