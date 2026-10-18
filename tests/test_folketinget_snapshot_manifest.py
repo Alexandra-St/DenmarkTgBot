@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import json
 import pathlib
 import sqlite3
@@ -20,6 +21,13 @@ SPEC = importlib.util.spec_from_file_location(
 MANIFEST = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MANIFEST)
+
+
+def sqlcmd_base64_output(poc, payload: str, *, wrap: int = 65535) -> str:
+    encoded = base64.b64encode(payload.encode("utf-16-le")).decode("ascii")
+    chunks = [encoded[index : index + wrap] for index in range(0, len(encoded), wrap)]
+    wrapped = "\n".join(chunks)
+    return f"{poc.MANIFEST_BASE64_COLUMN_HEADER}\n{'-' * 32}\n{wrapped}\n"
 
 
 def schema() -> dict[str, object]:
@@ -183,7 +191,7 @@ class FolketingetManifestTests(unittest.TestCase):
         poc_spec.loader.exec_module(poc)
         schema_info = MANIFEST.normalize_schema("Sag", schema())
         page = '[{"c0000":1,"c0001":"Æ","c0002":null,"c0003":null}]'
-        sqlcmd_output = f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\n{page}\n"
+        sqlcmd_output = sqlcmd_base64_output(poc, page)
         with mock.patch.object(poc, "run_manifest_page_sql", return_value=sqlcmd_output) as run:
             payload = poc.manifest_page_json("private", "Sag", "dbo", schema_info, 5000, 5000)
         self.assertEqual(MANIFEST._decode_json_page(payload), [{"c0000": 1, "c0001": "Æ", "c0002": None, "c0003": None}])
@@ -196,6 +204,8 @@ class FolketingetManifestTests(unittest.TestCase):
         query = argv[-1]
         self.assertIn("ORDER BY [id] OFFSET 5000 ROWS FETCH NEXT 5000 ROWS ONLY", query)
         self.assertIn("FOR JSON PATH, INCLUDE_NULL_VALUES", query)
+        self.assertIn("BASE64_ENCODE(CONVERT(varbinary(max), @manifest_json)) AS [manifest_payload_b64]", query)
+        self.assertIn("SET @manifest_json = (SELECT", query)
         self.assertNotIn("private", query)
 
     def test_manifest_page_converts_legacy_text_types_before_for_json(self) -> None:
@@ -214,7 +224,7 @@ class FolketingetManifestTests(unittest.TestCase):
         ])
         schema_info = MANIFEST.normalize_schema("Sag", source_schema)
         page = '[{"c0000":1,"c0001":null,"c0002":null,"c0003":null,"c0004":"old","c0005":"æ"}]'
-        sqlcmd_output = f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\n{page}\n"
+        sqlcmd_output = sqlcmd_base64_output(poc, page)
         with mock.patch.object(poc, "run_manifest_page_sql", return_value=sqlcmd_output) as run:
             payload = poc.manifest_page_json("private", "Sag", "dbo", schema_info, 0, 10)
         query = run.call_args.args[0][-1]
@@ -222,24 +232,76 @@ class FolketingetManifestTests(unittest.TestCase):
         self.assertIn("CONVERT(nvarchar(max), [legacy_ntext]) AS [c0005]", query)
         self.assertEqual(MANIFEST._decode_json_page(payload)[0]["c0005"], "æ")
 
-    def test_manifest_page_output_accepts_only_documented_header_and_valid_json(self) -> None:
+    def test_manifest_base64_transport_round_trips_json_losslessly(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(
             "folketinget_backup_poc_output_test", ROOT / "tools" / "folketinget_backup_poc.py"
         )
         poc = importlib.util.module_from_spec(poc_spec)
         assert poc_spec.loader is not None
         poc_spec.loader.exec_module(poc)
-        payload = '[{"c0000":1}]'
-        expected = f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\n{payload}\n"
-        self.assertEqual(poc.parse_manifest_page_output(expected), payload)
-        for malformed in (
-            f"unexpected\n{'-' * 48}\n{payload}\n",
-            f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\n{payload}\nunexpected\n",
-            f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\nnot-json\n",
-        ):
+        payload = json.dumps([{
+            "uk": "Привіт",
+            "da": "Æøå",
+            "emoji": "🧪",
+            "newline": "first\nsecond",
+            "tab": "left\tright",
+            "spaces": "  leading and trailing  ",
+            "quoted": '"quoted" \\ path',
+            "null": None,
+        }], ensure_ascii=False, separators=(",", ":"))
+        encoded = base64.b64encode(payload.encode("utf-16-le")).decode("ascii")
+        wrapped = " ".join(encoded[index : index + 17] for index in range(0, len(encoded), 17))
+        sqlcmd_output = f"{poc.MANIFEST_BASE64_COLUMN_HEADER}\n{'-' * 32}\n{wrapped}\n"
+        self.assertEqual(poc.parse_manifest_page_output(sqlcmd_output), payload)
+
+    def test_manifest_base64_output_rejects_invalid_structure_and_payload(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_output_invalid_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        valid_prefix = f"{poc.MANIFEST_BASE64_COLUMN_HEADER}\n{'-' * 32}\n"
+        malformed_outputs = (
+            f"wrong_header\n{'-' * 32}\nWwBd\n",
+            valid_prefix + "WwBd\nextra\n",
+            valid_prefix + "not-base64!\n",
+            valid_prefix + "WwB=\n",
+            valid_prefix + base64.b64encode(b"\x00").decode("ascii") + "\n",
+            valid_prefix + base64.b64encode("not JSON".encode("utf-16-le")).decode("ascii") + "\n",
+        )
+        for malformed in malformed_outputs:
+            with self.subTest(malformed=malformed[:15]):
+                with self.assertRaises(poc.PocError) as raised:
+                    poc.parse_manifest_page_output(malformed)
+                self.assertEqual(raised.exception.category, "manifest_page_invalid")
+
+    def test_manifest_base64_decoded_size_limit_is_enforced(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_output_size_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        payload = '[{"c0000":"long enough"}]'
+        with mock.patch.object(poc.snapshot_manifest, "MAX_BATCH_JSON_BYTES", 4):
             with self.assertRaises(poc.PocError) as raised:
-                poc.parse_manifest_page_output(malformed)
-            self.assertEqual(raised.exception.category, "manifest_page_invalid")
+                poc.parse_manifest_page_output(sqlcmd_base64_output(poc, payload))
+        self.assertEqual(raised.exception.category, "manifest_page_too_large")
+
+    def test_manifest_base64_parse_failure_never_logs_raw_payload(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_output_no_log_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        private_payload = "PRIVATE_UNICODE_PAYLOAD"
+        bad = sqlcmd_base64_output(poc, private_payload)
+        output = StringIO()
+        with redirect_stdout(output), redirect_stderr(output), self.assertRaises(poc.PocError):
+            poc.parse_manifest_page_output(bad)
+        self.assertEqual(output.getvalue(), "")
 
     def test_sql_failure_logs_only_safe_entity_offset_code_and_category(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(

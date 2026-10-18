@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -42,7 +43,7 @@ RESTORE_VALIDATE = "RESTORE_VALIDATE"
 CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
-MANIFEST_JSON_COLUMN_HEADER = "JSON_F52E2B61-18A1-11d1-B105-00805F49916B"
+MANIFEST_BASE64_COLUMN_HEADER = "manifest_payload_b64"
 
 
 class PocError(Exception):
@@ -753,10 +754,12 @@ def manifest_page_json(
     primary_key = schema["primary_key"]
     ordering = ", ".join(quote_identifier(name) for name in primary_key)
     query = (
-        "SET NOCOUNT ON; "
+        "SET NOCOUNT ON; DECLARE @manifest_json nvarchar(max); "
+        "SET @manifest_json = ("
         f"SELECT {selected} FROM {quote_identifier(schema_name)}.{quote_identifier(entity)} "
         f"ORDER BY {ordering} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY "
-        "FOR JSON PATH, INCLUDE_NULL_VALUES;"
+        "FOR JSON PATH, INCLUDE_NULL_VALUES); "
+        "SELECT BASE64_ENCODE(CONVERT(varbinary(max), @manifest_json)) AS [manifest_payload_b64];"
     )
     output = run_manifest_page_sql(
         [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-r",
@@ -776,18 +779,26 @@ def manifest_page_json(
 
 
 def parse_manifest_page_output(output: str) -> str:
-    """Remove only sqlcmd's documented FOR JSON heading and separator."""
+    """Decode a Base64-wrapped UTF-16LE JSON result from sqlcmd."""
     lines = output.splitlines()
-    if len(lines) < 3 or lines[0].strip() != MANIFEST_JSON_COLUMN_HEADER:
+    if len(lines) < 3 or lines[0].strip() != MANIFEST_BASE64_COLUMN_HEADER:
         raise PocError("manifest_page_invalid")
     if not re.fullmatch(r"\s*-{3,}\s*", lines[1]):
         raise PocError("manifest_page_invalid")
-    # sqlcmd wraps a single result column at -w boundaries. Preserve every
-    # payload character across those breaks; unexpected text will fail JSON decoding.
-    payload = "".join(lines[2:])
+    # Formatting whitespace is safe to remove only after SQL encoded the payload.
+    encoded = "".join(lines[2:])
+    encoded = re.sub(r"[\t\n\r\v\f ]", "", encoded)
+    if not encoded or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", encoded) or len(encoded) % 4:
+        raise PocError("manifest_page_invalid")
     try:
+        raw = base64.b64decode(encoded, validate=True)
+        payload = raw.decode("utf-16-le", errors="strict")
+        if len(payload.encode("utf-8", errors="strict")) > snapshot_manifest.MAX_BATCH_JSON_BYTES:
+            raise PocError("manifest_page_too_large")
         snapshot_manifest._decode_json_page(payload)
-    except snapshot_manifest.ManifestError:
+    except PocError:
+        raise
+    except (ValueError, UnicodeDecodeError, UnicodeEncodeError, snapshot_manifest.ManifestError):
         raise PocError("manifest_page_invalid") from None
     return payload
 
