@@ -485,39 +485,128 @@ def build_restore_query(backup_path: str, data_dir: str, entries: list[dict[str,
 def table_objects(password: str) -> dict[str, tuple[str, str]]:
     names = ",".join(quote_literal(name) for name in REQUIRED_ENTITIES)
     query = (
-        "SELECT s.name, o.name, o.type_desc FROM sys.objects AS o "
+        "SELECT s.name AS schema_name, o.name AS entity_name, o.type_desc AS object_type FROM sys.objects AS o "
         "JOIN sys.schemas AS s ON s.schema_id=o.schema_id "
         f"WHERE o.type IN ('U','V') AND o.name IN ({names}) ORDER BY o.name,s.name;"
     )
-    output = sqlcmd(query, password, database=DATABASE)
-    found: dict[str, tuple[str, str]] = {}
-    for line in output.splitlines():
-        fields = [value.strip() for value in line.split("|")]
-        if len(fields) == 3 and fields[1] in REQUIRED_ENTITIES:
-            if fields[1] in found:
+    output = sqlcmd(query, password, database=DATABASE, failure_category="entity_discovery_query_failed")
+    return parse_entity_discovery(output)
+
+
+def parse_entity_discovery(output: str) -> dict[str, tuple[str, str]]:
+    try:
+        headers, rows = _normalized_headers(output)
+        schema_index = field_index(headers, "schema_name")
+        entity_index = field_index(headers, "entity_name")
+        type_index = field_index(headers, "object_type")
+        found: dict[str, tuple[str, str]] = {}
+        for row in rows:
+            schema, name, object_type = row[schema_index], row[entity_index], row[type_index]
+            if not schema or name not in REQUIRED_ENTITIES or object_type not in {"USER_TABLE", "VIEW"}:
+                raise PocError("entity_discovery_result_invalid")
+            if name in found:
                 raise PocError("entity_mapping_ambiguous")
-            found[fields[1]] = (fields[0], fields[2])
-    return found
+            found[name] = (schema, object_type)
+        return found
+    except PocError as exc:
+        if exc.category in {"entity_mapping_ambiguous", "entity_discovery_result_invalid"}:
+            raise
+        raise PocError("entity_discovery_result_invalid") from None
+    except (IndexError, TypeError, ValueError):
+        raise PocError("entity_discovery_result_invalid") from None
+
+
+def _nonnegative_sql_integer(output: str, category: str, *, allow_zero: bool) -> int:
+    try:
+        value = int(simple_value(output), 10)
+    except (PocError, TypeError, ValueError, OverflowError):
+        raise PocError(category) from None
+    if value < 0 or (not allow_zero and value == 0):
+        raise PocError(category)
+    return value
+
+
+def parse_restored_database_size(output: str) -> int:
+    return _nonnegative_sql_integer(output, "restored_database_size_invalid", allow_zero=False)
+
+
+def restored_database_size(password: str) -> int:
+    output = sqlcmd(
+        "SELECT SUM(CAST(size AS bigint)) * CAST(8192 AS bigint) FROM sys.database_files;",
+        password,
+        database=DATABASE,
+        failure_category="restored_database_size_query_failed",
+    )
+    return parse_restored_database_size(output)
+
+
+def parse_entity_count(output: str) -> int:
+    return _nonnegative_sql_integer(output, "entity_count_result_invalid", allow_zero=True)
+
+
+def parse_primary_key_metadata(output: str) -> list[str]:
+    try:
+        headers, rows = _normalized_headers(output)
+        column_index = field_index(headers, "column_name")
+        names = [row[column_index] for row in rows]
+        if any(not name for name in names):
+            raise PocError("primary_key_metadata_invalid")
+        return names
+    except PocError:
+        raise PocError("primary_key_metadata_invalid") from None
+    except (IndexError, TypeError, ValueError):
+        raise PocError("primary_key_metadata_invalid") from None
+
+
+def parse_foreign_key_metadata(output: str) -> list[tuple[str, str, str, str]]:
+    columns = ("parent_table", "parent_column", "referenced_table", "referenced_column")
+    try:
+        headers, rows = _normalized_headers(output)
+        indexes = [field_index(headers, column) for column in columns]
+        relations = [tuple(row[index] for index in indexes) for row in rows]
+        if any(any(not value for value in relation) for relation in relations):
+            raise PocError("foreign_key_metadata_invalid")
+        return relations
+    except PocError:
+        raise PocError("foreign_key_metadata_invalid") from None
+    except (IndexError, TypeError, ValueError):
+        raise PocError("foreign_key_metadata_invalid") from None
 
 
 def validate_entities(password: str) -> dict[str, Any]:
+    print("progress=entity_discovery")
     objects = table_objects(password)
     counts: dict[str, int] = {}
     pk: dict[str, list[str]] = {name: [] for name in REQUIRED_ENTITIES}
-    fk: list[tuple[str, str, str, str]] = []
+    print("progress=entity_counts")
     for name, (schema, object_type) in objects.items():
         full_name = f"{quote_identifier(schema)}.{quote_identifier(name)}"
-        counts[name] = int(simple_value(sqlcmd(f"SELECT COUNT_BIG(*) FROM {full_name};", password, database=DATABASE, timeout=600)))
+        count_output = sqlcmd(
+            f"SELECT COUNT_BIG(*) FROM {full_name};",
+            password,
+            database=DATABASE,
+            timeout=600,
+            failure_category="entity_count_query_failed",
+        )
+        counts[name] = parse_entity_count(count_output)
+    print("progress=primary_key_metadata")
+    for name, (schema, object_type) in objects.items():
         if object_type == "USER_TABLE":
             pk_query = (
-                "SELECT c.name FROM sys.indexes AS i "
+                "SELECT ic.key_ordinal AS key_ordinal, c.name AS column_name FROM sys.indexes AS i "
                 "JOIN sys.index_columns AS ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id "
                 "JOIN sys.columns AS c ON c.object_id=ic.object_id AND c.column_id=ic.column_id "
                 f"WHERE i.is_primary_key=1 AND i.object_id=OBJECT_ID({quote_literal(schema + '.' + name)}) "
                 "ORDER BY ic.key_ordinal;"
             )
-            pk_headers, pk_rows = _normalized_headers(sqlcmd(pk_query, password, database=DATABASE))
-            pk[name] = [row[field_index(pk_headers, "name")] for row in pk_rows]
+            pk_output = sqlcmd(
+                pk_query,
+                password,
+                database=DATABASE,
+                failure_category="primary_key_metadata_query_failed",
+            )
+            pk[name] = parse_primary_key_metadata(pk_output)
+    print("progress=foreign_key_metadata")
     fk_query = (
         "SELECT pt.name AS parent_table, pc.name AS parent_column, "
         "rt.name AS referenced_table, rc.name AS referenced_column "
@@ -531,9 +620,13 @@ def validate_entities(password: str) -> dict[str, Any]:
         f"AND rt.name IN ({','.join(quote_literal(name) for name in REQUIRED_ENTITIES)}) "
         "ORDER BY pt.name, fk.name, fkc.constraint_column_id;"
     )
-    fk_headers, fk_rows = _normalized_headers(sqlcmd(fk_query, password, database=DATABASE))
-    for row in fk_rows:
-        fk.append(tuple(row[field_index(fk_headers, key)] for key in ("parent_table", "parent_column", "referenced_table", "referenced_column")))
+    fk_output = sqlcmd(
+        fk_query,
+        password,
+        database=DATABASE,
+        failure_category="foreign_key_metadata_query_failed",
+    )
+    fk = parse_foreign_key_metadata(fk_output)
     missing = [name for name in REQUIRED_ENTITIES if name not in objects]
     no_primary_key = [name for name in REQUIRED_ENTITIES if name in objects and objects[name][1] == "USER_TABLE" and not pk[name]]
     return {"objects": objects, "counts": counts, "primary_keys": pk, "foreign_keys": fk, "missing": missing, "no_primary_key": no_primary_key}
@@ -541,6 +634,7 @@ def validate_entities(password: str) -> dict[str, Any]:
 
 def write_summary(summary: dict[str, Any]) -> None:
     entities = summary["entities"]
+    primary_key_tables = sum(bool(columns) for columns in entities["primary_keys"].values())
     lines = [
         "## Folketinget backup restore PoC",
         "",
@@ -553,19 +647,13 @@ def write_summary(summary: dict[str, Any]) -> None:
         f"- Restored database bytes: {summary['restored_database_size_bytes']}",
         "- DBCC CHECKDB: PASS",
         "",
-        "| Entity | Present | Rows | Primary key columns |",
-        "|---|---:|---:|---|",
+        f"- Required entities present: {len(entities['objects'])}/{len(REQUIRED_ENTITIES)}",
+        f"- Rows across required entities: {sum(entities['counts'].values())}",
+        f"- Entities with primary-key metadata: {primary_key_tables}",
+        f"- Declared relationships among required entities: {len(entities['foreign_keys'])}",
+        "",
     ]
-    for name in REQUIRED_ENTITIES:
-        present = name in entities["objects"]
-        key_columns = ", ".join(entities["primary_keys"].get(name, [])) or "none reported"
-        lines.append(f"| {name} | {'yes' if present else 'no'} | {entities['counts'].get(name, '—')} | {key_columns} |")
-    lines.extend(["", "Relationship/FK metadata:"])
-    if entities["foreign_keys"]:
-        lines.extend(f"- {source}.{source_col} → {target}.{target_col}" for source, source_col, target, target_col in entities["foreign_keys"])
-    else:
-        lines.append("- No declared foreign keys found between the six entities.")
-    lines.extend(["", "No rows, IDs, or personal data were included."])
+    lines.append("No table/column names, rows, IDs, or personal data were included.")
     text = "\n".join(lines) + "\n"
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
@@ -710,7 +798,9 @@ def main() -> int:
         )
         if not re.search(r"0 allocation errors and 0 consistency errors", checkdb, re.IGNORECASE):
             raise PocError("dbcc_checkdb_not_clean")
-        restored_size = int(simple_value(sqlcmd("SELECT CAST(SUM(size) * 8192 AS bigint) FROM sys.database_files;", password, database=DATABASE)))
+        print("progress=dbcc_pass")
+        print("progress=database_size_check")
+        restored_size = restored_database_size(password)
         entities = validate_entities(password)
         summary = {
             "download": download,
@@ -719,6 +809,7 @@ def main() -> int:
             "restored_database_size_bytes": restored_size,
             "entities": entities,
         }
+        print("progress=summary_write")
         write_summary(summary)
         if entities["missing"] or entities["no_primary_key"]:
             raise PocError("required_entity_validation_failed")

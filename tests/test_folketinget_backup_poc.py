@@ -5,6 +5,8 @@ import os
 import pathlib
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest import mock
 import urllib.error
 from types import SimpleNamespace
@@ -242,6 +244,110 @@ class BackupPocSafetyTests(unittest.TestCase):
         headers, rows = POC.parse_sqlcmd_table(output)
         self.assertEqual(headers, ["name", "type_desc", "size"])
         self.assertEqual(rows, [["Sag", "USER_TABLE", "8192"]])
+
+    def test_post_dbcc_metadata_parsers_fail_with_safe_categories(self) -> None:
+        for output in ("", "0\n", "-1\n", "not-a-size\n"):
+            with self.subTest(parser="database_size", output=output), self.assertRaises(POC.PocError) as raised:
+                POC.parse_restored_database_size(output)
+            self.assertEqual(str(raised.exception), "restored_database_size_invalid")
+        self.assertEqual(POC.parse_restored_database_size("21474836480\n"), 21_474_836_480)
+
+        for output in ("", "-1\n", "many\n"):
+            with self.subTest(parser="entity_count", output=output), self.assertRaises(POC.PocError) as raised:
+                POC.parse_entity_count(output)
+            self.assertEqual(str(raised.exception), "entity_count_result_invalid")
+        self.assertEqual(POC.parse_entity_count("0\n"), 0)
+
+        self.assertEqual(
+            POC.parse_entity_discovery(
+                "schema_name|entity_name|object_type\n-----------|-----------|-----------\ndbo|Sag|USER_TABLE\n"
+            ),
+            {"Sag": ("dbo", "USER_TABLE")},
+        )
+        self.assertEqual(
+            POC.parse_primary_key_metadata("key_ordinal|column_name\n-----------|------------\n1|SagId\n"),
+            ["SagId"],
+        )
+        self.assertEqual(
+            POC.parse_foreign_key_metadata(
+                "parent_table|parent_column|referenced_table|referenced_column\n"
+                "------------|-------------|----------------|------------------\nSag|CaseId|Case|Id\n"
+            ),
+            [("Sag", "CaseId", "Case", "Id")],
+        )
+
+        for parser, output, category in (
+            (POC.parse_entity_discovery, "bad output", "entity_discovery_result_invalid"),
+            (POC.parse_primary_key_metadata, "bad output", "primary_key_metadata_invalid"),
+            (POC.parse_foreign_key_metadata, "bad output", "foreign_key_metadata_invalid"),
+        ):
+            with self.subTest(parser=parser.__name__), self.assertRaises(POC.PocError) as raised:
+                parser(output)
+            self.assertEqual(str(raised.exception), category)
+
+    def test_post_dbcc_sql_failures_have_specific_safe_categories(self) -> None:
+        cases = (
+            ("database_size", POC.restored_database_size, "restored_database_size_query_failed"),
+            ("discovery", POC.table_objects, "entity_discovery_query_failed"),
+        )
+        for name, operation, category in cases:
+            with self.subTest(query=name), mock.patch.object(POC, "sqlcmd", side_effect=POC.PocError(category)) as sql:
+                with self.assertRaises(POC.PocError) as raised:
+                    operation("private-password")
+            self.assertEqual(str(raised.exception), category)
+            self.assertEqual(sql.call_args.kwargs["failure_category"], category)
+        with mock.patch.object(POC, "sqlcmd", return_value="21474836480\n") as sql:
+            self.assertEqual(POC.restored_database_size("private-password"), 21_474_836_480)
+        self.assertIn("SUM(CAST(size AS bigint))", sql.call_args.args[0])
+
+        with mock.patch.object(POC, "table_objects", return_value={"Sag": ("dbo", "USER_TABLE")}):
+            scenarios = (
+                ("entity_count_query_failed", [POC.PocError("entity_count_query_failed")]),
+                ("primary_key_metadata_query_failed", ["1\n", POC.PocError("primary_key_metadata_query_failed")]),
+                (
+                    "foreign_key_metadata_query_failed",
+                    ["1\n", "key_ordinal|column_name\n-----------|------------\n1|SagId\n", POC.PocError("foreign_key_metadata_query_failed")],
+                ),
+            )
+            for target_category, responses in scenarios:
+                with self.subTest(query=target_category):
+                    with mock.patch.object(POC, "sqlcmd", side_effect=responses):
+                        with redirect_stdout(StringIO()), self.assertRaises(POC.PocError) as raised:
+                            POC.validate_entities("private-password")
+                    self.assertEqual(str(raised.exception), target_category)
+
+    def test_post_dbcc_progress_markers_are_ordered(self) -> None:
+        source = (ROOT / "tools/folketinget_backup_poc.py").read_text()
+        main_body = source[source.index("def main()") :]
+        markers = ("dbcc_pass", "database_size_check", "summary_write")
+        positions = [main_body.index(f"progress={marker}") for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+        entity_body = source[source.index("def validate_entities(") : source.index("def write_summary(")]
+        entity_markers = ("entity_discovery", "entity_counts", "primary_key_metadata", "foreign_key_metadata")
+        positions = [entity_body.index(f"progress={marker}") for marker in entity_markers]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_post_dbcc_summary_omits_schema_contents(self) -> None:
+        summary = {
+            "download": {"sha256": "a" * 64, "download_seconds": 1},
+            "backup_size_bytes": 10,
+            "header": {"source_sql_major": 17, "backup_finish_date": "date", "compressed": "1"},
+            "restored_database_size_bytes": 20,
+            "entities": {
+                "objects": {"Sag": ("PrivateSchema", "USER_TABLE")},
+                "counts": {"Sag": 3},
+                "primary_keys": {"Sag": ["PrivateColumn"]},
+                "foreign_keys": [("Sag", "PrivateColumn", "Other", "OtherId")],
+            },
+        }
+        output = StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), redirect_stdout(output):
+            POC.write_summary(summary)
+        rendered = output.getvalue()
+        for private_schema_value in ("PrivateSchema", "PrivateColumn", "OtherId"):
+            self.assertNotIn(private_schema_value, rendered)
+        self.assertIn("Required entities present: 1/6", rendered)
+        self.assertIn("Rows across required entities: 3", rendered)
 
     def test_filelist_accepts_only_data_and_log_files(self) -> None:
         headers = "LogicalName|Type|Size"
