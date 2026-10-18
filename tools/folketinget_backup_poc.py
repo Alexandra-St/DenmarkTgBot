@@ -22,6 +22,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
+if TOOLS_DIRECTORY not in sys.path:
+    sys.path.insert(0, TOOLS_DIRECTORY)
+import folketinget_snapshot_manifest as snapshot_manifest
+
 ODA_URL = "https://oda.ft.dk/odapublish/oda.bak"
 ODA_ORIGIN = ("https", "oda.ft.dk", 443)
 REQUIRED_ENTITIES = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
@@ -31,6 +36,10 @@ SQL_MAJOR = 17  # SQL Server 2025
 SQLCMD = "/opt/mssql-tools18/bin/sqlcmd"
 DATABASE = "DenmarkBotFolketingetBackupPoc"
 BACKUP_ROOT = Path("/var/opt/mssql/backup")
+MANIFEST_DIRECTORY_NAME = "denmarkbot-folketinget-manifest"
+MANIFEST_FILENAME = "manifest.sqlite"
+RESTORE_VALIDATE = "RESTORE_VALIDATE"
+CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 
 
 class PocError(Exception):
@@ -44,6 +53,12 @@ class PocError(Exception):
 def validate_confirmation(value: str) -> None:
     if value != "true":
         raise PocError("manual_confirmation_required")
+
+
+def validate_mode(value: str) -> str:
+    if value not in {RESTORE_VALIDATE, CREATE_MANIFEST_BASELINE}:
+        raise PocError("workflow_mode_invalid")
+    return value
 
 
 def validate_credentials(username: str, password: str) -> None:
@@ -632,6 +647,85 @@ def validate_entities(password: str) -> dict[str, Any]:
     return {"objects": objects, "counts": counts, "primary_keys": pk, "foreign_keys": fk, "missing": missing, "no_primary_key": no_primary_key}
 
 
+def manifest_schema(password: str, entity: str, schema_name: str) -> dict[str, Any]:
+    if entity not in REQUIRED_ENTITIES:
+        raise PocError("manifest_schema_invalid")
+    query = (
+        "SELECT c.column_id AS [ordinal], c.name AS [column_name], t.name AS [type_name], "
+        "c.max_length AS [max_length], c.precision AS [precision], c.scale AS [scale], "
+        "c.is_nullable AS [nullable], ISNULL(pk.key_ordinal,0) AS [key_ordinal], "
+        "ISNULL(c.collation_name,'') AS [collation] "
+        "FROM sys.columns AS c JOIN sys.types AS t ON t.user_type_id=c.user_type_id "
+        "JOIN sys.objects AS o ON o.object_id=c.object_id "
+        "JOIN sys.schemas AS s ON s.schema_id=o.schema_id "
+        "LEFT JOIN (SELECT ic.object_id,ic.column_id,ic.key_ordinal FROM sys.index_columns AS ic "
+        "JOIN sys.indexes AS i ON i.object_id=ic.object_id AND i.index_id=ic.index_id "
+        "WHERE i.is_primary_key=1 AND ic.key_ordinal>0) AS pk "
+        "ON pk.object_id=c.object_id AND pk.column_id=c.column_id "
+        f"WHERE s.name={quote_literal(schema_name)} AND o.name={quote_literal(entity)} "
+        "AND o.type='U' ORDER BY c.column_id;"
+    )
+    output = sqlcmd(
+        query, password, database=DATABASE, failure_category="manifest_schema_query_failed"
+    )
+    try:
+        headers, rows = _normalized_headers(output)
+        indexes = {name: field_index(headers, name) for name in (
+            "ordinal", "column_name", "type_name", "max_length", "precision", "scale",
+            "nullable", "key_ordinal", "collation",
+        )}
+        columns = []
+        for row in rows:
+            columns.append({
+                "ordinal": int(row[indexes["ordinal"]]),
+                "name": row[indexes["column_name"]],
+                "type_name": row[indexes["type_name"]],
+                "max_length": int(row[indexes["max_length"]]),
+                "precision": int(row[indexes["precision"]]),
+                "scale": int(row[indexes["scale"]]),
+                "nullable": int(row[indexes["nullable"]]),
+                "key_ordinal": int(row[indexes["key_ordinal"]]),
+                "collation": row[indexes["collation"]] or None,
+            })
+        return {"schema_name": schema_name, "object_type": "USER_TABLE", "columns": columns}
+    except (PocError, IndexError, TypeError, ValueError, OverflowError):
+        raise PocError("manifest_schema_invalid") from None
+
+
+def manifest_page_json(
+    password: str, entity: str, schema_name: str, schema: dict[str, Any], offset: int, limit: int
+) -> str:
+    if entity not in REQUIRED_ENTITIES or offset < 0 or limit <= 0 or limit > snapshot_manifest.DEFAULT_BATCH_SIZE:
+        raise PocError("manifest_page_invalid")
+    columns = schema["columns"]
+    selected = ", ".join(
+        f"{quote_identifier(column['name'])} AS {quote_identifier(f'c{index:04d}')}"
+        for index, column in enumerate(columns)
+    )
+    primary_key = schema["primary_key"]
+    ordering = ", ".join(quote_identifier(name) for name in primary_key)
+    query = (
+        "SET NOCOUNT ON; "
+        f"SELECT {selected} FROM {quote_identifier(schema_name)}.{quote_identifier(entity)} "
+        f"ORDER BY {ordering} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY "
+        "FOR JSON PATH, INCLUDE_NULL_VALUES;"
+    )
+    output = run_checked(
+        [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-W", "-h", "-1",
+         "-s", "|", "-w", "65535", "-y", "0", "-d", DATABASE, "-Q", query],
+        "manifest_page_query_failed", env=sql_env(password), timeout=600,
+    )
+    # sqlcmd may wrap long JSON output at its configured line width; the JSON
+    # serializer escapes embedded newlines, so concatenating output lines is safe.
+    payload = "".join(line.strip() for line in output.splitlines())
+    try:
+        if len(payload.encode("utf-8")) > snapshot_manifest.MAX_BATCH_JSON_BYTES:
+            raise PocError("manifest_page_too_large")
+    except UnicodeEncodeError:
+        raise PocError("manifest_page_invalid") from None
+    return payload
+
+
 def write_summary(summary: dict[str, Any]) -> None:
     entities = summary["entities"]
     primary_key_tables = sum(bool(columns) for columns in entities["primary_keys"].values())
@@ -654,6 +748,20 @@ def write_summary(summary: dict[str, Any]) -> None:
         "",
     ]
     lines.append("No table/column names, rows, IDs, or personal data were included.")
+    manifest = summary.get("manifest")
+    if manifest is not None:
+        lines.extend([
+            "",
+            "## Snapshot manifest",
+            "",
+            f"- Manifest SHA-256: {manifest['sha256']}",
+            f"- Manifest bytes: {manifest['manifest_bytes']}",
+            f"- Total manifest rows: {manifest['total_rows']}",
+            f"- Schema fingerprint: {manifest['schema_fingerprint']}",
+            f"- Manifest validation: {manifest['validation']}",
+            "- Per-entity row counts:",
+        ])
+        lines.extend(f"  - {entity}: {count}" for entity, count in manifest["entity_counts"].items())
     text = "\n".join(lines) + "\n"
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
@@ -721,6 +829,7 @@ def main() -> int:
     data_dir: Path | None = None
     download_dir: Path | None = None
     try:
+        mode = validate_mode(os.environ.get("INPUT_MODE", RESTORE_VALIDATE))
         validate_confirmation(os.environ.get("INPUT_CONFIRM_RESTORE", ""))
         username = os.environ.get("ODA_BACKUP_USERNAME", "")
         credential = os.environ.get("ODA_BACKUP_PASSWORD", "")
@@ -802,6 +911,8 @@ def main() -> int:
         print("progress=database_size_check")
         restored_size = restored_database_size(password)
         entities = validate_entities(password)
+        if entities["missing"] or entities["no_primary_key"]:
+            raise PocError("required_entity_validation_failed")
         summary = {
             "download": download,
             "backup_size_bytes": download["file_size_bytes"],
@@ -809,10 +920,41 @@ def main() -> int:
             "restored_database_size_bytes": restored_size,
             "entities": entities,
         }
+        if mode == CREATE_MANIFEST_BASELINE:
+            print("progress=manifest_schema_discovery")
+            schemas: dict[str, dict[str, Any]] = {}
+            for entity in REQUIRED_ENTITIES:
+                schema_name, object_type = entities["objects"][entity]
+                if object_type != "USER_TABLE":
+                    raise PocError("manifest_required_entity_not_table")
+                schemas[entity] = manifest_schema(password, entity, schema_name)
+            manifest_directory = runner_temp / MANIFEST_DIRECTORY_NAME
+            if manifest_directory.exists() or manifest_directory.is_symlink():
+                raise PocError("manifest_path_exists")
+            try:
+                manifest_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+            except OSError:
+                raise PocError("manifest_directory_setup_failed") from None
+            manifest_path = manifest_directory / MANIFEST_FILENAME
+            print("progress=manifest_generation")
+            try:
+                manifest_info = snapshot_manifest.build_manifest(
+                    manifest_path,
+                    backup_sha256=str(download["sha256"]),
+                    backup_finish_date=str(header_info["backup_finish_date"]),
+                    source_sql_major=int(header_info["source_sql_major"]),
+                    schemas=schemas,
+                    expected_counts={entity: entities["counts"][entity] for entity in REQUIRED_ENTITIES},
+                    fetch_page=lambda entity, schema_name, schema, offset, limit: manifest_page_json(
+                        password, entity, schema_name, schema, offset, limit
+                    ),
+                )
+                manifest_info["sha256"] = snapshot_manifest.sha256_file(manifest_path)
+            except snapshot_manifest.ManifestError as exc:
+                raise PocError(exc.category) from None
+            summary["manifest"] = manifest_info
         print("progress=summary_write")
         write_summary(summary)
-        if entities["missing"] or entities["no_primary_key"]:
-            raise PocError("required_entity_validation_failed")
         print("restore_validation=PASS")
     except PocError as exc:
         print(f"restore_validation=FAIL category={exc.category}", file=sys.stderr)

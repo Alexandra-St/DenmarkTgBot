@@ -8,6 +8,14 @@ on:
         required: true
         type: boolean
         default: false
+      mode:
+        description: "Choose restore validation or deterministic manifest generation"
+        required: true
+        type: choice
+        options:
+          - RESTORE_VALIDATE
+          - CREATE_MANIFEST_BASELINE
+        default: RESTORE_VALIDATE
 
 permissions:
   contents: read
@@ -26,7 +34,25 @@ jobs:
       - name: Verify and restore official backup
         env:
           INPUT_CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
+          INPUT_MODE: ${{ inputs.mode }}
           ODA_BACKUP_USERNAME: ${{ secrets.ODA_BACKUP_USERNAME }}
           ODA_BACKUP_PASSWORD: ${{ secrets.ODA_BACKUP_PASSWORD }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 tools/folketinget_backup_poc.py
+      - name: Upload validated manifest only
+        if: success() && inputs.mode == 'CREATE_MANIFEST_BASELINE'
+        uses: actions/upload-artifact@v7
+        with:
+          name: folketinget-snapshot-manifest-${{ github.run_id }}
+          path: ${{ runner.temp }}/denmarkbot-folketinget-manifest/manifest.sqlite
+          if-no-files-found: error
+          retention-days: 2
+      - name: Remove temporary manifest files
+        if: always() && inputs.mode == 'CREATE_MANIFEST_BASELINE'
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          target="$RUNNER_TEMP/denmarkbot-folketinget-manifest"
+          if [ -d "$target" ] && [ ! -L "$target" ]; then
+            rm -rf -- "$target"
+          fi

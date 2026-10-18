@@ -368,7 +368,11 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("confirm_restore", workflow)
         self.assertIn("secrets.ODA_BACKUP_USERNAME", workflow)
         self.assertIn("secrets.ODA_BACKUP_PASSWORD", workflow)
-        self.assertNotIn("upload-artifact", workflow)
+        self.assertIn("uses: actions/upload-artifact@v7", workflow)
+        self.assertIn("retention-days: 2", workflow)
+        self.assertIn("CREATE_MANIFEST_BASELINE", workflow)
+        self.assertIn("manifest.sqlite", workflow)
+        self.assertNotIn(".bak", workflow)
         self.assertNotIn("worker", workflow.lower())
         self.assertNotIn("telegram", workflow.lower())
 
