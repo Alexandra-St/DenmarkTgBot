@@ -18,11 +18,11 @@ concurrency:
 
 jobs:
   restore-poc:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Verify and restore official backup
         env:
           INPUT_CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
