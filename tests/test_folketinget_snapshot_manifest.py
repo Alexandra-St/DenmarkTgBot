@@ -180,9 +180,15 @@ class FolketingetManifestTests(unittest.TestCase):
         assert poc_spec.loader is not None
         poc_spec.loader.exec_module(poc)
         schema_info = MANIFEST.normalize_schema("Sag", schema())
-        with mock.patch.object(poc, "run_checked", return_value="[]\n") as run:
-            self.assertEqual(poc.manifest_page_json("private", "Sag", "dbo", schema_info, 5000, 5000), "[]")
-        query = run.call_args.args[0][-1]
+        page = '[{"c0000":1,"c0001":"Æ","c0002":null,"c0003":null}]'
+        with mock.patch.object(poc, "run_checked", return_value=page + "\n") as run:
+            payload = poc.manifest_page_json("private", "Sag", "dbo", schema_info, 5000, 5000)
+        self.assertEqual(MANIFEST._decode_json_page(payload), [{"c0000": 1, "c0001": "Æ", "c0002": None, "c0003": None}])
+        argv = run.call_args.args[0]
+        self.assertIn("-y", argv)
+        self.assertIn("0", argv)
+        self.assertNotIn("-W", argv)
+        query = argv[-1]
         self.assertIn("ORDER BY [id] OFFSET 5000 ROWS FETCH NEXT 5000 ROWS ONLY", query)
         self.assertIn("FOR JSON PATH, INCLUDE_NULL_VALUES", query)
         self.assertNotIn("private", query)

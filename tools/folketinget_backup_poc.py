@@ -711,7 +711,7 @@ def manifest_page_json(
         "FOR JSON PATH, INCLUDE_NULL_VALUES;"
     )
     output = run_checked(
-        [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-W", "-h", "-1",
+        [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-h", "-1",
          "-s", "|", "-w", "65535", "-y", "0", "-d", DATABASE, "-Q", query],
         "manifest_page_query_failed", env=sql_env(password), timeout=600,
     )
