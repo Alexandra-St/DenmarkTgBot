@@ -698,10 +698,18 @@ def manifest_page_json(
     if entity not in REQUIRED_ENTITIES or offset < 0 or limit <= 0 or limit > snapshot_manifest.DEFAULT_BATCH_SIZE:
         raise PocError("manifest_page_invalid")
     columns = schema["columns"]
-    selected = ", ".join(
-        f"{quote_identifier(column['name'])} AS {quote_identifier(f'c{index:04d}')}"
-        for index, column in enumerate(columns)
-    )
+    selected_expressions = []
+    for index, column in enumerate(columns):
+        identifier = quote_identifier(column["name"])
+        sql_type = str(column["type_name"]).casefold()
+        if sql_type == "text":
+            expression = f"CONVERT(varchar(max), {identifier})"
+        elif sql_type == "ntext":
+            expression = f"CONVERT(nvarchar(max), {identifier})"
+        else:
+            expression = identifier
+        selected_expressions.append(f"{expression} AS {quote_identifier(f'c{index:04d}')}")
+    selected = ", ".join(selected_expressions)
     primary_key = schema["primary_key"]
     ordering = ", ".join(quote_identifier(name) for name in primary_key)
     query = (
@@ -710,10 +718,13 @@ def manifest_page_json(
         f"ORDER BY {ordering} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY "
         "FOR JSON PATH, INCLUDE_NULL_VALUES;"
     )
-    output = run_checked(
+    output = run_manifest_page_sql(
         [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-h", "-1",
          "-s", "|", "-w", "65535", "-y", "0", "-d", DATABASE, "-Q", query],
-        "manifest_page_query_failed", env=sql_env(password), timeout=600,
+        password,
+        entity=entity,
+        offset=offset,
+        timeout=600,
     )
     # sqlcmd may wrap long JSON output at its configured line width; the JSON
     # serializer escapes embedded newlines, so concatenating output lines is safe.
@@ -724,6 +735,57 @@ def manifest_page_json(
     except UnicodeEncodeError:
         raise PocError("manifest_page_invalid") from None
     return payload
+
+
+def run_manifest_page_sql(
+    argv: list[str], password: str, *, entity: str, offset: int, timeout: int
+) -> str:
+    """Run one bounded page query and expose only safe SQL diagnostics."""
+    if entity not in REQUIRED_ENTITIES or offset < 0:
+        raise PocError("manifest_page_invalid")
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+            env=sql_env(password),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"manifest_page_sql_failure entity={entity} offset={offset} "
+            "return_code=timeout category=manifest_page_sqlcmd_failed",
+            file=sys.stderr,
+        )
+        raise PocError("manifest_page_sqlcmd_failed") from None
+    except OSError:
+        print(
+            f"manifest_page_sql_failure entity={entity} offset={offset} "
+            "return_code=unavailable category=manifest_page_sqlcmd_failed",
+            file=sys.stderr,
+        )
+        raise PocError("manifest_page_sqlcmd_failed") from None
+    if result.returncode != 0:
+        # SQL Server diagnostics are emitted on stderr by sqlcmd. Never expose
+        # its message text or stdout, which can contain selected row values.
+        match = re.search(r"\bMsg\s+([0-9]{1,6})\b", result.stderr or "", re.IGNORECASE)
+        category = f"manifest_page_sql_msg_{match.group(1)}" if match else "manifest_page_sqlcmd_failed"
+        print(
+            f"manifest_page_sql_failure entity={entity} offset={offset} "
+            f"return_code={result.returncode} category={category}",
+            file=sys.stderr,
+        )
+        raise PocError(category)
+    return result.stdout
+
+
+def report_manifest_entity(entity: str) -> None:
+    if entity not in REQUIRED_ENTITIES:
+        raise PocError("manifest_page_invalid")
+    print(f"progress=manifest_entity entity={entity}")
 
 
 def write_summary(summary: dict[str, Any]) -> None:
@@ -938,6 +1000,14 @@ def main() -> int:
             manifest_path = manifest_directory / MANIFEST_FILENAME
             print("progress=manifest_generation")
             try:
+                started_entities: set[str] = set()
+
+                def fetch_manifest_page(entity: str, schema_name: str, schema: dict[str, Any], offset: int, limit: int) -> str:
+                    if entity not in started_entities:
+                        report_manifest_entity(entity)
+                        started_entities.add(entity)
+                    return manifest_page_json(password, entity, schema_name, schema, offset, limit)
+
                 manifest_info = snapshot_manifest.build_manifest(
                     manifest_path,
                     backup_sha256=str(download["sha256"]),
@@ -945,9 +1015,7 @@ def main() -> int:
                     source_sql_major=int(header_info["source_sql_major"]),
                     schemas=schemas,
                     expected_counts={entity: entities["counts"][entity] for entity in REQUIRED_ENTITIES},
-                    fetch_page=lambda entity, schema_name, schema, offset, limit: manifest_page_json(
-                        password, entity, schema_name, schema, offset, limit
-                    ),
+                    fetch_page=fetch_manifest_page,
                 )
                 manifest_info["sha256"] = snapshot_manifest.sha256_file(manifest_path)
             except snapshot_manifest.ManifestError as exc:

@@ -6,6 +6,8 @@ import pathlib
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from unittest import mock
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
@@ -181,7 +183,7 @@ class FolketingetManifestTests(unittest.TestCase):
         poc_spec.loader.exec_module(poc)
         schema_info = MANIFEST.normalize_schema("Sag", schema())
         page = '[{"c0000":1,"c0001":"Æ","c0002":null,"c0003":null}]'
-        with mock.patch.object(poc, "run_checked", return_value=page + "\n") as run:
+        with mock.patch.object(poc, "run_manifest_page_sql", return_value=page + "\n") as run:
             payload = poc.manifest_page_json("private", "Sag", "dbo", schema_info, 5000, 5000)
         self.assertEqual(MANIFEST._decode_json_page(payload), [{"c0000": 1, "c0001": "Æ", "c0002": None, "c0003": None}])
         argv = run.call_args.args[0]
@@ -192,6 +194,75 @@ class FolketingetManifestTests(unittest.TestCase):
         self.assertIn("ORDER BY [id] OFFSET 5000 ROWS FETCH NEXT 5000 ROWS ONLY", query)
         self.assertIn("FOR JSON PATH, INCLUDE_NULL_VALUES", query)
         self.assertNotIn("private", query)
+
+    def test_manifest_page_converts_legacy_text_types_before_for_json(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_legacy_types_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        source_schema = schema()
+        source_schema["columns"].extend([
+            {"ordinal": 5, "name": "legacy_text", "type_name": "text", "max_length": 16,
+             "precision": 0, "scale": 0, "nullable": 1, "key_ordinal": 0, "collation": "Danish"},
+            {"ordinal": 6, "name": "legacy_ntext", "type_name": "ntext", "max_length": 16,
+             "precision": 0, "scale": 0, "nullable": 1, "key_ordinal": 0, "collation": "Danish"},
+        ])
+        schema_info = MANIFEST.normalize_schema("Sag", source_schema)
+        page = '[{"c0000":1,"c0001":null,"c0002":null,"c0003":null,"c0004":"old","c0005":"æ"}]'
+        with mock.patch.object(poc, "run_manifest_page_sql", return_value=page) as run:
+            payload = poc.manifest_page_json("private", "Sag", "dbo", schema_info, 0, 10)
+        query = run.call_args.args[0][-1]
+        self.assertIn("CONVERT(varchar(max), [legacy_text]) AS [c0004]", query)
+        self.assertIn("CONVERT(nvarchar(max), [legacy_ntext]) AS [c0005]", query)
+        self.assertEqual(MANIFEST._decode_json_page(payload)[0]["c0005"], "æ")
+
+    def test_sql_failure_logs_only_safe_entity_offset_code_and_category(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_sql_diagnostics_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        stderr = StringIO()
+        failure = mock.Mock(returncode=1, stdout='[{"row":"PRIVATE_STDOUT"}]', stderr="Msg 402, Level 16: PRIVATE_SQL_DETAIL PRIVATE_ID")
+        with mock.patch.object(poc.subprocess, "run", return_value=failure):
+            with redirect_stderr(stderr), self.assertRaises(poc.PocError) as raised:
+                poc.run_manifest_page_sql(["sqlcmd", "PRIVATE_QUERY"], "PRIVATE_PASSWORD", entity="Sag", offset=5000, timeout=10)
+        self.assertEqual(raised.exception.category, "manifest_page_sql_msg_402")
+        rendered = stderr.getvalue()
+        self.assertIn("entity=Sag offset=5000 return_code=1 category=manifest_page_sql_msg_402", rendered)
+        for secret in ("PRIVATE_SQL_DETAIL", "PRIVATE_ID", "PRIVATE_STDOUT", "PRIVATE_QUERY", "PRIVATE_PASSWORD"):
+            self.assertNotIn(secret, rendered)
+
+    def test_sql_failure_without_message_number_uses_generic_safe_category(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_sql_generic_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        failure = mock.Mock(returncode=2, stdout="", stderr="connection details that must stay private")
+        with mock.patch.object(poc.subprocess, "run", return_value=failure), redirect_stderr(StringIO()) as output:
+            with self.assertRaises(poc.PocError) as raised:
+                poc.run_manifest_page_sql(["sqlcmd"], "private", entity="Sag", offset=0, timeout=10)
+        self.assertEqual(raised.exception.category, "manifest_page_sqlcmd_failed")
+        self.assertNotIn("connection details", output.getvalue())
+
+    def test_manifest_entity_progress_uses_only_allowed_entity(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_progress_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        output = StringIO()
+        with redirect_stdout(output):
+            poc.report_manifest_entity("Sagstrin")
+        self.assertEqual(output.getvalue(), "progress=manifest_entity entity=Sagstrin\n")
+        with self.assertRaises(poc.PocError):
+            poc.report_manifest_entity("private")
 
     def test_manifest_progress_and_summary_do_not_print_row_values(self) -> None:
         source = (ROOT / "tools/folketinget_backup_poc.py").read_text()
