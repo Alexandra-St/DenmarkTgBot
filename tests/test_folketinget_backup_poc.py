@@ -69,17 +69,26 @@ class BackupPocSafetyTests(unittest.TestCase):
     def test_backup_path_permissions_and_size_are_checked_safely(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             backup = pathlib.Path(directory) / "oda.bak"
-            with self.assertRaises(POC.PocError) as raised:
-                POC.validate_backup_readable_by_sql_server(backup, 10)
+            with mock.patch.object(POC, "run_checked", side_effect=POC.PocError("backup_file_validation_failed")):
+                with self.assertRaises(POC.PocError) as raised:
+                    POC.validate_backup_readable_by_sql_server(backup, 10)
             self.assertEqual(str(raised.exception), "backup_file_validation_failed")
-            backup.write_bytes(b"backup")
-            with self.assertRaises(POC.PocError) as raised:
-                POC.validate_backup_readable_by_sql_server(backup, 10)
-            self.assertEqual(str(raised.exception), "backup_file_validation_failed")
-            with mock.patch.object(POC, "run_checked", side_effect=POC.PocError("backup_path_unreadable_by_sql_server")):
+            with mock.patch.object(POC, "run_checked", side_effect=["regular file 640 6\n", None]) as checked:
+                POC.validate_backup_readable_by_sql_server(backup, 6)
+            self.assertIn("stat", checked.call_args_list[0].args[0])
+            self.assertEqual(checked.call_args_list[1].args[1], "backup_path_unreadable_by_sql_server")
+            with mock.patch.object(POC, "run_checked", side_effect=["regular file 640 6\n", POC.PocError("backup_path_unreadable_by_sql_server")]):
                 with self.assertRaises(POC.PocError) as raised:
                     POC.validate_backup_readable_by_sql_server(backup, 6)
             self.assertEqual(str(raised.exception), "backup_path_unreadable_by_sql_server")
+
+    def test_backup_file_permissions_reject_world_access_and_wrong_size(self) -> None:
+        for stat_output in ("regular file 644 6\n", "regular file 640 7\n", "directory 750 6\n", "invalid\n"):
+            with self.subTest(stat_output=stat_output):
+                with mock.patch.object(POC, "run_checked", return_value=stat_output):
+                    with self.assertRaises(POC.PocError) as raised:
+                        POC.validate_backup_readable_by_sql_server(pathlib.Path("/var/opt/mssql/backup/poc/oda.bak"), 6)
+                self.assertEqual(str(raised.exception), "backup_file_validation_failed")
 
     def test_download_metadata_and_header_parsing_have_safe_categories(self) -> None:
         with self.assertRaises(POC.PocError) as raised:
@@ -96,7 +105,7 @@ class BackupPocSafetyTests(unittest.TestCase):
 
     def test_cleanup_still_removes_temp_path_if_service_check_raises(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            backup_dir = pathlib.Path(directory) / "denmarkbot-poc-backup-test"
+            backup_dir = POC.BACKUP_ROOT / "denmarkbot-poc-backup-test"
             calls: list[list[str]] = []
 
             def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
@@ -111,6 +120,33 @@ class BackupPocSafetyTests(unittest.TestCase):
                         POC.cleanup("never-printed", backup_dir, None)
             self.assertEqual(str(raised.exception), "temporary_data_cleanup_failed")
             self.assertTrue(any("rm" in call for call in calls))
+
+    def test_backup_path_allowlist_and_cleanup_use_sql_server_staging_root(self) -> None:
+        runner_temp = pathlib.Path("/runner/temp")
+        backup_dir = POC.BACKUP_ROOT / "denmarkbot-poc-backup-run-id-random"
+        self.assertTrue(POC.cleanup_path_is_allowed(backup_dir, runner_temp))
+        self.assertTrue(POC.cleanup_path_is_allowed(runner_temp / "denmarkbot-poc-download-run-id-random", runner_temp))
+        self.assertFalse(POC.cleanup_path_is_allowed(pathlib.Path("/tmp/denmarkbot-poc-backup-outside"), runner_temp))
+        self.assertFalse(POC.cleanup_path_is_allowed(pathlib.Path("/var/opt/mssql/backup/../outside"), runner_temp))
+
+        calls: list[list[str]] = []
+        with mock.patch.object(POC.subprocess, "run", side_effect=lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(returncode=0)):
+            POC.cleanup(None, backup_dir, None)
+        self.assertIn(str(backup_dir), calls[0])
+
+    def test_backup_staging_permissions_are_private_and_sql_server_readable(self) -> None:
+        script = (ROOT / "tools/folketinget_backup_poc.py").read_text()
+        self.assertIn('"-g", "mssql", "-m", "0750", "--", str(backup_dir)', script)
+        self.assertIn('"-g", "mssql", "-m", "0640", "--", str(download_temp_path), str(backup_path)', script)
+        self.assertIn('["sudo", "-u", "mssql", "test", "-r", str(path)]', script)
+
+    def test_cleanup_rejects_path_outside_allowlisted_directories(self) -> None:
+        calls: list[list[str]] = []
+        with mock.patch.object(POC.subprocess, "run", side_effect=lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(returncode=0)):
+            with self.assertRaises(POC.PocError) as raised:
+                POC.cleanup(None, pathlib.Path("/tmp/not-an-allowed-poc-path"), None)
+        self.assertEqual(str(raised.exception), "temporary_data_cleanup_failed")
+        self.assertEqual(calls, [])
 
     def test_backup_must_be_full_and_supported(self) -> None:
         POC.validate_backup_header(16, 1, False)

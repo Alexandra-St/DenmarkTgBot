@@ -12,7 +12,6 @@ import re
 import shutil
 import signal
 import ssl
-import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +30,7 @@ GIB = 1024**3
 SQL_MAJOR = 17  # SQL Server 2025
 SQLCMD = "/opt/mssql-tools18/bin/sqlcmd"
 DATABASE = "DenmarkBotFolketingetBackupPoc"
+BACKUP_ROOT = Path("/var/opt/mssql/backup")
 
 
 class PocError(Exception):
@@ -270,11 +270,16 @@ def check_restore_disk_space(data_dir: Path, required_bytes: int) -> int:
 
 
 def validate_backup_readable_by_sql_server(path: Path, expected_bytes: int) -> None:
-    try:
-        metadata = path.stat()
-    except OSError:
-        raise PocError("backup_file_validation_failed") from None
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected_bytes:
+    size_output = run_checked(
+        ["sudo", "-u", "mssql", "stat", "-c", "%F %a %s", "--", str(path)],
+        "backup_file_validation_failed",
+        timeout=15,
+    )
+    match = re.fullmatch(r"\s*regular file ([0-7]{3,4}) ([0-9]+)\s*", size_output)
+    if match is None:
+        raise PocError("backup_file_validation_failed")
+    mode, size = int(match.group(1), 8), int(match.group(2), 10)
+    if size != expected_bytes or mode & 0o007:
         raise PocError("backup_file_validation_failed")
     run_checked(
         ["sudo", "-u", "mssql", "test", "-r", str(path)],
@@ -569,7 +574,28 @@ def write_summary(summary: dict[str, Any]) -> None:
     print(text, end="")
 
 
-def cleanup(password: str | None, backup_dir: Path | None, data_dir: Path | None) -> None:
+def cleanup_path_is_allowed(
+    path: Path,
+    runner_temp: Path,
+    backup_root: Path = BACKUP_ROOT,
+) -> bool:
+    """Allow removal only of named, direct child directories created by this PoC."""
+    if not path.is_absolute() or ".." in path.parts:
+        return False
+    if path.parent == backup_root and path.name.startswith("denmarkbot-poc-backup-"):
+        return True
+    if path.parent == runner_temp and path.name.startswith("denmarkbot-poc-download-"):
+        return True
+    data_root = Path("/var/opt/mssql/data")
+    return path.parent == data_root and path.name.startswith("denmarkbot-poc-data-")
+
+
+def cleanup(
+    password: str | None,
+    backup_dir: Path | None,
+    data_dir: Path | None,
+    download_dir: Path | None = None,
+) -> None:
     cleanup_failed = False
     if password:
         try:
@@ -585,17 +611,10 @@ def cleanup(password: str | None, backup_dir: Path | None, data_dir: Path | None
                 )
             except PocError:
                 cleanup_failed = True
-    for path in (backup_dir, data_dir):
+    runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp")).absolute()
+    for path in (backup_dir, data_dir, download_dir):
         if path is not None:
-            try:
-                resolved = path.resolve()
-                backup_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
-                allowed_backup = resolved.parent == backup_root and resolved.name.startswith("denmarkbot-poc-backup-")
-                allowed_data = resolved.parent == Path("/var/opt/mssql/data").resolve() and resolved.name.startswith("denmarkbot-poc-data-")
-            except OSError:
-                cleanup_failed = True
-                continue
-            if not (allowed_backup or allowed_data):
+            if not cleanup_path_is_allowed(path, runner_temp):
                 cleanup_failed = True
                 continue
             try:
@@ -612,6 +631,7 @@ def main() -> int:
     password: str | None = None
     backup_dir: Path | None = None
     data_dir: Path | None = None
+    download_dir: Path | None = None
     try:
         validate_confirmation(os.environ.get("INPUT_CONFIRM_RESTORE", ""))
         username = os.environ.get("ODA_BACKUP_USERNAME", "")
@@ -632,14 +652,25 @@ def main() -> int:
         check_free_space(after_install, download_space_required(content_length))
         run_id = re.sub(r"[^A-Za-z0-9-]", "", os.environ.get("GITHUB_RUN_ID", "manual")) or "manual"
         suffix = __import__("secrets").token_hex(6)
-        backup_dir = runner_temp / f"denmarkbot-poc-backup-{run_id}-{suffix}"
+        download_dir = runner_temp / f"denmarkbot-poc-download-{run_id}-{suffix}"
+        backup_dir = BACKUP_ROOT / f"denmarkbot-poc-backup-{run_id}-{suffix}"
         data_dir = Path("/var/opt/mssql/data") / f"denmarkbot-poc-data-{run_id}-{suffix}"
-        run_checked(["sudo", "install", "-d", "-o", os.environ.get("USER", "runner"), "-g", "mssql", "-m", "0750", str(backup_dir)], "backup_temp_setup_failed")
+        run_checked(["sudo", "install", "-d", "-o", os.environ.get("USER", "runner"), "-g", "mssql", "-m", "0700", "--", str(download_dir)], "backup_temp_setup_failed")
+        run_checked(["sudo", "install", "-d", "-o", "mssql", "-g", "mssql", "-m", "0750", "--", str(BACKUP_ROOT)], "backup_staging_setup_failed")
+        run_checked(["sudo", "install", "-d", "-o", "mssql", "-g", "mssql", "-m", "0750", "--", str(backup_dir)], "backup_staging_setup_failed")
+        download_temp_path = download_dir / "oda.bak"
         backup_path = backup_dir / "oda.bak"
-        download = download_backup(opener, backup_path, content_length)
+        download = download_backup(opener, download_temp_path, content_length)
         print("progress=backup_download_complete")
         backup_size, backup_checksum, download_seconds = validate_download_metadata(download, content_length)
         print(f"backup_bytes={backup_size} sha256={backup_checksum} download_seconds={download_seconds}")
+        print("progress=backup_staging_copy")
+        run_checked(
+            ["sudo", "install", "-o", "mssql", "-g", "mssql", "-m", "0640", "--", str(download_temp_path), str(backup_path)],
+            "backup_staging_copy_failed",
+            timeout=300,
+        )
+        download_temp_path.unlink(missing_ok=True)
         restore_parent = Path("/var/opt/mssql/data")
         print("progress=restore_storage_check")
         run_checked(
@@ -704,7 +735,7 @@ def main() -> int:
         os.environ.pop("ODA_BACKUP_USERNAME", None)
         os.environ.pop("ODA_BACKUP_PASSWORD", None)
         try:
-            cleanup(password, backup_dir, data_dir)
+            cleanup(password, backup_dir, data_dir, download_dir)
         except PocError as exc:
             print(f"cleanup=FAIL category={exc.category}", file=sys.stderr)
             return_code = 2
