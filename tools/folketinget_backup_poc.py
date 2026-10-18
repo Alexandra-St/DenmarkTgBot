@@ -218,8 +218,30 @@ def download_backup(opener: urllib.request.OpenerDirector, target: Path, expecte
         raise PocError("backup_download_network_error") from None
 
 
+def parse_df_available_bytes(output: str) -> int:
+    """Parse only GNU df's available-byte column, with a stable C locale."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) != 2 or lines[0] != "Avail" or not re.fullmatch(r"[0-9]+", lines[1]):
+        raise PocError("restore_disk_space_result_invalid")
+    try:
+        available = int(lines[1], 10)
+    except (ValueError, OverflowError):
+        raise PocError("restore_disk_space_result_invalid") from None
+    if available < 0:
+        raise PocError("restore_disk_space_result_invalid")
+    return available
+
+
 def free_bytes(path: Path) -> int:
-    return shutil.disk_usage(path).free
+    # Query the containing filesystem as root: the runner may not have search
+    # permission on SQL Server's data directory. Never expose df output.
+    output = run_checked(
+        ["sudo", "df", "--output=avail", "-B1", "--", str(path)],
+        "restore_disk_space_check_failed",
+        env={"LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+        timeout=15,
+    )
+    return parse_df_available_bytes(output)
 
 
 def validate_download_metadata(download: dict[str, object], expected_bytes: int) -> tuple[int, str, float]:
@@ -238,8 +260,6 @@ def validate_download_metadata(download: dict[str, object], expected_bytes: int)
 
 def check_restore_disk_space(data_dir: Path, required_bytes: int) -> int:
     try:
-        if not data_dir.is_dir():
-            raise PocError("restore_data_directory_unavailable")
         available = free_bytes(data_dir)
     except PocError:
         raise

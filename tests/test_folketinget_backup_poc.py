@@ -47,16 +47,24 @@ class BackupPocSafetyTests(unittest.TestCase):
         with self.assertRaises(POC.PocError):
             POC.restore_space_required([])
 
-    def test_restore_disk_checks_categorize_missing_and_inaccessible_paths(self) -> None:
-        missing = pathlib.Path("/path/that/does/not/exist/for/restore")
-        with self.assertRaises(POC.PocError) as raised:
-            POC.check_restore_disk_space(missing, 1)
-        self.assertEqual(str(raised.exception), "restore_data_directory_unavailable")
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.object(POC, "free_bytes", side_effect=PermissionError("private path details")):
-                with self.assertRaises(POC.PocError) as raised:
-                    POC.check_restore_disk_space(pathlib.Path(directory), 1)
+    def test_restore_disk_space_parser_accepts_numeric_available_bytes(self) -> None:
+        self.assertEqual(POC.parse_df_available_bytes("Avail\n123456789\n"), 123456789)
+
+    def test_restore_disk_space_command_failure_is_categorized(self) -> None:
+        with mock.patch.object(
+            POC,
+            "run_checked",
+            side_effect=POC.PocError("restore_disk_space_check_failed"),
+        ):
+            with self.assertRaises(POC.PocError) as raised:
+                POC.check_restore_disk_space(pathlib.Path("/restricted/path"), 1)
         self.assertEqual(str(raised.exception), "restore_disk_space_check_failed")
+
+    def test_restore_disk_space_parser_rejects_malformed_results(self) -> None:
+        for output in ("", "Avail\n\n", "Avail\n-1\n", "Avail\n1.5\n", "Avail\n1\nextra\n", "Wrong\n1\n"):
+            with self.subTest(output=output), self.assertRaises(POC.PocError) as raised:
+                POC.parse_df_available_bytes(output)
+            self.assertEqual(str(raised.exception), "restore_disk_space_result_invalid")
 
     def test_backup_path_permissions_and_size_are_checked_safely(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
