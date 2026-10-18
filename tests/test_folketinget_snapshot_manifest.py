@@ -183,12 +183,14 @@ class FolketingetManifestTests(unittest.TestCase):
         poc_spec.loader.exec_module(poc)
         schema_info = MANIFEST.normalize_schema("Sag", schema())
         page = '[{"c0000":1,"c0001":"Æ","c0002":null,"c0003":null}]'
-        with mock.patch.object(poc, "run_manifest_page_sql", return_value=page + "\n") as run:
+        sqlcmd_output = f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\n{page}\n"
+        with mock.patch.object(poc, "run_manifest_page_sql", return_value=sqlcmd_output) as run:
             payload = poc.manifest_page_json("private", "Sag", "dbo", schema_info, 5000, 5000)
         self.assertEqual(MANIFEST._decode_json_page(payload), [{"c0000": 1, "c0001": "Æ", "c0002": None, "c0003": None}])
         argv = run.call_args.args[0]
         self.assertIn("-y", argv)
         self.assertIn("0", argv)
+        self.assertNotIn("-h", argv)
         self.assertNotIn("-W", argv)
         self.assertIn("-r", argv)
         query = argv[-1]
@@ -212,12 +214,32 @@ class FolketingetManifestTests(unittest.TestCase):
         ])
         schema_info = MANIFEST.normalize_schema("Sag", source_schema)
         page = '[{"c0000":1,"c0001":null,"c0002":null,"c0003":null,"c0004":"old","c0005":"æ"}]'
-        with mock.patch.object(poc, "run_manifest_page_sql", return_value=page) as run:
+        sqlcmd_output = f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\n{page}\n"
+        with mock.patch.object(poc, "run_manifest_page_sql", return_value=sqlcmd_output) as run:
             payload = poc.manifest_page_json("private", "Sag", "dbo", schema_info, 0, 10)
         query = run.call_args.args[0][-1]
         self.assertIn("CONVERT(varchar(max), [legacy_text]) AS [c0004]", query)
         self.assertIn("CONVERT(nvarchar(max), [legacy_ntext]) AS [c0005]", query)
         self.assertEqual(MANIFEST._decode_json_page(payload)[0]["c0005"], "æ")
+
+    def test_manifest_page_output_accepts_only_documented_header_and_valid_json(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_output_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        payload = '[{"c0000":1}]'
+        expected = f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\n{payload}\n"
+        self.assertEqual(poc.parse_manifest_page_output(expected), payload)
+        for malformed in (
+            f"unexpected\n{'-' * 48}\n{payload}\n",
+            f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\n{payload}\nunexpected\n",
+            f"{poc.MANIFEST_JSON_COLUMN_HEADER}\n{'-' * 48}\nnot-json\n",
+        ):
+            with self.assertRaises(poc.PocError) as raised:
+                poc.parse_manifest_page_output(malformed)
+            self.assertEqual(raised.exception.category, "manifest_page_invalid")
 
     def test_sql_failure_logs_only_safe_entity_offset_code_and_category(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(

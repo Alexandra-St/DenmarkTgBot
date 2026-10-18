@@ -42,6 +42,7 @@ RESTORE_VALIDATE = "RESTORE_VALIDATE"
 CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
+MANIFEST_JSON_COLUMN_HEADER = "JSON_F52E2B61-18A1-11d1-B105-00805F49916B"
 
 
 class PocError(Exception):
@@ -758,20 +759,35 @@ def manifest_page_json(
         "FOR JSON PATH, INCLUDE_NULL_VALUES;"
     )
     output = run_manifest_page_sql(
-        [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-r", "-h", "-1",
+        [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-r",
          "-s", "|", "-w", "65535", "-y", "0", "-d", DATABASE, "-Q", query],
         password,
         entity=entity,
         offset=offset,
         timeout=600,
     )
-    # sqlcmd may wrap long JSON output at its configured line width; the JSON
-    # serializer escapes embedded newlines, so concatenating output lines is safe.
-    payload = "".join(line.strip() for line in output.splitlines())
+    payload = parse_manifest_page_output(output)
     try:
         if len(payload.encode("utf-8")) > snapshot_manifest.MAX_BATCH_JSON_BYTES:
             raise PocError("manifest_page_too_large")
     except UnicodeEncodeError:
+        raise PocError("manifest_page_invalid") from None
+    return payload
+
+
+def parse_manifest_page_output(output: str) -> str:
+    """Remove only sqlcmd's documented FOR JSON heading and separator."""
+    lines = output.splitlines()
+    if len(lines) < 3 or lines[0].strip() != MANIFEST_JSON_COLUMN_HEADER:
+        raise PocError("manifest_page_invalid")
+    if not re.fullmatch(r"\s*-{3,}\s*", lines[1]):
+        raise PocError("manifest_page_invalid")
+    # sqlcmd wraps a single result column at -w boundaries. Preserve every
+    # payload character across those breaks; unexpected text will fail JSON decoding.
+    payload = "".join(lines[2:])
+    try:
+        snapshot_manifest._decode_json_page(payload)
+    except snapshot_manifest.ManifestError:
         raise PocError("manifest_page_invalid") from None
     return payload
 
