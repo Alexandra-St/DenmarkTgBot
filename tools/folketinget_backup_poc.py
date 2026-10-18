@@ -252,19 +252,70 @@ def simple_value(output: str) -> str:
     return values[-1]
 
 
+def fetch_microsoft_file(url: str, failure_category: str) -> bytes:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != "packages.microsoft.com" or parsed.username or parsed.password:
+        raise PocError("microsoft_repo_setup_failed")
+    request = urllib.request.Request(url, headers={"User-Agent": "DenmarkBot backup PoC"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            final = urllib.parse.urlsplit(response.geturl())
+            if final.scheme != "https" or final.hostname != "packages.microsoft.com":
+                raise PocError(failure_category)
+            content = response.read(64 * 1024 + 1)
+            if not content or len(content) > 64 * 1024:
+                raise PocError(failure_category)
+            return content
+    except PocError:
+        raise
+    except (OSError, TimeoutError, urllib.error.URLError, http.client.HTTPException):
+        raise PocError(failure_category) from None
+
+
+def validate_repository_list(content: bytes, repository: str) -> bytes:
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise PocError("microsoft_repo_setup_failed") from exc
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    expected = f"https://packages.microsoft.com/ubuntu/24.04/{repository}"
+    if not lines or any(not line.startswith("deb ") or expected not in line.split() for line in lines):
+        raise PocError("microsoft_repo_setup_failed")
+    return content
+
+
 def run_sql_server_setup(password: str) -> None:
-    # Install the supported x64 SQL Server 2025 packages; never silently use Developer/Evaluation.
-    key = urllib.request.urlopen("https://packages.microsoft.com/keys/microsoft.asc", timeout=20).read()
-    run_checked(["sudo", "mkdir", "-p", "/etc/apt/keyrings"], "sql_server_setup_failed")
-    run_checked(["sudo", "gpg", "--dearmor", "--yes", "-o", "/etc/apt/keyrings/microsoft-prod.gpg"], "sql_server_setup_failed", input_bytes=key)
-    sources = (
-        "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/mssql-server-2025 noble main\n"
-        "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main\n"
+    # Follow Microsoft's Ubuntu 24.04 SQL Server 2025 and tools repository setup.
+    key = fetch_microsoft_file(
+        "https://packages.microsoft.com/keys/microsoft.asc", "microsoft_key_download_failed"
     )
-    run_checked(["sudo", "tee", "/etc/apt/sources.list.d/microsoft-sqlserver.list"], "sql_server_setup_failed", input_bytes=sources.encode())
-    run_checked(["sudo", "apt-get", "update", "-qq"], "sql_server_setup_failed", timeout=600)
+    if not key.startswith(b"-----BEGIN PGP PUBLIC KEY BLOCK-----"):
+        raise PocError("microsoft_key_download_failed")
+    server_list = fetch_microsoft_file(
+        "https://packages.microsoft.com/config/ubuntu/24.04/mssql-server-2025.list",
+        "microsoft_repo_setup_failed",
+    )
+    tools_list = fetch_microsoft_file(
+        "https://packages.microsoft.com/config/ubuntu/24.04/prod.list",
+        "microsoft_repo_setup_failed",
+    )
+    validate_repository_list(server_list, "mssql-server-2025")
+    validate_repository_list(tools_list, "prod")
+    run_checked(
+        ["sudo", "tee", "/etc/apt/trusted.gpg.d/microsoft.asc"],
+        "microsoft_repo_setup_failed", input_bytes=key,
+    )
+    run_checked(
+        ["sudo", "tee", "/etc/apt/sources.list.d/mssql-server-2025.list"],
+        "microsoft_repo_setup_failed", input_bytes=server_list,
+    )
+    run_checked(
+        ["sudo", "tee", "/etc/apt/sources.list.d/mssql-release.list"],
+        "microsoft_repo_setup_failed", input_bytes=tools_list,
+    )
+    run_checked(["sudo", "apt-get", "update", "-qq"], "apt_update_failed", timeout=600)
     install_env = {**sql_env(""), "ACCEPT_EULA": "Y"}
-    run_checked(["sudo", "env", "ACCEPT_EULA=Y", "apt-get", "install", "-y", "-qq", "mssql-server", "mssql-tools18"], "sql_server_setup_failed", env=install_env, timeout=1200)
+    run_checked(["sudo", "env", "ACCEPT_EULA=Y", "apt-get", "install", "-y", "-qq", "mssql-server", "mssql-tools18"], "sql_server_package_install_failed", env=install_env, timeout=1200)
     setup_env = {**sql_env(""), "ACCEPT_EULA": "Y", "MSSQL_PID": "Express", "MSSQL_SA_PASSWORD": password}
     run_checked(
         ["sudo", "--preserve-env=ACCEPT_EULA,MSSQL_PID,MSSQL_SA_PASSWORD", "/opt/mssql/bin/mssql-conf", "-n", "setup"],
@@ -283,7 +334,7 @@ def run_sql_server_setup(password: str) -> None:
             if exc.category == "sql_server_express_version_unverified":
                 raise
             time.sleep(3)
-    raise PocError("sql_server_start_timeout")
+    raise PocError("sql_server_start_failed")
 
 
 def _normalized_headers(output: str) -> tuple[list[str], list[list[str]]]:

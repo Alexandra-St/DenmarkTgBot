@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
+import urllib.error
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -53,6 +55,56 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIsNone(POC.official_origin("https://user:pass@oda.ft.dk/file"))
         self.assertNotEqual(POC.official_origin("https://example.org/file"), POC.ODA_ORIGIN)
 
+    def test_repository_config_must_be_official_and_expected(self) -> None:
+        valid = b"deb [arch=amd64] https://packages.microsoft.com/ubuntu/24.04/mssql-server-2025 noble main\n"
+        self.assertEqual(POC.validate_repository_list(valid, "mssql-server-2025"), valid)
+        with self.assertRaises(POC.PocError):
+            POC.validate_repository_list(
+                b"deb https://evil.example/ubuntu/24.04/mssql-server-2025 noble main\n",
+                "mssql-server-2025",
+            )
+
+    def test_microsoft_key_download_failure_is_sanitized(self) -> None:
+        with mock.patch.object(POC.urllib.request, "urlopen", side_effect=urllib.error.URLError("private response detail")):
+            with self.assertRaises(POC.PocError) as raised:
+                POC.fetch_microsoft_file(
+                    "https://packages.microsoft.com/keys/microsoft.asc",
+                    "microsoft_key_download_failed",
+                )
+        self.assertEqual(str(raised.exception), "microsoft_key_download_failed")
+
+    def test_apt_update_failure_has_its_own_safe_category(self) -> None:
+        key = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nfixture\n"
+        server_repo = b"deb [arch=amd64] https://packages.microsoft.com/ubuntu/24.04/mssql-server-2025 noble main\n"
+        tools_repo = b"deb [arch=amd64] https://packages.microsoft.com/ubuntu/24.04/prod noble main\n"
+
+        def fail_on_apt_update(argv: list[str], category: str, **kwargs: object) -> str:
+            if "update" in argv:
+                raise POC.PocError(category)
+            return ""
+
+        with mock.patch.object(POC, "fetch_microsoft_file", side_effect=[key, server_repo, tools_repo]):
+            with mock.patch.object(POC, "run_checked", side_effect=fail_on_apt_update):
+                with self.assertRaises(POC.PocError) as raised:
+                    POC.run_sql_server_setup("never-printed")
+        self.assertEqual(str(raised.exception), "apt_update_failed")
+
+    def test_package_install_failure_has_its_own_safe_category(self) -> None:
+        key = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nfixture\n"
+        server_repo = b"deb [arch=amd64] https://packages.microsoft.com/ubuntu/24.04/mssql-server-2025 noble main\n"
+        tools_repo = b"deb [arch=amd64] https://packages.microsoft.com/ubuntu/24.04/prod noble main\n"
+
+        def fail_on_package_install(argv: list[str], category: str, **kwargs: object) -> str:
+            if "mssql-server" in argv and "install" in argv:
+                raise POC.PocError(category)
+            return ""
+
+        with mock.patch.object(POC, "fetch_microsoft_file", side_effect=[key, server_repo, tools_repo]):
+            with mock.patch.object(POC, "run_checked", side_effect=fail_on_package_install):
+                with self.assertRaises(POC.PocError) as raised:
+                    POC.run_sql_server_setup("never-printed")
+        self.assertEqual(str(raised.exception), "sql_server_package_install_failed")
+
     def test_restore_sql_escapes_metadata(self) -> None:
         query = POC.build_restore_query(
             "/tmp/oda.bak",
@@ -95,6 +147,12 @@ class BackupPocSafetyTests(unittest.TestCase):
         for forbidden in ("workers.dev", "/internal/", "api.telegram.org", "ingestion endpoint"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, script)
+
+    def test_sql_server_setup_is_verified_before_backup_download(self) -> None:
+        script = (ROOT / "tools/folketinget_backup_poc.py").read_text()
+        main_body = script[script.index("def main()") :]
+        self.assertLess(main_body.index("run_sql_server_setup(password)"), main_body.index("request_content_length(opener)"))
+        self.assertLess(main_body.index("request_content_length(opener)"), main_body.index("download_backup(opener"))
 
 
 if __name__ == "__main__":
