@@ -94,7 +94,7 @@ class BackupPocSafetyTests(unittest.TestCase):
         with self.assertRaises(POC.PocError) as raised:
             POC.validate_download_metadata({"file_size_bytes": "bad"}, 10)
         self.assertEqual(str(raised.exception), "backup_download_metadata_invalid")
-        malformed_header = "SoftwareVersionMajor|BackupType|IsDamaged|IsCompressed|BackupFinishDate\n---|---|---|---|---\nbad|1|0|1|date\n"
+        malformed_header = "SoftwareVersionMajor|BackupType|IsDamaged|Compressed|BackupFinishDate\n---|---|---|---|---\nbad|1|0|1|date\n"
         with self.assertRaises(POC.PocError) as raised:
             POC.header_metadata(malformed_header)
         self.assertEqual(str(raised.exception), "backup_header_invalid")
@@ -102,6 +102,24 @@ class BackupPocSafetyTests(unittest.TestCase):
         with self.assertRaises(POC.PocError) as raised:
             POC.filelist_metadata(malformed_filelist)
         self.assertEqual(str(raised.exception), "backup_filelist_invalid")
+
+    def test_headeronly_uses_official_result_column_names(self) -> None:
+        fixture = (
+            "BackupName|BackupType|BackupFinishDate|SoftwareVersionMajor|IsDamaged|Compressed\n"
+            "----------|----------|----------------|--------------------|---------|----------\n"
+            "ODA nightly|1|2026-10-17 02:14:06.000|17|0|1\n"
+            "(1 rows affected)\n"
+        )
+        parsed = POC.header_metadata(fixture)
+        self.assertEqual(parsed["source_sql_major"], 17)
+        self.assertEqual(parsed["backup_type"], 1)
+        self.assertEqual(parsed["compressed"], "1")
+        self.assertEqual(parsed["backup_finish_date"], "2026-10-17 02:14:06.000")
+
+        undocumented_alias_fixture = fixture.replace("|Compressed", "|IsCompressed")
+        with self.assertRaises(POC.PocError) as raised:
+            POC.header_metadata(undocumented_alias_fixture)
+        self.assertEqual(str(raised.exception), "sql_metadata_field_missing")
 
     def test_cleanup_still_removes_temp_path_if_service_check_raises(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

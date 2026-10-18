@@ -430,7 +430,7 @@ def header_metadata(output: str) -> dict[str, object]:
     return {
         "source_sql_major": major,
         "backup_type": backup_type,
-        "compressed": row[field_index(headers, "IsCompressed")],
+        "compressed": row[field_index(headers, "Compressed")],
         "backup_finish_date": row[field_index(headers, "BackupFinishDate")],
     }
 
