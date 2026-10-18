@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -221,6 +222,46 @@ def free_bytes(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
+def validate_download_metadata(download: dict[str, object], expected_bytes: int) -> tuple[int, str, float]:
+    try:
+        size = int(download["file_size_bytes"])
+        checksum = str(download["sha256"])
+        duration = float(download["download_seconds"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise PocError("backup_download_metadata_invalid") from None
+    if size != expected_bytes or len(checksum) != 64 or duration < 0:
+        raise PocError("backup_download_metadata_invalid")
+    if any(character not in "0123456789abcdef" for character in checksum.lower()):
+        raise PocError("backup_download_metadata_invalid")
+    return size, checksum, duration
+
+
+def check_restore_disk_space(data_dir: Path, required_bytes: int) -> int:
+    try:
+        if not data_dir.is_dir():
+            raise PocError("restore_data_directory_unavailable")
+        available = free_bytes(data_dir)
+    except PocError:
+        raise
+    except OSError:
+        raise PocError("restore_disk_space_check_failed") from None
+    check_free_space(available, required_bytes)
+    return available
+
+
+def validate_backup_readable_by_sql_server(path: Path, expected_bytes: int) -> None:
+    try:
+        metadata = path.stat()
+    except OSError:
+        raise PocError("backup_file_validation_failed") from None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected_bytes:
+        raise PocError("backup_file_validation_failed")
+    run_checked(
+        ["sudo", "-u", "mssql", "test", "-r", str(path)],
+        "backup_path_unreadable_by_sql_server", timeout=15,
+    )
+
+
 def run_checked(argv: list[str], category: str, *, env: dict[str, str] | None = None, timeout: int = 1800, input_bytes: bytes | None = None) -> str:
     try:
         result = subprocess.run(argv, input=input_bytes, text=input_bytes is None, capture_output=True, check=False, timeout=timeout, env=env)
@@ -238,10 +279,17 @@ def sql_env(password: str) -> dict[str, str]:
     return result
 
 
-def sqlcmd(query: str, password: str, *, timeout: int = 900, database: str = "master") -> str:
+def sqlcmd(
+    query: str,
+    password: str,
+    *,
+    timeout: int = 900,
+    database: str = "master",
+    failure_category: str = "sql_server_command_failed",
+) -> str:
     return run_checked(
         [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-W", "-s", "|", "-w", "65535", "-d", database, "-Q", query],
-        "sql_server_command_failed", env=sql_env(password), timeout=timeout,
+        failure_category, env=sql_env(password), timeout=timeout,
     )
 
 
@@ -347,9 +395,12 @@ def header_metadata(output: str) -> dict[str, object]:
     if len(rows) != 1:
         raise PocError("backup_header_count_invalid")
     row = rows[0]
-    major = int(row[field_index(headers, "SoftwareVersionMajor")])
-    backup_type = int(row[field_index(headers, "BackupType")])
-    damaged_value = row[field_index(headers, "IsDamaged")].lower()
+    try:
+        major = int(row[field_index(headers, "SoftwareVersionMajor")])
+        backup_type = int(row[field_index(headers, "BackupType")])
+        damaged_value = row[field_index(headers, "IsDamaged")].lower()
+    except (IndexError, TypeError, ValueError, OverflowError):
+        raise PocError("backup_header_invalid") from None
     validate_backup_header(major, backup_type, damaged_value in {"1", "true"})
     return {
         "source_sql_major": major,
@@ -366,8 +417,11 @@ def filelist_metadata(output: str) -> list[dict[str, object]]:
         file_type = row[field_index(headers, "Type")]
         if file_type not in {"D", "L"}:
             raise PocError("backup_file_type_unsupported")
-        size = int(row[field_index(headers, "Size")])
-        logical_name = row[field_index(headers, "LogicalName")]
+        try:
+            size = int(row[field_index(headers, "Size")])
+            logical_name = row[field_index(headers, "LogicalName")]
+        except (IndexError, TypeError, ValueError, OverflowError):
+            raise PocError("backup_filelist_invalid") from None
         if not logical_name or size <= 0:
             raise PocError("backup_filelist_invalid")
         entries.append({"logical_name": logical_name, "type": file_type, "size": size})
@@ -498,8 +552,12 @@ def write_summary(summary: dict[str, Any]) -> None:
 def cleanup(password: str | None, backup_dir: Path | None, data_dir: Path | None) -> None:
     cleanup_failed = False
     if password:
-        service = subprocess.run(["sudo", "systemctl", "is-active", "--quiet", "mssql-server"], capture_output=True, check=False, timeout=20)
-        if service.returncode == 0:
+        try:
+            service = subprocess.run(["sudo", "systemctl", "is-active", "--quiet", "mssql-server"], capture_output=True, check=False, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            cleanup_failed = True
+            service = None
+        if service is not None and service.returncode == 0:
             try:
                 sqlcmd(
                     f"IF DB_ID({quote_literal(DATABASE)}) IS NOT NULL BEGIN ALTER DATABASE {quote_identifier(DATABASE)} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {quote_identifier(DATABASE)}; END;",
@@ -509,14 +567,22 @@ def cleanup(password: str | None, backup_dir: Path | None, data_dir: Path | None
                 cleanup_failed = True
     for path in (backup_dir, data_dir):
         if path is not None:
-            resolved = path.resolve()
-            backup_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
-            allowed_backup = resolved.parent == backup_root and resolved.name.startswith("denmarkbot-poc-backup-")
-            allowed_data = resolved.parent == Path("/var/opt/mssql/data").resolve() and resolved.name.startswith("denmarkbot-poc-data-")
+            try:
+                resolved = path.resolve()
+                backup_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
+                allowed_backup = resolved.parent == backup_root and resolved.name.startswith("denmarkbot-poc-backup-")
+                allowed_data = resolved.parent == Path("/var/opt/mssql/data").resolve() and resolved.name.startswith("denmarkbot-poc-data-")
+            except OSError:
+                cleanup_failed = True
+                continue
             if not (allowed_backup or allowed_data):
                 cleanup_failed = True
                 continue
-            result = subprocess.run(["sudo", "rm", "-rf", "--", str(path)], capture_output=True, check=False, timeout=60)
+            try:
+                result = subprocess.run(["sudo", "rm", "-rf", "--", str(path)], capture_output=True, check=False, timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                cleanup_failed = True
+                continue
             cleanup_failed = cleanup_failed or result.returncode != 0
     if cleanup_failed:
         raise PocError("temporary_data_cleanup_failed")
@@ -551,20 +617,46 @@ def main() -> int:
         run_checked(["sudo", "install", "-d", "-o", os.environ.get("USER", "runner"), "-g", "mssql", "-m", "0750", str(backup_dir)], "backup_temp_setup_failed")
         backup_path = backup_dir / "oda.bak"
         download = download_backup(opener, backup_path, content_length)
-        print(f"backup_bytes={download['file_size_bytes']} sha256={download['sha256']} download_seconds={download['download_seconds']}")
+        print("progress=backup_download_complete")
+        backup_size, backup_checksum, download_seconds = validate_download_metadata(download, content_length)
+        print(f"backup_bytes={backup_size} sha256={backup_checksum} download_seconds={download_seconds}")
         restore_parent = Path("/var/opt/mssql/data")
-        restore_free = free_bytes(restore_parent)
+        print("progress=restore_storage_check")
+        run_checked(
+            ["sudo", "install", "-d", "-o", "mssql", "-g", "mssql", "-m", "0750", str(restore_parent)],
+            "restore_data_directory_setup_failed",
+        )
+        restore_free = check_restore_disk_space(restore_parent, 1)
+        validate_backup_readable_by_sql_server(backup_path, backup_size)
         print(f"free_disk_before_restore_bytes={restore_free}")
-        # RESTORE FILELISTONLY is checked before any database files are created.
-        header_output = sqlcmd(f"RESTORE HEADERONLY FROM DISK = {quote_literal(str(backup_path))};", password, timeout=600)
+        print("progress=restore_header_check")
+        header_output = sqlcmd(
+            f"RESTORE HEADERONLY FROM DISK = {quote_literal(str(backup_path))};",
+            password, timeout=600, failure_category="restore_header_request_failed",
+        )
         header_info = header_metadata(header_output)
-        file_output = sqlcmd(f"RESTORE FILELISTONLY FROM DISK = {quote_literal(str(backup_path))};", password, timeout=600)
+        print("progress=restore_filelist_check")
+        file_output = sqlcmd(
+            f"RESTORE FILELISTONLY FROM DISK = {quote_literal(str(backup_path))};",
+            password, timeout=600, failure_category="restore_filelist_request_failed",
+        )
         entries = filelist_metadata(file_output)
-        check_free_space(restore_free, restore_space_required([int(item["size"]) for item in entries]))
+        required_restore_space = restore_space_required([int(item["size"]) for item in entries])
+        restore_free = check_restore_disk_space(restore_parent, required_restore_space)
         run_checked(["sudo", "install", "-d", "-o", "mssql", "-g", "mssql", "-m", "0750", str(data_dir)], "restore_directory_setup_failed")
-        restore_query = build_restore_query(str(backup_path), str(data_dir), entries)
-        sqlcmd(restore_query, password, timeout=20 * 60)
-        checkdb = sqlcmd(f"DBCC CHECKDB ({quote_identifier(DATABASE)}) WITH ALL_ERRORMSGS;", password, timeout=20 * 60)
+        try:
+            restore_query = build_restore_query(str(backup_path), str(data_dir), entries)
+        except PocError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise PocError("restore_path_generation_failed") from None
+        print("progress=restore_start")
+        sqlcmd(restore_query, password, timeout=20 * 60, failure_category="restore_execution_failed")
+        print("progress=dbcc_start")
+        checkdb = sqlcmd(
+            f"DBCC CHECKDB ({quote_identifier(DATABASE)}) WITH ALL_ERRORMSGS;",
+            password, timeout=20 * 60, failure_category="dbcc_checkdb_failed",
+        )
         if not re.search(r"0 allocation errors and 0 consistency errors", checkdb, re.IGNORECASE):
             raise PocError("dbcc_checkdb_not_clean")
         restored_size = int(simple_value(sqlcmd("SELECT CAST(SUM(size) * 8192 AS bigint) FROM sys.database_files;", password, database=DATABASE)))

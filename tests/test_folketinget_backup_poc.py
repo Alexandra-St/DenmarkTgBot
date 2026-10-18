@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
+import tempfile
 import unittest
 from unittest import mock
 import urllib.error
+from types import SimpleNamespace
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -43,6 +46,63 @@ class BackupPocSafetyTests(unittest.TestCase):
             POC.download_space_required(POC.MAX_BACKUP_BYTES + 1)
         with self.assertRaises(POC.PocError):
             POC.restore_space_required([])
+
+    def test_restore_disk_checks_categorize_missing_and_inaccessible_paths(self) -> None:
+        missing = pathlib.Path("/path/that/does/not/exist/for/restore")
+        with self.assertRaises(POC.PocError) as raised:
+            POC.check_restore_disk_space(missing, 1)
+        self.assertEqual(str(raised.exception), "restore_data_directory_unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(POC, "free_bytes", side_effect=PermissionError("private path details")):
+                with self.assertRaises(POC.PocError) as raised:
+                    POC.check_restore_disk_space(pathlib.Path(directory), 1)
+        self.assertEqual(str(raised.exception), "restore_disk_space_check_failed")
+
+    def test_backup_path_permissions_and_size_are_checked_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backup = pathlib.Path(directory) / "oda.bak"
+            with self.assertRaises(POC.PocError) as raised:
+                POC.validate_backup_readable_by_sql_server(backup, 10)
+            self.assertEqual(str(raised.exception), "backup_file_validation_failed")
+            backup.write_bytes(b"backup")
+            with self.assertRaises(POC.PocError) as raised:
+                POC.validate_backup_readable_by_sql_server(backup, 10)
+            self.assertEqual(str(raised.exception), "backup_file_validation_failed")
+            with mock.patch.object(POC, "run_checked", side_effect=POC.PocError("backup_path_unreadable_by_sql_server")):
+                with self.assertRaises(POC.PocError) as raised:
+                    POC.validate_backup_readable_by_sql_server(backup, 6)
+            self.assertEqual(str(raised.exception), "backup_path_unreadable_by_sql_server")
+
+    def test_download_metadata_and_header_parsing_have_safe_categories(self) -> None:
+        with self.assertRaises(POC.PocError) as raised:
+            POC.validate_download_metadata({"file_size_bytes": "bad"}, 10)
+        self.assertEqual(str(raised.exception), "backup_download_metadata_invalid")
+        malformed_header = "SoftwareVersionMajor|BackupType|IsDamaged|IsCompressed|BackupFinishDate\n---|---|---|---|---\nbad|1|0|1|date\n"
+        with self.assertRaises(POC.PocError) as raised:
+            POC.header_metadata(malformed_header)
+        self.assertEqual(str(raised.exception), "backup_header_invalid")
+        malformed_filelist = "LogicalName|Type|Size\n---|---|---\nODA|D|not-an-integer\n"
+        with self.assertRaises(POC.PocError) as raised:
+            POC.filelist_metadata(malformed_filelist)
+        self.assertEqual(str(raised.exception), "backup_filelist_invalid")
+
+    def test_cleanup_still_removes_temp_path_if_service_check_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backup_dir = pathlib.Path(directory) / "denmarkbot-poc-backup-test"
+            calls: list[list[str]] = []
+
+            def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+                calls.append(argv)
+                if "systemctl" in argv:
+                    raise OSError("private service error")
+                return SimpleNamespace(returncode=0)
+
+            with mock.patch.dict(os.environ, {"RUNNER_TEMP": directory}):
+                with mock.patch.object(POC.subprocess, "run", side_effect=fake_run):
+                    with self.assertRaises(POC.PocError) as raised:
+                        POC.cleanup("never-printed", backup_dir, None)
+            self.assertEqual(str(raised.exception), "temporary_data_cleanup_failed")
+            self.assertTrue(any("rm" in call for call in calls))
 
     def test_backup_must_be_full_and_supported(self) -> None:
         POC.validate_backup_header(16, 1, False)
@@ -153,6 +213,20 @@ class BackupPocSafetyTests(unittest.TestCase):
         main_body = script[script.index("def main()") :]
         self.assertLess(main_body.index("run_sql_server_setup(password)"), main_body.index("request_content_length(opener)"))
         self.assertLess(main_body.index("request_content_length(opener)"), main_body.index("download_backup(opener"))
+
+    def test_safe_restore_progress_markers_are_present_in_order(self) -> None:
+        script = (ROOT / "tools/folketinget_backup_poc.py").read_text()
+        main_body = script[script.index("def main()") :]
+        markers = (
+            "backup_download_complete",
+            "restore_storage_check",
+            "restore_header_check",
+            "restore_filelist_check",
+            "restore_start",
+            "dbcc_start",
+        )
+        positions = [main_body.index(f"progress={marker}") for marker in markers]
+        self.assertEqual(positions, sorted(positions))
 
 
 if __name__ == "__main__":
