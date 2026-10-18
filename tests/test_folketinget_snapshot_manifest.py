@@ -190,6 +190,7 @@ class FolketingetManifestTests(unittest.TestCase):
         self.assertIn("-y", argv)
         self.assertIn("0", argv)
         self.assertNotIn("-W", argv)
+        self.assertIn("-r", argv)
         query = argv[-1]
         self.assertIn("ORDER BY [id] OFFSET 5000 ROWS FETCH NEXT 5000 ROWS ONLY", query)
         self.assertIn("FOR JSON PATH, INCLUDE_NULL_VALUES", query)
@@ -236,6 +237,23 @@ class FolketingetManifestTests(unittest.TestCase):
         for secret in ("PRIVATE_SQL_DETAIL", "PRIVATE_ID", "PRIVATE_STDOUT", "PRIVATE_QUERY", "PRIVATE_PASSWORD"):
             self.assertNotIn(secret, rendered)
 
+    def test_sql_message_number_is_extracted_from_stdout_fallback(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_sql_stdout_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        failure = mock.Mock(returncode=1, stdout="Msg 207, Level 16: PRIVATE_VALUE", stderr="")
+        logged = StringIO()
+        with mock.patch.object(poc.subprocess, "run", return_value=failure), redirect_stderr(logged):
+            with self.assertRaises(poc.PocError) as raised:
+                poc.run_manifest_page_sql(["sqlcmd"], "PRIVATE_PASSWORD", entity="Dokument", offset=25, timeout=10)
+        self.assertEqual(raised.exception.category, "manifest_page_sql_msg_207")
+        self.assertIn("entity=Dokument offset=25 return_code=1 category=manifest_page_sql_msg_207", logged.getvalue())
+        self.assertNotIn("PRIVATE_VALUE", logged.getvalue())
+        self.assertNotIn("PRIVATE_PASSWORD", logged.getvalue())
+
     def test_sql_failure_without_message_number_uses_generic_safe_category(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(
             "folketinget_backup_poc_sql_generic_test", ROOT / "tools" / "folketinget_backup_poc.py"
@@ -263,6 +281,29 @@ class FolketingetManifestTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "progress=manifest_entity entity=Sagstrin\n")
         with self.assertRaises(poc.PocError):
             poc.report_manifest_entity("private")
+
+    def test_compatibility_level_parsing_and_offset_fetch_gate_fail_closed(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_compatibility_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        self.assertEqual(poc.parse_database_compatibility_level("160\n(1 rows affected)\n"), 160)
+        poc.validate_manifest_compatibility_level(160)
+        with self.assertRaises(poc.PocError) as raised:
+            poc.parse_database_compatibility_level("not numeric")
+        self.assertEqual(raised.exception.category, "manifest_database_compatibility_invalid")
+        with self.assertRaises(poc.PocError) as raised:
+            poc.parse_database_compatibility_level("100\n110\n")
+        self.assertEqual(raised.exception.category, "manifest_database_compatibility_invalid")
+        with self.assertRaises(poc.PocError) as raised:
+            poc.validate_manifest_compatibility_level(100)
+        self.assertEqual(raised.exception.category, "manifest_database_compatibility_unsupported")
+        output = StringIO()
+        with redirect_stdout(output):
+            poc.report_manifest_compatibility(160)
+        self.assertEqual(output.getvalue(), "progress=manifest_database_compatibility level=160\n")
 
     def test_manifest_progress_and_summary_do_not_print_row_values(self) -> None:
         source = (ROOT / "tools/folketinget_backup_poc.py").read_text()

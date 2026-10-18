@@ -40,6 +40,8 @@ MANIFEST_DIRECTORY_NAME = "denmarkbot-folketinget-manifest"
 MANIFEST_FILENAME = "manifest.sqlite"
 RESTORE_VALIDATE = "RESTORE_VALIDATE"
 CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
+MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
+SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 
 
 class PocError(Exception):
@@ -555,6 +557,39 @@ def restored_database_size(password: str) -> int:
     return parse_restored_database_size(output)
 
 
+def parse_database_compatibility_level(output: str) -> int:
+    values = [line.strip() for line in output.splitlines() if line.strip() and not line.strip().startswith("(")]
+    if len(values) != 1 or not re.fullmatch(r"[0-9]{3}", values[0]):
+        raise PocError("manifest_database_compatibility_invalid")
+    level = int(values[0])
+    if level not in SUPPORTED_COMPATIBILITY_LEVELS:
+        raise PocError("manifest_database_compatibility_invalid")
+    return level
+
+
+def database_compatibility_level(password: str) -> int:
+    output = sqlcmd(
+        "SELECT compatibility_level FROM sys.databases WHERE database_id=DB_ID();",
+        password,
+        database=DATABASE,
+        failure_category="manifest_database_compatibility_query_failed",
+    )
+    return parse_database_compatibility_level(output)
+
+
+def validate_manifest_compatibility_level(level: int) -> None:
+    if level not in SUPPORTED_COMPATIBILITY_LEVELS:
+        raise PocError("manifest_database_compatibility_invalid")
+    if level < MIN_MANIFEST_COMPATIBILITY_LEVEL:
+        raise PocError("manifest_database_compatibility_unsupported")
+
+
+def report_manifest_compatibility(level: int) -> None:
+    if level not in SUPPORTED_COMPATIBILITY_LEVELS:
+        raise PocError("manifest_database_compatibility_invalid")
+    print(f"progress=manifest_database_compatibility level={level}")
+
+
 def parse_entity_count(output: str) -> int:
     return _nonnegative_sql_integer(output, "entity_count_result_invalid", allow_zero=True)
 
@@ -719,7 +754,7 @@ def manifest_page_json(
         "FOR JSON PATH, INCLUDE_NULL_VALUES;"
     )
     output = run_manifest_page_sql(
-        [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-h", "-1",
+        [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-r", "-h", "-1",
          "-s", "|", "-w", "65535", "-y", "0", "-d", DATABASE, "-Q", query],
         password,
         entity=entity,
@@ -769,9 +804,12 @@ def run_manifest_page_sql(
         )
         raise PocError("manifest_page_sqlcmd_failed") from None
     if result.returncode != 0:
-        # SQL Server diagnostics are emitted on stderr by sqlcmd. Never expose
-        # its message text or stdout, which can contain selected row values.
-        match = re.search(r"\bMsg\s+([0-9]{1,6})\b", result.stderr or "", re.IGNORECASE)
+        # Never expose either stream: stdout may contain selected row values.
+        # -r routes SQL errors to stderr; stdout is a safe numeric fallback only.
+        msg_pattern = re.compile(r"(?im)^\s*Msg\s+([0-9]{1,6})\b")
+        match = msg_pattern.search(result.stderr or "")
+        if match is None:
+            match = msg_pattern.search(result.stdout or "")
         category = f"manifest_page_sql_msg_{match.group(1)}" if match else "manifest_page_sqlcmd_failed"
         print(
             f"manifest_page_sql_failure entity={entity} offset={offset} "
@@ -983,6 +1021,9 @@ def main() -> int:
             "entities": entities,
         }
         if mode == CREATE_MANIFEST_BASELINE:
+            compatibility_level = database_compatibility_level(password)
+            report_manifest_compatibility(compatibility_level)
+            validate_manifest_compatibility_level(compatibility_level)
             print("progress=manifest_schema_discovery")
             schemas: dict[str, dict[str, Any]] = {}
             for entity in REQUIRED_ENTITIES:
