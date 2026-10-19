@@ -42,6 +42,7 @@ MANIFEST_DIRECTORY_NAME = "denmarkbot-folketinget-manifest"
 MANIFEST_FILENAME = "manifest.sqlite"
 RESTORE_VALIDATE = "RESTORE_VALIDATE"
 CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
+VALIDATE_SQL_PROVIDER = "VALIDATE_SQL_PROVIDER"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 MANIFEST_BASE64_CHUNK_SIZE = 6000
@@ -65,7 +66,7 @@ def validate_confirmation(value: str) -> None:
 
 
 def validate_mode(value: str) -> str:
-    if value not in {RESTORE_VALIDATE, CREATE_MANIFEST_BASELINE}:
+    if value not in {RESTORE_VALIDATE, CREATE_MANIFEST_BASELINE, VALIDATE_SQL_PROVIDER}:
         raise PocError("workflow_mode_invalid")
     return value
 
@@ -758,22 +759,12 @@ def manifest_page_json(
     selected = ", ".join(selected_expressions)
     primary_key = schema["primary_key"]
     ordering = ", ".join(quote_identifier(name) for name in primary_key)
-    query = (
-        "SET NOCOUNT ON; DECLARE @manifest_json nvarchar(max); "
-        "SET @manifest_json = ("
+    select = (
         f"SELECT {selected} FROM {quote_identifier(schema_name)}.{quote_identifier(entity)} "
         f"ORDER BY {ordering} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY "
-        "FOR JSON PATH, INCLUDE_NULL_VALUES); "
-        "DECLARE @manifest_b64 varchar(max); "
-        "SET @manifest_b64 = BASE64_ENCODE(CONVERT(varbinary(max), @manifest_json)); "
-        ";WITH chunk_sequence AS ("
-        "SELECT CAST(1 AS int) AS sequence_number UNION ALL "
-        f"SELECT sequence_number + 1 FROM chunk_sequence WHERE sequence_number * {MANIFEST_BASE64_CHUNK_SIZE} < LEN(@manifest_b64)) "
-        "SELECT CAST(CAST(sequence_number AS varchar(5)) + '|' + "
-        f"CAST(SUBSTRING(@manifest_b64, ((sequence_number - 1) * {MANIFEST_BASE64_CHUNK_SIZE}) + 1, "
-        f"{MANIFEST_BASE64_CHUNK_SIZE}) AS varchar({MANIFEST_BASE64_CHUNK_SIZE})) AS varchar(6006)) AS chunk_line "
-        f"FROM chunk_sequence ORDER BY sequence_number OPTION (MAXRECURSION {MANIFEST_MAX_BASE64_CHUNKS});"
+        "FOR JSON PATH, INCLUDE_NULL_VALUES"
     )
+    query = build_chunked_json_query(select, variable="manifest")
     output = run_manifest_page_sql(
         [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-r",
          "-h", "-1", "-W", "-s", "|", "-w", str(MANIFEST_SQL_ROW_WIDTH),
@@ -790,6 +781,38 @@ def manifest_page_json(
     except UnicodeEncodeError:
         raise PocError("manifest_page_invalid") from None
     return payload
+
+
+def build_chunked_json_query(select_query: str, *, variable: str) -> str:
+    """Wrap a trusted JSON SELECT in the validated fixed-width Base64 transport."""
+    if variable not in {"manifest", "provider"} or not select_query.startswith("SELECT "):
+        raise PocError("manifest_page_invalid")
+    json_variable = f"@{variable}_json"
+    b64_variable = f"@{variable}_b64"
+    return (
+        f"SET NOCOUNT ON; DECLARE {json_variable} nvarchar(max); "
+        f"SET {json_variable} = ({select_query}); "
+        f"DECLARE {b64_variable} varchar(max); "
+        f"SET {b64_variable} = BASE64_ENCODE(CONVERT(varbinary(max), {json_variable})); "
+        ";WITH chunk_sequence AS ("
+        "SELECT CAST(1 AS int) AS sequence_number UNION ALL "
+        f"SELECT sequence_number + 1 FROM chunk_sequence WHERE sequence_number * {MANIFEST_BASE64_CHUNK_SIZE} < LEN({b64_variable})) "
+        "SELECT CAST(CAST(sequence_number AS varchar(5)) + '|' + "
+        f"CAST(SUBSTRING({b64_variable}, ((sequence_number - 1) * {MANIFEST_BASE64_CHUNK_SIZE}) + 1, "
+        f"{MANIFEST_BASE64_CHUNK_SIZE}) AS varchar({MANIFEST_BASE64_CHUNK_SIZE})) AS varchar(6006)) AS chunk_line "
+        f"FROM chunk_sequence ORDER BY sequence_number OPTION (MAXRECURSION {MANIFEST_MAX_BASE64_CHUNKS});"
+    )
+
+
+def run_provider_chunked_json(password: str, query: str, entity: str) -> str:
+    """Execute provider JSON through the same strict manifest chunk transport."""
+    if entity not in REQUIRED_ENTITIES:
+        raise PocError("manifest_page_invalid")
+    argv = [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-r",
+            "-h", "-1", "-W", "-s", "|", "-w", str(MANIFEST_SQL_ROW_WIDTH),
+            "-d", DATABASE, "-Q", query]
+    output = run_manifest_page_sql(argv, password, entity=entity, offset=0, timeout=600)
+    return parse_manifest_page_output(output, entity=entity, offset=0)
 
 
 def parse_manifest_page_output(output: str, *, entity: str, offset: int) -> str:
@@ -904,6 +927,120 @@ def report_manifest_entity(entity: str) -> None:
     if entity not in REQUIRED_ENTITIES:
         raise PocError("manifest_page_invalid")
     print(f"progress=manifest_entity entity={entity}")
+
+
+def read_sql_provider_sample_ids(password: str, entities: dict[str, Any]) -> dict[str, int]:
+    """Select one deterministic internal ID from each validated table."""
+    samples: dict[str, int] = {}
+    try:
+        for entity in REQUIRED_ENTITIES:
+            schema, object_type = entities["objects"][entity]
+            if object_type != "USER_TABLE" or entities["primary_keys"].get(entity) != ["id"]:
+                raise PocError("sql_provider_sample_unavailable")
+            table = f"{quote_identifier(schema)}.{quote_identifier(entity)}"
+            output = sqlcmd(
+                f"SELECT MIN({quote_identifier('id')}) AS [sample_id] FROM {table};",
+                password,
+                database=DATABASE,
+                failure_category="sql_provider_sample_query_failed",
+            )
+            value = simple_value(output)
+            if not re.fullmatch(r"[0-9]+", value):
+                raise PocError("sql_provider_sample_unavailable")
+            samples[entity] = int(value, 10)
+    except PocError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise PocError("sql_provider_sample_unavailable") from None
+    return samples
+
+
+def exercise_sql_provider(provider: Any, sample_ids: dict[str, int]) -> dict[str, int]:
+    """Exercise by-ID and relationship reads; return aggregate-only results."""
+    from collectors.folketinget_models import normalize_many
+
+    if set(sample_ids) != set(REQUIRED_ENTITIES) or any(
+        isinstance(value, bool) or not isinstance(value, int) for value in sample_ids.values()
+    ):
+        raise PocError("sql_provider_validation_failed")
+    failures = 0
+    sample_rows: dict[str, dict[str, Any]] = {}
+
+    def validate_rows(entity: str, rows: Any) -> tuple[dict[str, Any], ...]:
+        nonlocal failures
+        result = normalize_many(list(rows), entity)
+        failures += len(result.diagnostics)
+        if not result.complete or len(result.record or ()) != len(rows):
+            failures += 1
+        return tuple(row for row in rows if isinstance(row, dict))
+
+    try:
+        get_checks = 0
+        for entity in REQUIRED_ENTITIES:
+            rows = tuple(provider.get_by_ids(entity, (sample_ids[entity],)))
+            if len(rows) != 1 or rows[0].get("id") != sample_ids[entity]:
+                raise PocError("sql_provider_validation_failed")
+            normalized = validate_rows(entity, rows)
+            if len(normalized) != 1:
+                raise PocError("sql_provider_validation_failed")
+            sample_rows[entity] = normalized[0]
+            get_checks += 1
+
+        relations: list[tuple[str, str, object]] = []
+        sag_id = sample_rows["Sag"].get("id")
+        status_id = sample_rows["Sag"].get("statusid")
+        if isinstance(sag_id, int) and not isinstance(sag_id, bool):
+            relations.extend((("Sagstrin", "sagid", sag_id), ("SagDokument", "sagid", sag_id)))
+        if isinstance(status_id, int) and not isinstance(status_id, bool):
+            relations.append(("Sag", "statusid", status_id))
+        document_id = sample_rows["Dokument"].get("id")
+        if isinstance(document_id, int) and not isinstance(document_id, bool):
+            relations.append(("SagDokument", "dokumentid", document_id))
+        stage_id = sample_rows["Sagstrin"].get("id")
+        if isinstance(stage_id, int) and not isinstance(stage_id, bool):
+            relations.append(("Afstemning", "sagstrinid", stage_id))
+        source_status_id = sample_rows["Sagsstatus"].get("id")
+        if isinstance(source_status_id, int) and not isinstance(source_status_id, bool):
+            relations.append(("Sag", "statusid", source_status_id))
+
+        for entity, field, value in relations:
+            rows = tuple(provider.find_by_field(entity, field, (value,)))
+            validate_rows(entity, rows)
+        if failures:
+            raise PocError("sql_provider_normalization_failed")
+        return {"entities_tested": len(REQUIRED_ENTITIES), "get_by_ids_checks": get_checks,
+                "relation_checks": len(relations), "normalization_failures": failures}
+    except PocError:
+        raise
+    except Exception:
+        raise PocError("sql_provider_validation_failed") from None
+
+
+def validate_sql_provider(password: str, entities: dict[str, Any]) -> dict[str, int]:
+    from folketinget_sql_provider import SQLServerFolketingetProvider
+
+    samples = read_sql_provider_sample_ids(password, entities)
+    try:
+        column_types: dict[str, dict[str, str]] = {}
+        for entity in REQUIRED_ENTITIES:
+            schema_name, object_type = entities["objects"][entity]
+            schema = manifest_schema(password, entity, schema_name)
+            available_types = {column["name"]: column["type_name"] for column in schema["columns"]}
+            from folketinget_sql_provider import PROJECTIONS
+
+            if set(PROJECTIONS[entity]) - set(available_types):
+                raise PocError("sql_provider_schema_invalid")
+            column_types[entity] = {name: available_types[name] for name in PROJECTIONS[entity]}
+        provider = SQLServerFolketingetProvider(
+            entities["objects"],
+            lambda query, entity: run_provider_chunked_json(password, query, entity),
+            column_types=column_types,
+        )
+    except PocError:
+        raise
+    except Exception:
+        raise PocError("sql_provider_validation_failed") from None
+    return exercise_sql_provider(provider, samples)
 
 
 def write_summary(summary: dict[str, Any]) -> None:
@@ -1100,6 +1237,14 @@ def main() -> int:
             "restored_database_size_bytes": restored_size,
             "entities": entities,
         }
+        if mode == VALIDATE_SQL_PROVIDER:
+            print("progress=sql_provider_validation_start")
+            provider_validation = validate_sql_provider(password, entities)
+            print("SQL provider validation: PASS")
+            print(f"entities tested: {provider_validation['entities_tested']}/{len(REQUIRED_ENTITIES)}")
+            print(f"get_by_ids checks: {provider_validation['get_by_ids_checks']}")
+            print(f"relation checks: {provider_validation['relation_checks']}")
+            print(f"normalization failures: {provider_validation['normalization_failures']}")
         if mode == CREATE_MANIFEST_BASELINE:
             compatibility_level = database_compatibility_level(password)
             report_manifest_compatibility(compatibility_level)

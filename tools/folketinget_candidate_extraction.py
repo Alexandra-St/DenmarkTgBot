@@ -16,7 +16,7 @@ TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
 if TOOLS_DIRECTORY not in sys.path:
     sys.path.insert(0, TOOLS_DIRECTORY)
 
-from collectors.folketinget_models import Diagnostic, LegislativeCase, normalize_many
+from collectors.folketinget_models import LegislativeCase, normalize_many
 from collectors.folketinget_relations import assemble_cases
 import folketinget_snapshot_diff as snapshot_diff
 import folketinget_snapshot_manifest as snapshot_manifest
@@ -210,10 +210,6 @@ def _hydrate_cases(
     statuses_raw = _safe_lookup(provider, "by_ids", "Sagsstatus", status_ids, diagnostics) if status_ids else ()
     statuses, _ = _normalize_rows("Sagsstatus", statuses_raw, diagnostics)
 
-    assembly_diagnostics = [
-        Diagnostic(code, "Folketinget", "candidate extraction validation issue")
-        for code in diagnostics
-    ]
     assembled = assemble_cases(
         sags,
         stages=stages,
@@ -221,7 +217,6 @@ def _hydrate_cases(
         documents=documents,
         votes=votes,
         statuses=statuses,
-        diagnostics=assembly_diagnostics,
     )
     diagnostics.update(item.code for item in assembled.diagnostics)
     hydrated = sum(1 for case in assembled.cases if case.complete)

@@ -180,6 +180,7 @@ class FolketingetManifestTests(unittest.TestCase):
         poc_spec.loader.exec_module(poc)
         self.assertEqual(poc.validate_mode("CREATE_MANIFEST_BASELINE"), "CREATE_MANIFEST_BASELINE")
         self.assertEqual(poc.validate_mode("RESTORE_VALIDATE"), "RESTORE_VALIDATE")
+        self.assertEqual(poc.validate_mode("VALIDATE_SQL_PROVIDER"), "VALIDATE_SQL_PROVIDER")
         with self.assertRaises(poc.PocError):
             poc.validate_mode("PRODUCTION_INGEST")
 

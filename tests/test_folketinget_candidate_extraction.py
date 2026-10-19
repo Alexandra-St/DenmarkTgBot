@@ -199,6 +199,15 @@ class CandidateExtractionTests(unittest.TestCase):
         self.assertFalse(bundle["complete"])
         self.assertIn("affected_case_missing", {item["code"] for item in bundle["diagnostics"]})
 
+    def test_existing_normalization_diagnostic_is_counted_once(self) -> None:
+        incomplete_sag = sag(77)
+        incomplete_sag["opdateringsdato"] = None
+        bundle = self.build([("Sag", "added", 77)], {"Sag": [incomplete_sag]})
+        summary = CANDIDATES.candidate_summary(bundle)
+        diagnostics = {item["code"]: item["count"] for item in summary["diagnostics"]}
+        self.assertEqual(diagnostics["missing_timestamp"], 1)
+        self.assertFalse(bundle["complete"])
+
     def test_case_order_is_deterministic_and_summary_does_not_leak_payload(self) -> None:
         title = "PRIVATE TITLE displaced people from Ukraine"
         bundle = self.build([("Sag", "added", 10), ("Sag", "added", 2)],

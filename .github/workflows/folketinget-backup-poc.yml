@@ -4,16 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       confirm_restore:
-        description: "Confirm the requested manual PoC operation (restore or manifest comparison)"
+        description: "Confirm the requested manual PoC operation"
         required: true
         type: boolean
         default: false
       mode:
-        description: "Choose restore validation, manifest generation, or manifest comparison"
+        description: "Choose restore validation, SQL provider validation, manifest generation, or manifest comparison"
         required: true
         type: choice
         options:
           - RESTORE_VALIDATE
+          - VALIDATE_SQL_PROVIDER
           - CREATE_MANIFEST_BASELINE
           - DIFF_MANIFESTS
         default: RESTORE_VALIDATE

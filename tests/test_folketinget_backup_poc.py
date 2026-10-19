@@ -371,6 +371,8 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("uses: actions/upload-artifact@v7", workflow)
         self.assertIn("retention-days: 2", workflow)
         self.assertIn("CREATE_MANIFEST_BASELINE", workflow)
+        self.assertIn("VALIDATE_SQL_PROVIDER", workflow)
+        self.assertIn("if: inputs.mode != 'DIFF_MANIFESTS'", workflow)
         self.assertIn("manifest.sqlite", workflow)
         self.assertNotIn(".bak", workflow)
         self.assertNotIn("worker", workflow.lower())
