@@ -90,6 +90,41 @@ class BackupPocSafetyTests(unittest.TestCase):
                 classify_candidates=True,
             )
 
+    @staticmethod
+    def _ingestion_case(external_id, title, *, complete=True):
+        return {
+            "source": "folketinget",
+            "external_id": str(external_id),
+            "number": f"L {external_id}",
+            "title": title,
+            "type_id": 1,
+            "category_id": 1,
+            "status": {"id": 1, "name": "Fremsat"},
+            "source_updated_at_raw": None,
+            "updated_at_utc": None,
+            "source_url": f"https://oda.ft.dk/api/Sag({external_id})",
+            "legal_url": None,
+            "stages": [],
+            "documents": [],
+            "votes": [],
+            "complete": complete,
+            "historical": False,
+            "notify_eligible": None,
+        }
+
+    def _run_ingestion_preparation(self, root, cases, *, complete=True, diagnostics=None):
+        stamp = "2026-10-19T02:00:00Z"
+        old, new = root / "old.sqlite", root / "new.sqlite"
+        create_candidate_manifest(old, backup="1", finish="2026-10-18T02:00:00Z", include_sag=False)
+        create_candidate_manifest(new, backup="2", finish=stamp, include_sag=False)
+        bundle = self._candidate_bundle(cases, complete=complete, diagnostics=diagnostics)
+        with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=bundle):
+            result = POC.run_candidate_extraction(
+                old, new, SimpleNamespace(), root, "2026-10-18T02:00:00Z", stamp,
+                classify_candidates=True, prepare_ingestion=True,
+            )
+        return result
+
     def test_snapshot_classification_handles_zero_direct_potential_and_irrelevant(self) -> None:
         from collectors import relevance
 
@@ -173,6 +208,136 @@ class BackupPocSafetyTests(unittest.TestCase):
 
             with mock.patch.object(POC, "_write_private_candidate_bundle", side_effect=inspect_private_file):
                 self._run_classification(root, bundle)
+            self.assertEqual(observed_modes, [0o600])
+            self.assertEqual(list(root.glob("denmarkbot-candidate-bundle-*.json")), [])
+
+    def test_snapshot_ingestion_preparation_zero_candidates_reports_actual_empty_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            result = self._run_ingestion_preparation(root, [])
+            ingestion = result["ingestion"]
+            self.assertTrue(ingestion["complete"])
+            self.assertEqual(ingestion["prepared_record_count"], 0)
+            self.assertEqual(ingestion["batch_count"], 1)
+            self.assertEqual(ingestion["largest_batch_record_count"], 0)
+            self.assertEqual(ingestion["largest_batch_encoded_bytes"], len(b'{"records":[]}'))
+            self.assertEqual(ingestion["empty_batch_representation"], "one empty batch")
+            self.assertFalse(ingestion["submission_eligible"])
+            output = StringIO()
+            with redirect_stdout(output):
+                POC.write_snapshot_ingestion_summary(result)
+            self.assertIn("Snapshot ingestion contract dry-run: PASS", output.getvalue())
+            self.assertIn("prepared records: 0", output.getvalue())
+            self.assertIn("empty input behavior: one empty batch", output.getvalue())
+
+    def test_snapshot_ingestion_preparation_uses_existing_classifier_and_record_contract(self) -> None:
+        cases = [
+            self._ingestion_case(101, "Fordrevne fra Ukraine"),
+            self._ingestion_case(102, "Ændring af udlændingeloven om opholdstilladelse"),
+            self._ingestion_case(103, "Vejlov om vejvedligeholdelse"),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._run_ingestion_preparation(pathlib.Path(temp), cases)
+            ingestion = result["ingestion"]
+            self.assertEqual(ingestion["prepared_record_count"], 3)
+            self.assertEqual(ingestion["relevance_counts"], {"DIRECT": 1, "POTENTIAL": 1, "IRRELEVANT": 1})
+            self.assertEqual(ingestion["complete_candidate_count"], 3)
+            self.assertEqual(ingestion["incomplete_candidate_count"], 0)
+            self.assertEqual(ingestion["ruleset_version"], "1.1")
+
+    def test_snapshot_ingestion_preparation_batches_more_than_50_records(self) -> None:
+        cases = [self._ingestion_case(index + 1, f"Vejlov {index + 1}") for index in range(51)]
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._run_ingestion_preparation(pathlib.Path(temp), cases)
+            ingestion = result["ingestion"]
+            self.assertEqual(ingestion["prepared_record_count"], 51)
+            self.assertEqual(ingestion["batch_count"], 2)
+            self.assertEqual(ingestion["largest_batch_record_count"], 50)
+
+    def test_snapshot_ingestion_preparation_obeys_batch_byte_limit(self) -> None:
+        cases = [self._ingestion_case(index + 1, "x" * 60000) for index in range(2)]
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._run_ingestion_preparation(pathlib.Path(temp), cases)
+            ingestion = result["ingestion"]
+            self.assertEqual(ingestion["prepared_record_count"], 2)
+            self.assertEqual(ingestion["batch_count"], 2)
+            self.assertLessEqual(ingestion["largest_batch_encoded_bytes"], 220 * 1024)
+
+    def test_snapshot_ingestion_preparation_rejects_malformed_case_safely(self) -> None:
+        case = self._ingestion_case(404, "PRIVATE TITLE")
+        case["source_url"] = None
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            with self.assertRaises(POC.PocError) as raised:
+                self._run_ingestion_preparation(root, [case])
+            self.assertEqual(raised.exception.category, "snapshot_ingestion_preparation_failed")
+            self.assertNotIn("PRIVATE TITLE", str(raised.exception))
+            self.assertEqual(list(root.glob("denmarkbot-candidate-bundle-*.json")), [])
+
+    def test_snapshot_ingestion_incomplete_extraction_stays_incomplete_and_never_eligible(self) -> None:
+        diagnostics = [{"code": "source_lookup_failed", "count": 1}]
+        cases = [self._ingestion_case(505, "PRIVATE TITLE", complete=False)]
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._run_ingestion_preparation(
+                pathlib.Path(temp), cases, complete=False, diagnostics=diagnostics
+            )
+            ingestion = result["ingestion"]
+            self.assertFalse(ingestion["complete"])
+            self.assertFalse(ingestion["extraction_complete"])
+            self.assertFalse(ingestion["submission_eligible"])
+            self.assertEqual(ingestion["notification_blocked_count"], 1)
+            self.assertEqual(ingestion["prepared_record_count"], 1)
+            self.assertEqual(ingestion["complete_candidate_count"], 0)
+            self.assertEqual(ingestion["incomplete_candidate_count"], 1)
+            self.assertEqual(ingestion["extraction_diagnostics"], diagnostics)
+            output = StringIO()
+            with redirect_stdout(output):
+                POC.write_snapshot_ingestion_summary(result)
+            self.assertIn("Snapshot ingestion contract dry-run: INCOMPLETE", output.getvalue())
+            self.assertIn("source_lookup_failed: 1", output.getvalue())
+            self.assertNotIn("PRIVATE TITLE", output.getvalue())
+
+    def test_snapshot_ingestion_path_cannot_call_network_upload_or_checkpoint_helpers(self) -> None:
+        from collectors import ingestion_client
+
+        cases = [self._ingestion_case(606, "Vejlov")]
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(ingestion_client, "upload", side_effect=AssertionError("upload forbidden")) as upload, \
+                mock.patch.object(ingestion_client, "collection_complete", side_effect=AssertionError("checkpoint path forbidden")) as complete, \
+                mock.patch.object(ingestion_client, "proposed_checkpoints", side_effect=AssertionError("checkpoint path forbidden")) as checkpoints, \
+                mock.patch.object(ingestion_client, "_request", side_effect=AssertionError("network forbidden")) as request:
+            self._run_ingestion_preparation(pathlib.Path(temp), cases)
+            upload.assert_not_called()
+            complete.assert_not_called()
+            checkpoints.assert_not_called()
+            request.assert_not_called()
+
+    def test_snapshot_ingestion_summary_never_leaks_record_fields(self) -> None:
+        case = self._ingestion_case(777, "PRIVATE SNAPSHOT TITLE")
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._run_ingestion_preparation(pathlib.Path(temp), [case])
+            output = StringIO()
+            with redirect_stdout(output):
+                POC.write_snapshot_ingestion_summary(result)
+            rendered = output.getvalue()
+            for private in ("777", "PRIVATE SNAPSHOT TITLE", "https://oda.ft.dk", "normalized_snapshot", "payload"):
+                self.assertNotIn(private, rendered)
+            self.assertIn("submission eligible: false", rendered)
+
+    def test_snapshot_ingestion_candidate_temp_file_is_private_and_cleaned(self) -> None:
+        case = self._ingestion_case(808, "Vejlov")
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            observed_modes = []
+            original = POC._write_private_candidate_bundle
+
+            def inspect_file(payload, directory):
+                path = original(payload, directory)
+                observed_modes.append(path.stat().st_mode & 0o777)
+                return path
+
+            with mock.patch.object(POC, "_write_private_candidate_bundle", side_effect=inspect_file):
+                self._run_ingestion_preparation(root, [case])
             self.assertEqual(observed_modes, [0o600])
             self.assertEqual(list(root.glob("denmarkbot-candidate-bundle-*.json")), [])
 
@@ -356,8 +521,9 @@ class BackupPocSafetyTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
         self.assertIn("- EXTRACT_SNAPSHOT_CANDIDATES", workflow)
         self.assertIn("- CLASSIFY_SNAPSHOT_CANDIDATES", workflow)
+        self.assertIn("- PREPARE_SNAPSHOT_INGESTION", workflow)
         self.assertNotIn("schedule:", workflow)
-        self.assertIn("inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES'", workflow)
+        self.assertIn("inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION'", workflow)
         self.assertIn("OLD_MANIFEST_PATH:", workflow)
         self.assertIn("NEW_MANIFEST_PATH:", workflow)
         self.assertIn("INPUT_OLD_RUN_ID:", workflow)
@@ -371,6 +537,7 @@ class BackupPocSafetyTests(unittest.TestCase):
 
     def test_classify_mode_is_explicit_and_restores_without_production_integrations(self) -> None:
         self.assertEqual(POC.validate_mode("CLASSIFY_SNAPSHOT_CANDIDATES"), "CLASSIFY_SNAPSHOT_CANDIDATES")
+        self.assertEqual(POC.validate_mode("PREPARE_SNAPSHOT_INGESTION"), "PREPARE_SNAPSHOT_INGESTION")
         workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
         self.assertIn("on:\n  workflow_dispatch:", workflow)
         self.assertNotIn("schedule:", workflow)

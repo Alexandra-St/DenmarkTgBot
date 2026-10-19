@@ -57,6 +57,7 @@ CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 VALIDATE_SQL_PROVIDER = "VALIDATE_SQL_PROVIDER"
 EXTRACT_SNAPSHOT_CANDIDATES = "EXTRACT_SNAPSHOT_CANDIDATES"
 CLASSIFY_SNAPSHOT_CANDIDATES = "CLASSIFY_SNAPSHOT_CANDIDATES"
+PREPARE_SNAPSHOT_INGESTION = "PREPARE_SNAPSHOT_INGESTION"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
@@ -82,6 +83,7 @@ def validate_mode(value: str) -> str:
         VALIDATE_SQL_PROVIDER,
         EXTRACT_SNAPSHOT_CANDIDATES,
         CLASSIFY_SNAPSHOT_CANDIDATES,
+        PREPARE_SNAPSHOT_INGESTION,
     }:
         raise PocError("workflow_mode_invalid")
     return value
@@ -1315,6 +1317,7 @@ def run_candidate_extraction(
     old_finish: str,
     new_finish: str,
     classify_candidates: bool = False,
+    prepare_ingestion: bool = False,
 ) -> dict[str, Any]:
     """Run the established extractor and return only validated aggregate data."""
     bundle_path: Path | None = None
@@ -1398,8 +1401,12 @@ def run_candidate_extraction(
             "old_finish": old_finish,
             "new_finish": new_finish,
         }
-        if classify_candidates:
+        if classify_candidates or prepare_ingestion:
             result["classification"] = _classify_candidate_bundle(persisted_bundle)
+        if prepare_ingestion:
+            result["ingestion"] = _prepare_snapshot_ingestion(
+                persisted_bundle, result["classification"]
+            )
         return result
     finally:
         cleanup_candidate_bundle(bundle_path, runner_temp)
@@ -1526,6 +1533,178 @@ def write_candidate_classification_summary(summary: dict[str, Any]) -> None:
                 output.write(text)
         except OSError:
             raise PocError("candidate_classification_summary_write_failed") from None
+    print(text, end="")
+
+
+def _prepare_snapshot_ingestion(
+    bundle: dict[str, Any], classification: dict[str, Any]
+) -> dict[str, Any]:
+    """Exercise record preparation and batching only; never use OData checkpoints or upload()."""
+    try:
+        from collectors import ingestion_client
+        from collectors.relevance import DIRECT, IRRELEVANT, POTENTIAL
+    except Exception:
+        raise PocError("snapshot_ingestion_import_failed") from None
+
+    cases = bundle.get("cases")
+    if not isinstance(cases, list):
+        raise PocError("snapshot_ingestion_bundle_invalid")
+    for case in cases:
+        if (
+            not isinstance(case, dict)
+            or case.get("source") != "folketinget"
+            or case.get("historical") is not False
+            or case.get("notify_eligible") is not None
+            or not isinstance(case.get("complete"), bool)
+            or any(not isinstance(case.get(name), list) for name in ("documents", "stages", "votes"))
+        ):
+            raise PocError("snapshot_ingestion_case_invalid")
+    try:
+        records = ingestion_client.prepare_records(
+            {"cases": cases}, source="folketinget", mode="incremental"
+        )
+    except ingestion_client.IngestionError:
+        raise PocError("snapshot_ingestion_preparation_failed") from None
+    except Exception:
+        raise PocError("snapshot_ingestion_preparation_failed") from None
+    if not isinstance(records, list):
+        raise PocError("snapshot_ingestion_preparation_failed")
+
+    relevance_counts = {DIRECT: 0, POTENTIAL: 0, IRRELEVANT: 0}
+    notification_blocked_count = 0
+    complete_candidate_count = 0
+    incomplete_candidate_count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            raise PocError("snapshot_ingestion_contract_invalid")
+        source = record.get("source")
+        historical = record.get("historical")
+        complete = record.get("complete")
+        notification_blocked = record.get("notification_blocked")
+        relevance = record.get("relevance")
+        ruleset_version = record.get("ruleset_version")
+        url = record.get("url")
+        normalized_snapshot = record.get("normalized_snapshot")
+        if (
+            source != "folketinget"
+            or historical is not False
+            or not isinstance(complete, bool)
+            or not isinstance(notification_blocked, bool)
+            or relevance not in relevance_counts
+            or ruleset_version != ingestion_client.RULESET_VERSION
+            or not _is_official_oda_case_url(url)
+            or not isinstance(normalized_snapshot, dict)
+            or any(not isinstance(normalized_snapshot.get(name), list) for name in ("documents", "stages", "votes"))
+        ):
+            raise PocError("snapshot_ingestion_contract_invalid")
+        relevance_counts[relevance] += 1
+        notification_blocked_count += int(notification_blocked)
+        if complete:
+            complete_candidate_count += 1
+        else:
+            incomplete_candidate_count += 1
+
+    if len(records) != classification.get("classified_case_count"):
+        raise PocError("snapshot_ingestion_record_count_mismatch")
+    if (
+        relevance_counts != classification.get("relevance_counts")
+        or notification_blocked_count != classification.get("notification_blocked_count")
+    ):
+        raise PocError("snapshot_ingestion_classification_mismatch")
+
+    try:
+        batches = ingestion_client.chunks(records)
+    except ingestion_client.IngestionError:
+        raise PocError("snapshot_ingestion_batching_failed") from None
+    except Exception:
+        raise PocError("snapshot_ingestion_batching_failed") from None
+    if not isinstance(batches, list) or not batches or any(not isinstance(batch, list) for batch in batches):
+        raise PocError("snapshot_ingestion_batching_invalid")
+    if [record for batch in batches for record in batch] != records:
+        raise PocError("snapshot_ingestion_batching_invalid")
+    largest_batch_records = max(len(batch) for batch in batches)
+    largest_batch_bytes = max(
+        len(json.dumps({"records": batch}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        for batch in batches
+    )
+    extraction_complete = bundle.get("complete") is True
+    # Deliberately never mark a snapshot-native batch eligible for submission here.
+    return {
+        "prepared_record_count": len(records),
+        "batch_count": len(batches),
+        "largest_batch_record_count": largest_batch_records,
+        "largest_batch_encoded_bytes": largest_batch_bytes,
+        "relevance_counts": relevance_counts,
+        "notification_blocked_count": notification_blocked_count,
+        "complete_candidate_count": complete_candidate_count,
+        "incomplete_candidate_count": incomplete_candidate_count,
+        "extraction_complete": extraction_complete,
+        "complete": extraction_complete,
+        "ruleset_version": ingestion_client.RULESET_VERSION,
+        "extraction_diagnostics": classification["extraction_diagnostics"],
+        "submission_eligible": False,
+        "empty_batch_representation": "one empty batch" if not records and batches == [[]] else None,
+    }
+
+
+def _is_official_oda_case_url(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "oda.ft.dk"
+            and parsed.username is None
+            and parsed.password is None
+            and re.fullmatch(r"/api/Sag\(\d{1,20}\)", parsed.path) is not None
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+
+
+def write_snapshot_ingestion_summary(summary: dict[str, Any]) -> None:
+    ingestion = summary["ingestion"]
+    state = "PASS" if ingestion["complete"] else "INCOMPLETE"
+    relevance_counts = ingestion["relevance_counts"]
+    lines = [
+        f"Snapshot ingestion contract dry-run: {state}",
+        "",
+        f"- prepared records: {ingestion['prepared_record_count']}",
+        f"- batch count: {ingestion['batch_count']}",
+        f"- largest batch records: {ingestion['largest_batch_record_count']}",
+        f"- largest encoded batch bytes: {ingestion['largest_batch_encoded_bytes']}",
+        f"- DIRECT: {relevance_counts['DIRECT']}",
+        f"- POTENTIAL: {relevance_counts['POTENTIAL']}",
+        f"- IRRELEVANT: {relevance_counts['IRRELEVANT']}",
+        f"- notification_blocked count: {ingestion['notification_blocked_count']}",
+        f"- complete candidates: {ingestion['complete_candidate_count']}",
+        f"- incomplete candidates: {ingestion['incomplete_candidate_count']}",
+        f"- extraction complete: {str(ingestion['extraction_complete']).lower()}",
+        f"- ruleset_version: {ingestion['ruleset_version']}",
+        f"- submission eligible: {str(ingestion['submission_eligible']).lower()}",
+    ]
+    if ingestion["empty_batch_representation"]:
+        lines.append(f"- empty input behavior: {ingestion['empty_batch_representation']}")
+    lines.append("- extraction diagnostics:")
+    if ingestion["extraction_diagnostics"]:
+        lines.extend(
+            f"  - {item['code']}: {item['count']}"
+            for item in ingestion["extraction_diagnostics"]
+        )
+    else:
+        lines.append("  - none")
+    lines.append("")
+    text = "\n".join(lines)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as output:
+                output.write(text)
+        except OSError:
+            raise PocError("snapshot_ingestion_summary_write_failed") from None
     print(text, end="")
 
 
@@ -1674,7 +1853,7 @@ def main() -> int:
     try:
         mode = validate_mode(os.environ.get("INPUT_MODE", RESTORE_VALIDATE))
         validate_confirmation(os.environ.get("INPUT_CONFIRM_RESTORE", ""))
-        if mode in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
+        if mode in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
             candidate_context = validate_candidate_manifest_inputs(
                 Path(os.environ.get("OLD_MANIFEST_PATH", "")),
                 Path(os.environ.get("NEW_MANIFEST_PATH", "")),
@@ -1688,13 +1867,13 @@ def main() -> int:
         require_x64_ubuntu24(platform.machine(), release)
         runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
         initial_free = free_bytes(runner_temp)
-        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
+        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
             print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
         check_free_space(initial_free, 8 * GIB)
         password = __import__("secrets").token_urlsafe(32) + "Aa1!"
         run_sql_server_setup(password)
         after_install = free_bytes(runner_temp)
-        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
+        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
             print(f"sql_server_edition=Express 2025 free_disk_before_download_bytes={after_install}")
         opener = make_oda_opener(username, credential)
         content_length = request_content_length(opener)
@@ -1712,7 +1891,7 @@ def main() -> int:
         download = download_backup(opener, download_temp_path, content_length)
         print("progress=backup_download_complete")
         backup_size, backup_checksum, download_seconds = validate_download_metadata(download, content_length)
-        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
+        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
             print(f"backup_bytes={backup_size} sha256={backup_checksum} download_seconds={download_seconds}")
         print("progress=backup_staging_copy")
         run_checked(
@@ -1729,7 +1908,7 @@ def main() -> int:
         )
         restore_free = check_restore_disk_space(restore_parent, 1)
         validate_backup_readable_by_sql_server(backup_path, backup_size)
-        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
+        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
             print(f"free_disk_before_restore_bytes={restore_free}")
         print("progress=restore_header_check")
         header_output = sqlcmd(
@@ -1767,7 +1946,7 @@ def main() -> int:
         entities = validate_entities(password)
         if entities["missing"] or entities["no_primary_key"]:
             raise PocError("required_entity_validation_failed")
-        if mode in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
+        if mode in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
             if candidate_context is None:
                 raise PocError("candidate_manifest_context_missing")
             print("progress=candidate_schema_discovery")
@@ -1804,9 +1983,15 @@ def main() -> int:
                 runner_temp,
                 candidate_context["old_finish"],
                 candidate_context["new_finish"],
-                classify_candidates=mode == CLASSIFY_SNAPSHOT_CANDIDATES,
+                classify_candidates=mode in {CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION},
+                prepare_ingestion=mode == PREPARE_SNAPSHOT_INGESTION,
             )
-            if mode == CLASSIFY_SNAPSHOT_CANDIDATES:
+            if mode == PREPARE_SNAPSHOT_INGESTION:
+                write_snapshot_ingestion_summary(candidate_result)
+                if not candidate_result["ingestion"]["complete"]:
+                    print("restore_validation=INCOMPLETE")
+                    return 2
+            elif mode == CLASSIFY_SNAPSHOT_CANDIDATES:
                 write_candidate_classification_summary(candidate_result)
                 if not candidate_result["classification"]["complete"]:
                     print("restore_validation=INCOMPLETE")
