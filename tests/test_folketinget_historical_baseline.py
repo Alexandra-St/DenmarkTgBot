@@ -19,6 +19,7 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(BASELINE)
 
 from folketinget_candidate_extraction import InMemoryFolketingetProvider
+from folketinget_sql_provider import SQLProviderError
 
 ENTITIES = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
 STAMP = "2026-10-18T12:00:00Z"
@@ -199,6 +200,27 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
             progress_callback=lambda processed, total: progress.append((processed, total)),
         )
         self.assertEqual(progress, [(1, 2), (2, 2)])
+
+    def test_categorized_provider_lookup_failure_remains_incomplete_and_in_summary(self):
+        create_manifest(self.manifest, [77])
+
+        class FailingRelationProvider(TrackingProvider):
+            def find_by_field(self, entity, field, values):
+                if entity == "SagDokument" and field == "sagid":
+                    raise SQLProviderError(
+                        "provider_transport_failed", transport_category="manifest_page_json_invalid"
+                    )
+                return super().find_by_field(entity, field, values)
+
+        result = BASELINE.run_historical_baseline(
+            self.manifest, FailingRelationProvider(source_rows([77]))
+        )
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertEqual(result["diagnostics"].get("source_lookup_failed"), 1)
+        categorized = "source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_json_invalid"
+        self.assertEqual(result["diagnostics"].get(categorized), 1)
+        self.assertEqual(result["incomplete_case_count"], 0)
+        self.assertTrue(BASELINE.candidate_extraction.is_safe_diagnostic_code(categorized))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 import sys
 from collections import Counter
@@ -27,7 +26,6 @@ import folketinget_snapshot_manifest as snapshot_manifest
 
 MAX_SAGS_PER_HYDRATION = 250
 RELEVANCE_VALUES = frozenset({DIRECT, POTENTIAL, IRRELEVANT})
-SAFE_DIAGNOSTIC = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class HistoricalBaselineError(Exception):
@@ -141,7 +139,7 @@ def run_historical_baseline(
             incomplete_cases += max(0, len(sag_ids) - len(external_ids))
 
         for code, count in batch_diagnostics.items():
-            diagnostics[code if SAFE_DIAGNOSTIC.fullmatch(code) else "diagnostic_invalid"] += count
+            diagnostics[code if candidate_extraction.is_safe_diagnostic_code(code) else "diagnostic_invalid"] += count
 
         # Prepare this bounded unit independently so case payloads do not
         # accumulate across the full historical universe.

@@ -528,7 +528,10 @@ class BackupPocSafetyTests(unittest.TestCase):
             "prepared_record_count": 2, "DIRECT": 1, "POTENTIAL": 0, "IRRELEVANT": 1,
             "notification_blocked_count": 1, "ingestion_batch_count": 1, "largest_batch_records": 2,
             "largest_batch_bytes": 500, "incomplete_case_count": 1,
-            "diagnostics": {"missing_status": 1}, "target_backup_finish": "2026-10-19T02:00:00Z",
+            "diagnostics": {
+                "missing_status": 1,
+                "source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_json_invalid": 120,
+            }, "target_backup_finish": "2026-10-19T02:00:00Z",
             "ruleset_version": "1.1", "private_title": "DO NOT PRINT", "external_id": "987654",
         }
         output = StringIO()
@@ -538,6 +541,7 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("Historical snapshot baseline dry-run: INCOMPLETE", rendered)
         self.assertEqual(POC.historical_baseline_exit_code(summary), 2)
         self.assertIn("missing_status: 1", rendered)
+        self.assertIn("source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_json_invalid: 120", rendered)
         self.assertNotIn("DO NOT PRINT", rendered)
         self.assertNotIn("987654", rendered)
         summary["status"] = "PASS"

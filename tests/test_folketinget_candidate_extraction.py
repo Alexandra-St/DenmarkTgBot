@@ -18,6 +18,7 @@ SPEC = importlib.util.spec_from_file_location(
 CANDIDATES = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(CANDIDATES)
+SQLProviderError = CANDIDATES.SQLProviderError
 
 ENTITIES = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
 STAMP = "2026-10-18T12:00:00Z"
@@ -207,6 +208,76 @@ class CandidateExtractionTests(unittest.TestCase):
         diagnostics = {item["code"]: item["count"] for item in summary["diagnostics"]}
         self.assertEqual(diagnostics["missing_timestamp"], 1)
         self.assertFalse(bundle["complete"])
+
+    def test_provider_lookup_diagnostics_preserve_allowlisted_dimensions(self) -> None:
+        class FailingProvider:
+            def __init__(self, error):
+                self.error = error
+
+            def get_by_ids(self, entity, ids):
+                raise self.error
+
+            def find_by_field(self, entity, field, values):
+                raise self.error
+
+        cases = (
+            ("by_ids", "Dokument", "id", SQLProviderError("provider_json_invalid"),
+             "source_lookup_failed_Dokument_by_ids_id_provider_json_invalid"),
+            ("by_field", "SagDokument", "sagid", SQLProviderError("provider_query_failed"),
+             "source_lookup_failed_SagDokument_by_field_sagid_provider_query_failed"),
+            ("by_field", "Afstemning", "sagstrinid",
+             SQLProviderError("provider_relation_field_type_invalid"),
+             "source_lookup_failed_Afstemning_by_field_sagstrinid_provider_relation_field_type_invalid"),
+            ("by_field", "SagDokument", "sagid",
+             SQLProviderError("provider_transport_failed", transport_category="manifest_page_json_invalid"),
+             "source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_json_invalid"),
+            ("by_field", "SagDokument", "sagid",
+             SQLProviderError("provider_transport_failed", transport_category="PRIVATE SQL row 123"),
+             "source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_provider_transport_failed"),
+        )
+        for method, entity, field, error, expected_code in cases:
+            with self.subTest(code=expected_code):
+                diagnostics = Counter()
+                rows = CANDIDATES._safe_lookup(
+                    FailingProvider(error), method, entity, (987654,), diagnostics, field=field
+                )
+                self.assertEqual(rows, ())
+                self.assertEqual(diagnostics["source_lookup_failed"], 1)
+                self.assertEqual(diagnostics[expected_code], 1)
+                self.assertTrue(CANDIDATES.is_safe_diagnostic_code(expected_code))
+
+    def test_unknown_provider_exception_and_unallowlisted_dimensions_stay_generic(self) -> None:
+        class FailingProvider:
+            def get_by_ids(self, entity, ids):
+                raise RuntimeError("SECRET SQL title=PRIVATE id=987654 payload")
+
+            def find_by_field(self, entity, field, values):
+                raise SQLProviderError("secret_category")
+
+        diagnostics = Counter()
+        CANDIDATES._safe_lookup(FailingProvider(), "by_ids", "Sag", (987654,), diagnostics)
+        self.assertEqual(diagnostics, Counter({"source_lookup_failed": 1}))
+        diagnostics.clear()
+        CANDIDATES._safe_lookup(
+            FailingProvider(), "by_field", "SagDokument", (987654,), diagnostics, field="private_field"
+        )
+        self.assertEqual(diagnostics, Counter({"source_lookup_failed": 1}))
+        rendered = json.dumps(dict(diagnostics))
+        for value in ("SECRET", "SQL", "PRIVATE", "987654", "payload", "secret_category", "private_field"):
+            self.assertNotIn(value, rendered)
+
+    def test_categorized_lookup_codes_are_hard_allowlisted(self) -> None:
+        self.assertTrue(CANDIDATES.is_safe_diagnostic_code("source_lookup_failed"))
+        self.assertTrue(CANDIDATES.is_safe_diagnostic_code(
+            "source_lookup_failed_Afstemning_by_field_sagstrinid_provider_transport_failed_transport_manifest_page_sql_msg_400"
+        ))
+        for code in (
+            "source_lookup_failed_PRIVATE_by_ids_id_provider_json_invalid",
+            "source_lookup_failed_Sag_by_field_id_provider_query_failed",
+            "source_lookup_failed_Sag_by_ids_id_private_category",
+            "source_lookup_failed_Sag_by_ids_id_provider_query_failed_transport_private",
+        ):
+            self.assertFalse(CANDIDATES.is_safe_diagnostic_code(code))
 
     def test_case_order_is_deterministic_and_summary_does_not_leak_payload(self) -> None:
         title = "PRIVATE TITLE displaced people from Ukraine"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -20,6 +21,12 @@ from collectors.folketinget_models import LegislativeCase, normalize_many
 from collectors.folketinget_relations import assemble_cases
 import folketinget_snapshot_diff as snapshot_diff
 import folketinget_snapshot_manifest as snapshot_manifest
+from folketinget_sql_provider import (
+    RELATION_FIELDS as PROVIDER_RELATION_FIELDS,
+    SAFE_PROVIDER_ERROR_CATEGORIES,
+    SAFE_TRANSPORT_CATEGORIES,
+    SQLProviderError,
+)
 
 
 SOURCE = "folketinget"
@@ -27,6 +34,11 @@ FORMAT_VERSION = 1
 MAX_AFFECTED_CASES = 5000
 RELATION_FIELDS = frozenset({"id", "sagid", "dokumentid", "sagstrinid", "statusid"})
 INTEGER_SQL_TYPES = frozenset({"tinyint", "smallint", "int", "bigint"})
+LOOKUP_METHODS = frozenset({"by_ids", "by_field"})
+LOOKUP_ENTITIES = frozenset(snapshot_manifest.REQUIRED_ENTITIES)
+LOOKUP_FIELDS = {entity: PROVIDER_RELATION_FIELDS[entity] for entity in LOOKUP_ENTITIES}
+_SIMPLE_DIAGNOSTIC = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_SQL_MESSAGE = re.compile(r"^manifest_page_sql_msg_[0-9]{1,6}$")
 
 
 class CandidateExtractionError(Exception):
@@ -68,6 +80,51 @@ class InMemoryFolketingetProvider:
 
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _safe_transport_category(value: object) -> str | None:
+    if isinstance(value, str) and (
+        value in SAFE_TRANSPORT_CATEGORIES or _SAFE_SQL_MESSAGE.fullmatch(value)
+    ):
+        return value
+    return None
+
+
+def _lookup_failure_code(method: str, entity: str, field: str, error: SQLProviderError) -> str | None:
+    """Build an aggregate diagnostic only from provider-owned allowlists."""
+    valid_field = field == "id" if method == "by_ids" else (
+        method == "by_field" and entity in LOOKUP_ENTITIES and field in LOOKUP_FIELDS[entity]
+    )
+    if (method not in LOOKUP_METHODS or entity not in LOOKUP_ENTITIES or not valid_field
+            or error.category not in SAFE_PROVIDER_ERROR_CATEGORIES):
+        return None
+    code = f"source_lookup_failed_{entity}_{method}_{field}_{error.category}"
+    if error.transport_category is not None:
+        transport = _safe_transport_category(error.transport_category) or "provider_transport_failed"
+        code += f"_transport_{transport}"
+    return code
+
+
+def is_safe_diagnostic_code(code: object) -> bool:
+    """Validate ordinary diagnostics and the structured lookup diagnostics."""
+    if not isinstance(code, str):
+        return False
+    if _SIMPLE_DIAGNOSTIC.fullmatch(code):
+        return True
+    for entity in LOOKUP_ENTITIES:
+        for method in LOOKUP_METHODS:
+            fields = LOOKUP_FIELDS[entity] if method == "by_field" else frozenset({"id"})
+            for field in fields:
+                for category in SAFE_PROVIDER_ERROR_CATEGORIES:
+                    prefix = f"source_lookup_failed_{entity}_{method}_{field}_{category}"
+                    if code == prefix:
+                        return True
+                    transport_prefix = prefix + "_transport_"
+                    if code.startswith(transport_prefix):
+                        transport = code[len(transport_prefix):]
+                        if transport == "provider_transport_failed" or _safe_transport_category(transport):
+                            return True
+    return False
 
 
 def decode_canonical_key(entity: str, canonical_key: str) -> int:
@@ -128,6 +185,12 @@ def _safe_lookup(
         if len(valid) != len(found):
             diagnostics.update(("unexpected_source_rows",))
         return valid
+    except SQLProviderError as error:
+        diagnostics.update(("source_lookup_failed",))
+        code = _lookup_failure_code(method, entity, field, error)
+        if code is not None:
+            diagnostics.update((code,))
+        return ()
     except Exception:
         diagnostics.update(("source_lookup_failed",))
         return ()

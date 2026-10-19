@@ -1932,6 +1932,8 @@ def write_snapshot_ingestion_client_summary(summary: dict[str, Any]) -> None:
 
 def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
     """Write only the documented aggregate fields for historical baseline dry-run."""
+    import folketinget_candidate_extraction as candidate_extraction
+
     expected_integer_fields = (
         "manifest_sag_count", "hydrated_case_count", "prepared_record_count", "DIRECT", "POTENTIAL",
         "IRRELEVANT", "notification_blocked_count", "ingestion_batch_count", "largest_batch_records",
@@ -1957,7 +1959,7 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
         raise PocError("historical_baseline_summary_invalid")
     diagnostic_lines = []
     for code, count in sorted(diagnostics.items()):
-        if not isinstance(code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+        if not candidate_extraction.is_safe_diagnostic_code(code):
             raise PocError("historical_baseline_summary_invalid")
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise PocError("historical_baseline_summary_invalid")
