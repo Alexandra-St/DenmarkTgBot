@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
 if TOOLS_DIRECTORY not in sys.path:
     sys.path.insert(0, TOOLS_DIRECTORY)
 import folketinget_snapshot_manifest as snapshot_manifest
+import folketinget_snapshot_diff as snapshot_diff
 from folketinget_sql_transport import (
     MANIFEST_BASE64_CHUNK_SIZE,
     MANIFEST_MAX_BASE64_CHUNKS,
@@ -53,6 +55,7 @@ MANIFEST_FILENAME = "manifest.sqlite"
 RESTORE_VALIDATE = "RESTORE_VALIDATE"
 CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 VALIDATE_SQL_PROVIDER = "VALIDATE_SQL_PROVIDER"
+EXTRACT_SNAPSHOT_CANDIDATES = "EXTRACT_SNAPSHOT_CANDIDATES"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
@@ -72,7 +75,12 @@ def validate_confirmation(value: str) -> None:
 
 
 def validate_mode(value: str) -> str:
-    if value not in {RESTORE_VALIDATE, CREATE_MANIFEST_BASELINE, VALIDATE_SQL_PROVIDER}:
+    if value not in {
+        RESTORE_VALIDATE,
+        CREATE_MANIFEST_BASELINE,
+        VALIDATE_SQL_PROVIDER,
+        EXTRACT_SNAPSHOT_CANDIDATES,
+    }:
         raise PocError("workflow_mode_invalid")
     return value
 
@@ -1169,6 +1177,267 @@ def validate_sql_provider(password: str, entities: dict[str, Any]) -> dict[str, 
         raise PocError("sql_provider_validation_failed") from None
 
 
+def validate_candidate_manifest_inputs(
+    old_value: Path, new_value: Path, old_run_id: str, new_run_id: str
+) -> dict[str, Any]:
+    """Validate both downloaded manifests and their declared source chronology."""
+    if not re.fullmatch(r"[0-9]+", old_run_id or "") or not re.fullmatch(r"[0-9]+", new_run_id or ""):
+        raise PocError("workflow_run_id_invalid")
+    old_run_order = old_run_id.lstrip("0") or "0"
+    new_run_order = new_run_id.lstrip("0") or "0"
+    if old_run_order == new_run_order:
+        raise PocError("workflow_run_ids_must_differ")
+    try:
+        old_path = snapshot_diff._manifest_file(old_value)
+        new_path = snapshot_diff._manifest_file(new_value)
+        report = snapshot_diff.compare_manifests(old_path, new_path)
+    except snapshot_diff.DiffError as error:
+        if error.category == "manifest_schema_mismatch":
+            raise PocError("candidate_schema_mismatch") from None
+        raise PocError(error.category) from None
+    try:
+        old_finish = datetime.fromisoformat(report["old"]["backup_finish_date"].replace("Z", "+00:00"))
+        new_finish = datetime.fromisoformat(report["new"]["backup_finish_date"].replace("Z", "+00:00"))
+        if (old_finish.tzinfo is None) != (new_finish.tzinfo is None):
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise PocError("candidate_manifest_finish_invalid") from None
+    if old_finish > new_finish:
+        raise PocError("candidate_manifest_order_invalid")
+    return {
+        "old_path": old_path,
+        "new_path": new_path,
+        "report": report,
+        "old_finish": report["old"]["backup_finish_date"],
+        "new_finish": report["new"]["backup_finish_date"],
+    }
+
+
+def validate_candidate_backup_identity(
+    backup_sha256: str, backup_finish_date: str, restored_schema_fingerprint: str,
+    candidate_context: dict[str, Any],
+) -> None:
+    """Require the restored official backup to be exactly the new manifest source."""
+    new_metadata = candidate_context["report"]["new"]
+    if backup_sha256 != new_metadata["backup_sha256"]:
+        raise PocError("candidate_backup_sha_mismatch")
+    if backup_finish_date != new_metadata["backup_finish_date"]:
+        raise PocError("candidate_backup_finish_mismatch")
+    if restored_schema_fingerprint != candidate_context["report"]["schema_fingerprint"]:
+        raise PocError("candidate_schema_mismatch")
+
+
+def create_candidate_sql_provider(
+    password: str, entities: dict[str, Any], schemas: dict[str, dict[str, Any]]
+) -> Any:
+    """Build the same allowlisted SQL provider used by the validated smoke mode."""
+    try:
+        from folketinget_sql_provider import PROJECTIONS, SQLServerFolketingetProvider
+    except Exception:
+        raise PocError("candidate_provider_import_failed") from None
+    try:
+        column_types: dict[str, dict[str, str]] = {}
+        for entity in REQUIRED_ENTITIES:
+            schema_name, object_type = entities["objects"][entity]
+            if object_type != "USER_TABLE" or schemas[entity]["primary_key"] != ["id"]:
+                raise PocError("candidate_provider_schema_invalid")
+            available_types = {column["name"]: column["type_name"] for column in schemas[entity]["columns"]}
+            if set(PROJECTIONS[entity]) - set(available_types):
+                raise PocError("candidate_provider_schema_invalid")
+            column_types[entity] = {name: available_types[name] for name in PROJECTIONS[entity]}
+    except PocError:
+        raise
+    except Exception:
+        raise PocError("candidate_provider_schema_invalid") from None
+    try:
+        return SQLServerFolketingetProvider(
+            entities["objects"],
+            lambda query, entity: run_provider_chunked_json(password, query, entity),
+            column_types=column_types,
+        )
+    except Exception:
+        raise PocError("candidate_provider_construction_failed") from None
+
+
+def _write_private_candidate_bundle(bundle: dict[str, Any], runner_temp: Path) -> Path:
+    path: Path | None = None
+    try:
+        descriptor, filename = tempfile.mkstemp(
+            prefix="denmarkbot-candidate-bundle-", suffix=".json", dir=runner_temp
+        )
+        path = Path(filename)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(bundle, output, ensure_ascii=False, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        if path.stat().st_mode & 0o077:
+            raise PocError("candidate_bundle_permissions_invalid")
+        return path
+    except PocError:
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    except Exception:
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise PocError("candidate_bundle_write_failed") from None
+
+
+def cleanup_candidate_bundle(path: Path | None, runner_temp: Path) -> None:
+    if path is None:
+        return
+    if (
+        path.parent != runner_temp
+        or not path.name.startswith("denmarkbot-candidate-bundle-")
+        or path.suffix != ".json"
+        or path.is_symlink()
+    ):
+        raise PocError("candidate_bundle_cleanup_failed")
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        raise PocError("candidate_bundle_cleanup_failed") from None
+
+
+def run_candidate_extraction(
+    old_manifest: Path,
+    new_manifest: Path,
+    provider: Any,
+    runner_temp: Path,
+    old_finish: str,
+    new_finish: str,
+) -> dict[str, Any]:
+    """Run the established extractor and return only validated aggregate data."""
+    bundle_path: Path | None = None
+    try:
+        try:
+            import folketinget_candidate_extraction as candidate_extraction
+        except Exception:
+            raise PocError("candidate_extractor_import_failed") from None
+        try:
+            bundle = candidate_extraction.extract_candidates(old_manifest, new_manifest, provider)
+        except candidate_extraction.CandidateExtractionError as error:
+            raise PocError(error.category) from None
+        except Exception:
+            raise PocError("candidate_extraction_failed") from None
+        bundle_path = _write_private_candidate_bundle(bundle, runner_temp)
+        try:
+            with bundle_path.open("r", encoding="utf-8") as stored_bundle:
+                persisted_bundle = json.load(stored_bundle)
+        except Exception:
+            raise PocError("candidate_bundle_validation_failed") from None
+        if (
+            not isinstance(persisted_bundle, dict)
+            or persisted_bundle.get("format_version") != 1
+            or persisted_bundle.get("source") != "folketinget"
+            or not isinstance(persisted_bundle.get("cases"), list)
+        ):
+            raise PocError("candidate_bundle_validation_failed")
+        summary = candidate_extraction.candidate_summary(persisted_bundle)
+        diff = summary.get("diff")
+        totals = diff.get("totals") if isinstance(diff, dict) else None
+        if not isinstance(totals, dict) or set(totals) != set(snapshot_diff.CATEGORIES):
+            raise PocError("candidate_summary_invalid")
+        clean_totals: dict[str, int] = {}
+        for name in snapshot_diff.CATEGORIES:
+            value = totals[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise PocError("candidate_summary_invalid")
+            clean_totals[name] = value
+        entity_counts = diff.get("entities")
+        if not isinstance(entity_counts, dict) or set(entity_counts) != set(REQUIRED_ENTITIES):
+            raise PocError("candidate_summary_invalid")
+        clean_entity_counts: dict[str, dict[str, int]] = {}
+        for entity in REQUIRED_ENTITIES:
+            counts = entity_counts[entity]
+            if not isinstance(counts, dict) or set(counts) != set(snapshot_diff.CATEGORIES):
+                raise PocError("candidate_summary_invalid")
+            clean_counts: dict[str, int] = {}
+            for name in snapshot_diff.CATEGORIES:
+                value = counts[name]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise PocError("candidate_summary_invalid")
+                clean_counts[name] = value
+            clean_entity_counts[entity] = clean_counts
+        diagnostics = summary.get("diagnostics")
+        if not isinstance(diagnostics, list):
+            raise PocError("candidate_summary_invalid")
+        clean_diagnostics: list[dict[str, Any]] = []
+        for item in diagnostics:
+            if not isinstance(item, dict) or not re.fullmatch(r"[a-z0-9_]{1,80}", str(item.get("code", ""))):
+                raise PocError("candidate_summary_invalid")
+            count = item.get("count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise PocError("candidate_summary_invalid")
+            clean_diagnostics.append({"code": item["code"], "count": count})
+        counts = {}
+        for field in ("affected_case_count", "hydrated_case_count"):
+            value = summary.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise PocError("candidate_summary_invalid")
+            counts[field] = value
+        candidate_count = persisted_bundle.get("candidate_case_count")
+        if isinstance(candidate_count, bool) or not isinstance(candidate_count, int) or candidate_count < 0:
+            raise PocError("candidate_summary_invalid")
+        return {
+            "complete": summary.get("complete") is True,
+            "diff_totals": clean_totals,
+            "diff_entities": clean_entity_counts,
+            **counts,
+            "candidate_case_count": candidate_count,
+            "diagnostics": clean_diagnostics,
+            "old_finish": old_finish,
+            "new_finish": new_finish,
+        }
+    finally:
+        cleanup_candidate_bundle(bundle_path, runner_temp)
+
+
+def write_candidate_extraction_summary(summary: dict[str, Any]) -> None:
+    totals = summary["diff_totals"]
+    state = "PASS" if summary["complete"] else "INCOMPLETE"
+    lines = [
+        f"Snapshot candidate extraction: {state}",
+        "",
+        "Diff totals:",
+        *[f"- {name}: {totals[name]}" for name in snapshot_diff.CATEGORIES],
+        "- per entity:",
+        *[
+            f"  - {entity}: " + ", ".join(
+                f"{category}={summary['diff_entities'][entity][category]}"
+                for category in snapshot_diff.CATEGORIES
+            )
+            for entity in REQUIRED_ENTITIES
+        ],
+        f"- affected case count: {summary['affected_case_count']}",
+        f"- hydrated case count: {summary['hydrated_case_count']}",
+        f"- candidate case count: {summary['candidate_case_count']}",
+        "- diagnostics:",
+    ]
+    if summary["diagnostics"]:
+        lines.extend(f"  - {item['code']}: {item['count']}" for item in summary["diagnostics"])
+    else:
+        lines.append("  - none")
+    lines.extend([
+        f"- complete: {str(summary['complete']).lower()}",
+        f"- old backup finish: {summary['old_finish']}",
+        f"- new backup finish: {summary['new_finish']}",
+        "",
+    ])
+    text = "\n".join(lines)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as output:
+            output.write(text)
+    print(text, end="")
+
+
 def write_summary(summary: dict[str, Any]) -> None:
     entities = summary["entities"]
     primary_key_tables = sum(bool(columns) for columns in entities["primary_keys"].values())
@@ -1271,9 +1540,17 @@ def main() -> int:
     backup_dir: Path | None = None
     data_dir: Path | None = None
     download_dir: Path | None = None
+    candidate_context: dict[str, Any] | None = None
     try:
         mode = validate_mode(os.environ.get("INPUT_MODE", RESTORE_VALIDATE))
         validate_confirmation(os.environ.get("INPUT_CONFIRM_RESTORE", ""))
+        if mode == EXTRACT_SNAPSHOT_CANDIDATES:
+            candidate_context = validate_candidate_manifest_inputs(
+                Path(os.environ.get("OLD_MANIFEST_PATH", "")),
+                Path(os.environ.get("NEW_MANIFEST_PATH", "")),
+                os.environ.get("INPUT_OLD_RUN_ID", ""),
+                os.environ.get("INPUT_NEW_RUN_ID", ""),
+            )
         username = os.environ.get("ODA_BACKUP_USERNAME", "")
         credential = os.environ.get("ODA_BACKUP_PASSWORD", "")
         validate_credentials(username, credential)
@@ -1281,12 +1558,14 @@ def main() -> int:
         require_x64_ubuntu24(platform.machine(), release)
         runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
         initial_free = free_bytes(runner_temp)
-        print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
+        if mode != EXTRACT_SNAPSHOT_CANDIDATES:
+            print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
         check_free_space(initial_free, 8 * GIB)
         password = __import__("secrets").token_urlsafe(32) + "Aa1!"
         run_sql_server_setup(password)
         after_install = free_bytes(runner_temp)
-        print(f"sql_server_edition=Express 2025 free_disk_before_download_bytes={after_install}")
+        if mode != EXTRACT_SNAPSHOT_CANDIDATES:
+            print(f"sql_server_edition=Express 2025 free_disk_before_download_bytes={after_install}")
         opener = make_oda_opener(username, credential)
         content_length = request_content_length(opener)
         check_free_space(after_install, download_space_required(content_length))
@@ -1303,7 +1582,8 @@ def main() -> int:
         download = download_backup(opener, download_temp_path, content_length)
         print("progress=backup_download_complete")
         backup_size, backup_checksum, download_seconds = validate_download_metadata(download, content_length)
-        print(f"backup_bytes={backup_size} sha256={backup_checksum} download_seconds={download_seconds}")
+        if mode != EXTRACT_SNAPSHOT_CANDIDATES:
+            print(f"backup_bytes={backup_size} sha256={backup_checksum} download_seconds={download_seconds}")
         print("progress=backup_staging_copy")
         run_checked(
             ["sudo", "install", "-o", "mssql", "-g", "mssql", "-m", "0640", "--", str(download_temp_path), str(backup_path)],
@@ -1319,7 +1599,8 @@ def main() -> int:
         )
         restore_free = check_restore_disk_space(restore_parent, 1)
         validate_backup_readable_by_sql_server(backup_path, backup_size)
-        print(f"free_disk_before_restore_bytes={restore_free}")
+        if mode != EXTRACT_SNAPSHOT_CANDIDATES:
+            print(f"free_disk_before_restore_bytes={restore_free}")
         print("progress=restore_header_check")
         header_output = sqlcmd(
             f"RESTORE HEADERONLY FROM DISK = {quote_literal(str(backup_path))};",
@@ -1356,66 +1637,107 @@ def main() -> int:
         entities = validate_entities(password)
         if entities["missing"] or entities["no_primary_key"]:
             raise PocError("required_entity_validation_failed")
-        summary = {
-            "download": download,
-            "backup_size_bytes": download["file_size_bytes"],
-            "header": header_info,
-            "restored_database_size_bytes": restored_size,
-            "entities": entities,
-        }
-        if mode == VALIDATE_SQL_PROVIDER:
-            print("progress=sql_provider_validation_start")
-            provider_validation = validate_sql_provider(password, entities)
-            print("SQL provider validation: PASS")
-            print(f"entities tested: {provider_validation['entities_tested']}/{len(REQUIRED_ENTITIES)}")
-            print(f"get_by_ids checks: {provider_validation['get_by_ids_checks']}")
-            print(f"relation checks: {provider_validation['relation_checks']}")
-            print(f"normalization failures: {provider_validation['normalization_failures']}")
-        if mode == CREATE_MANIFEST_BASELINE:
-            compatibility_level = database_compatibility_level(password)
-            report_manifest_compatibility(compatibility_level)
-            validate_manifest_compatibility_level(compatibility_level)
-            print("progress=manifest_schema_discovery")
-            schemas: dict[str, dict[str, Any]] = {}
-            for entity in REQUIRED_ENTITIES:
-                schema_name, object_type = entities["objects"][entity]
-                if object_type != "USER_TABLE":
-                    raise PocError("manifest_required_entity_not_table")
-                schemas[entity] = manifest_schema(password, entity, schema_name)
-            manifest_directory = runner_temp / MANIFEST_DIRECTORY_NAME
-            if manifest_directory.exists() or manifest_directory.is_symlink():
-                raise PocError("manifest_path_exists")
+        if mode == EXTRACT_SNAPSHOT_CANDIDATES:
+            if candidate_context is None:
+                raise PocError("candidate_manifest_context_missing")
+            print("progress=candidate_schema_discovery")
             try:
-                manifest_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
-            except OSError:
-                raise PocError("manifest_directory_setup_failed") from None
-            manifest_path = manifest_directory / MANIFEST_FILENAME
-            print("progress=manifest_generation")
-            try:
-                started_entities: set[str] = set()
+                schemas: dict[str, dict[str, Any]] = {}
+                for entity in REQUIRED_ENTITIES:
+                    schema_name, object_type = entities["objects"][entity]
+                    if object_type != "USER_TABLE":
+                        raise PocError("candidate_schema_mismatch")
+                    schemas[entity] = manifest_schema(password, entity, schema_name)
+                restored_schema_fingerprint = snapshot_manifest.schema_fingerprint(schemas)
+                provider_schemas = {
+                    entity: snapshot_manifest.normalize_schema(entity, schemas[entity])
+                    for entity in REQUIRED_ENTITIES
+                }
+            except PocError:
+                raise
+            except snapshot_manifest.ManifestError:
+                raise PocError("candidate_schema_mismatch") from None
+            except Exception:
+                raise PocError("candidate_schema_mismatch") from None
+            validate_candidate_backup_identity(
+                str(download["sha256"]),
+                str(header_info["backup_finish_date"]),
+                restored_schema_fingerprint,
+                candidate_context,
+            )
+            provider = create_candidate_sql_provider(password, entities, provider_schemas)
+            print("progress=candidate_extraction_start")
+            candidate_result = run_candidate_extraction(
+                candidate_context["old_path"],
+                candidate_context["new_path"],
+                provider,
+                runner_temp,
+                candidate_context["old_finish"],
+                candidate_context["new_finish"],
+            )
+            write_candidate_extraction_summary(candidate_result)
+            print("restore_validation=PASS")
+        else:
+            summary = {
+                "download": download,
+                "backup_size_bytes": download["file_size_bytes"],
+                "header": header_info,
+                "restored_database_size_bytes": restored_size,
+                "entities": entities,
+            }
+            if mode == VALIDATE_SQL_PROVIDER:
+                print("progress=sql_provider_validation_start")
+                provider_validation = validate_sql_provider(password, entities)
+                print("SQL provider validation: PASS")
+                print(f"entities tested: {provider_validation['entities_tested']}/{len(REQUIRED_ENTITIES)}")
+                print(f"get_by_ids checks: {provider_validation['get_by_ids_checks']}")
+                print(f"relation checks: {provider_validation['relation_checks']}")
+                print(f"normalization failures: {provider_validation['normalization_failures']}")
+            if mode == CREATE_MANIFEST_BASELINE:
+                compatibility_level = database_compatibility_level(password)
+                report_manifest_compatibility(compatibility_level)
+                validate_manifest_compatibility_level(compatibility_level)
+                print("progress=manifest_schema_discovery")
+                schemas: dict[str, dict[str, Any]] = {}
+                for entity in REQUIRED_ENTITIES:
+                    schema_name, object_type = entities["objects"][entity]
+                    if object_type != "USER_TABLE":
+                        raise PocError("manifest_required_entity_not_table")
+                    schemas[entity] = manifest_schema(password, entity, schema_name)
+                manifest_directory = runner_temp / MANIFEST_DIRECTORY_NAME
+                if manifest_directory.exists() or manifest_directory.is_symlink():
+                    raise PocError("manifest_path_exists")
+                try:
+                    manifest_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+                except OSError:
+                    raise PocError("manifest_directory_setup_failed") from None
+                manifest_path = manifest_directory / MANIFEST_FILENAME
+                print("progress=manifest_generation")
+                try:
+                    started_entities: set[str] = set()
 
-                def fetch_manifest_page(entity: str, schema_name: str, schema: dict[str, Any], offset: int, limit: int) -> str:
-                    if entity not in started_entities:
-                        report_manifest_entity(entity)
-                        started_entities.add(entity)
-                    return manifest_page_json(password, entity, schema_name, schema, offset, limit)
+                    def fetch_manifest_page(entity: str, schema_name: str, schema: dict[str, Any], offset: int, limit: int) -> str:
+                        if entity not in started_entities:
+                            report_manifest_entity(entity)
+                            started_entities.add(entity)
+                        return manifest_page_json(password, entity, schema_name, schema, offset, limit)
 
-                manifest_info = snapshot_manifest.build_manifest(
-                    manifest_path,
-                    backup_sha256=str(download["sha256"]),
-                    backup_finish_date=str(header_info["backup_finish_date"]),
-                    source_sql_major=int(header_info["source_sql_major"]),
-                    schemas=schemas,
-                    expected_counts={entity: entities["counts"][entity] for entity in REQUIRED_ENTITIES},
-                    fetch_page=fetch_manifest_page,
-                )
-                manifest_info["sha256"] = snapshot_manifest.sha256_file(manifest_path)
-            except snapshot_manifest.ManifestError as exc:
-                raise PocError(exc.category) from None
-            summary["manifest"] = manifest_info
-        print("progress=summary_write")
-        write_summary(summary)
-        print("restore_validation=PASS")
+                    manifest_info = snapshot_manifest.build_manifest(
+                        manifest_path,
+                        backup_sha256=str(download["sha256"]),
+                        backup_finish_date=str(header_info["backup_finish_date"]),
+                        source_sql_major=int(header_info["source_sql_major"]),
+                        schemas=schemas,
+                        expected_counts={entity: entities["counts"][entity] for entity in REQUIRED_ENTITIES},
+                        fetch_page=fetch_manifest_page,
+                    )
+                    manifest_info["sha256"] = snapshot_manifest.sha256_file(manifest_path)
+                except snapshot_manifest.ManifestError as exc:
+                    raise PocError(exc.category) from None
+                summary["manifest"] = manifest_info
+            print("progress=summary_write")
+            write_summary(summary)
+            print("restore_validation=PASS")
     except PocError as exc:
         print(f"restore_validation=FAIL category={exc.category}", file=sys.stderr)
         return_code = 2

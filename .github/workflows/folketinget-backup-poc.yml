@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
       mode:
-        description: "Choose restore validation, SQL provider validation, manifest generation, or manifest comparison"
+        description: "Choose restore validation, SQL provider validation, manifest generation, comparison, or candidate extraction"
         required: true
         type: choice
         options:
@@ -17,13 +17,14 @@ on:
           - VALIDATE_SQL_PROVIDER
           - CREATE_MANIFEST_BASELINE
           - DIFF_MANIFESTS
+          - EXTRACT_SNAPSHOT_CANDIDATES
         default: RESTORE_VALIDATE
       old_run_id:
-        description: "Successful manual baseline run ID for the older manifest (DIFF_MANIFESTS only)"
+        description: "Successful manual baseline run ID for the older manifest (diff/extraction modes)"
         required: false
         type: string
       new_run_id:
-        description: "Successful manual baseline run ID for the newer manifest (DIFF_MANIFESTS only)"
+        description: "Successful manual baseline run ID for the newer manifest (diff/extraction modes)"
         required: false
         type: string
 
@@ -43,7 +44,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
       - name: Validate manifest run IDs and artifacts
-        if: inputs.mode == 'DIFF_MANIFESTS'
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
@@ -90,7 +91,7 @@ jobs:
             fi
           done
       - name: Download older manifest artifact
-        if: inputs.mode == 'DIFF_MANIFESTS'
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES'
         uses: actions/download-artifact@v4
         with:
           name: folketinget-snapshot-manifest-${{ inputs.old_run_id }}
@@ -99,7 +100,7 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
       - name: Download newer manifest artifact
-        if: inputs.mode == 'DIFF_MANIFESTS'
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES'
         uses: actions/download-artifact@v4
         with:
           name: folketinget-snapshot-manifest-${{ inputs.new_run_id }}
@@ -118,11 +119,27 @@ jobs:
             --new "$RUNNER_TEMP/folketinget-manifest-new" \
             | tee "$RUNNER_TEMP/folketinget-snapshot-diff.json" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Remove downloaded manifest artifacts
+        if: always() && (inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES')
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          for name in folketinget-manifest-old folketinget-manifest-new; do
+            target="$RUNNER_TEMP/$name"
+            if [ -d "$target" ] && [ ! -L "$target" ]; then
+              rm -rf -- "$target"
+            fi
+          done
       - name: Verify and restore official backup
         if: inputs.mode != 'DIFF_MANIFESTS'
         env:
           INPUT_CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
           INPUT_MODE: ${{ inputs.mode }}
+          INPUT_OLD_RUN_ID: ${{ inputs.old_run_id }}
+          INPUT_NEW_RUN_ID: ${{ inputs.new_run_id }}
+          OLD_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-old
+          NEW_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-new
           ODA_BACKUP_USERNAME: ${{ secrets.ODA_BACKUP_USERNAME }}
           ODA_BACKUP_PASSWORD: ${{ secrets.ODA_BACKUP_PASSWORD }}
           GITHUB_RUN_ID: ${{ github.run_id }}

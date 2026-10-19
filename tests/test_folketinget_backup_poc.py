@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,7 +25,233 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(POC)
 
 
+def create_candidate_manifest(
+    path: pathlib.Path, *, backup: str, finish: str, include_sag: bool,
+    extra_records: dict[str, list[tuple[str, bytes, bytes]]] | None = None,
+) -> None:
+    path.unlink(missing_ok=True)
+    entities = POC.REQUIRED_ENTITIES
+    records = {entity: [] for entity in entities}
+    if include_sag:
+        key = json.dumps(
+            {"entity": "Sag", "key": [["id", "int", 42]]},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        records["Sag"].append((key, b"f" * 32, b"s" * 32))
+    for entity, items in (extra_records or {}).items():
+        records[entity].extend(items)
+    total = sum(map(len, records.values()))
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            "CREATE TABLE snapshot_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), backup_sha256 TEXT NOT NULL, "
+            "backup_finish_date TEXT NOT NULL, source_sql_major INTEGER NOT NULL, schema_fingerprint TEXT NOT NULL, "
+            "generated_at TEXT NOT NULL, total_rows INTEGER NOT NULL);"
+            "CREATE TABLE entity_counts (entity TEXT PRIMARY KEY, row_count INTEGER NOT NULL) WITHOUT ROWID;"
+            'CREATE TABLE "rows" (entity TEXT NOT NULL, canonical_key TEXT NOT NULL, full_hash BLOB NOT NULL CHECK(length(full_hash)=32), '
+            "semantic_hash BLOB NOT NULL CHECK(length(semantic_hash)=32), PRIMARY KEY(entity, canonical_key)) WITHOUT ROWID;"
+        )
+        db.execute(
+            "INSERT INTO snapshot_metadata VALUES (1, ?, ?, 17, ?, ?, ?)",
+            (backup * 64, finish, "a" * 64, "2026-10-19T00:00:00Z", total),
+        )
+        for entity in entities:
+            db.execute("INSERT INTO entity_counts VALUES (?, ?)", (entity, len(records[entity])))
+            db.executemany('INSERT INTO "rows" VALUES (?, ?, ?, ?)',
+                           ((entity, key, full, semantic) for key, full, semantic in records[entity]))
+
+
 class BackupPocSafetyTests(unittest.TestCase):
+    def test_candidate_orchestration_handles_zero_diff_added_sag_and_changed_child(self) -> None:
+        from folketinget_candidate_extraction import InMemoryFolketingetProvider
+
+        stamp = "2026-10-19T02:00:00Z"
+        sag_row = {
+            "id": 42, "nummer": "L 42", "titel": "PRIVATE TITLE", "typeid": None,
+            "kategoriid": None, "statusid": None, "opdateringsdato": stamp,
+            "retsinformationsurl": None,
+        }
+        stage_row = {
+            "id": 57, "sagid": 42, "titel": "Private stage", "dato": None,
+            "typeid": None, "statusid": None, "opdateringsdato": stamp,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            old, new = root / "old.sqlite", root / "new.sqlite"
+            create_candidate_manifest(old, backup="1", finish=stamp, include_sag=False)
+            create_candidate_manifest(new, backup="1", finish=stamp, include_sag=False)
+            zero = POC.run_candidate_extraction(
+                old, new, InMemoryFolketingetProvider({}), root, stamp, stamp
+            )
+            self.assertTrue(zero["complete"])
+            self.assertEqual(zero["candidate_case_count"], 0)
+            self.assertTrue(all(value == 0 for value in zero["diff_totals"].values()))
+
+            # Distinct run IDs may reference the same source snapshot; this must be a valid zero diff.
+            zero_context = POC.validate_candidate_manifest_inputs(old, new, "39225908640", "39231934823")
+            self.assertEqual(zero_context["report"]["totals"]["added"], 0)
+
+            create_candidate_manifest(old, backup="1", finish="2026-10-18T02:00:00Z", include_sag=False)
+            create_candidate_manifest(new, backup="2", finish=stamp, include_sag=True)
+            added = POC.run_candidate_extraction(
+                old, new, InMemoryFolketingetProvider({"Sag": [sag_row]}), root,
+                "2026-10-18T02:00:00Z", stamp,
+            )
+            self.assertTrue(added["complete"])
+            self.assertEqual((added["affected_case_count"], added["hydrated_case_count"], added["candidate_case_count"]), (1, 1, 1))
+            output = StringIO()
+            with redirect_stdout(output):
+                POC.write_candidate_extraction_summary(added)
+            self.assertIn("added: 1", output.getvalue())
+            self.assertNotIn("PRIVATE TITLE", output.getvalue())
+            self.assertNotIn("42", output.getvalue())
+
+            key = json.dumps({"entity": "Sagstrin", "key": [["id", "int", 57]]}, sort_keys=True, separators=(",", ":"))
+            create_candidate_manifest(old, backup="1", finish="2026-10-18T02:00:00Z", include_sag=False)
+            create_candidate_manifest(
+                new, backup="2", finish=stamp, include_sag=False,
+                extra_records={"Sagstrin": [(key, b"f" * 32, b"s" * 32)]},
+            )
+            child = POC.run_candidate_extraction(
+                old, new, InMemoryFolketingetProvider({"Sag": [sag_row], "Sagstrin": [stage_row]}), root,
+                "2026-10-18T02:00:00Z", stamp,
+            )
+            self.assertTrue(child["complete"])
+            self.assertEqual(child["candidate_case_count"], 1)
+
+    def test_candidate_extractor_and_provider_failures_remain_safe(self) -> None:
+        from folketinget_candidate_extraction import InMemoryFolketingetProvider
+
+        stamp = "2026-10-19T02:00:00Z"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            old, new = root / "old.sqlite", root / "new.sqlite"
+            create_candidate_manifest(old, backup="1", finish="2026-10-18T02:00:00Z", include_sag=False)
+            create_candidate_manifest(new, backup="2", finish=stamp, include_sag=False,
+                                      extra_records={"Sag": [("PRIVATE KEY", b"f" * 32, b"s" * 32)]})
+            with self.assertRaises(POC.PocError) as raised:
+                POC.run_candidate_extraction(old, new, InMemoryFolketingetProvider({}), root, "old", stamp)
+            self.assertEqual(raised.exception.category, "canonical_key_invalid")
+            self.assertNotIn("PRIVATE KEY", str(raised.exception))
+
+            key = json.dumps({"entity": "Sag", "key": [["id", "int", 42]]}, sort_keys=True, separators=(",", ":"))
+            create_candidate_manifest(new, backup="2", finish=stamp, include_sag=True)
+
+            class FailingProvider:
+                def get_by_ids(self, entity, ids):
+                    raise RuntimeError("SECRET PRIVATE TITLE row=42")
+                def find_by_field(self, entity, field, values):
+                    raise RuntimeError("SECRET PRIVATE TITLE row=42")
+
+            result = POC.run_candidate_extraction(old, new, FailingProvider(), root, "old", stamp)
+            self.assertFalse(result["complete"])
+            output = json.dumps(result)
+            for private in ("SECRET", "PRIVATE TITLE", "row=42", key):
+                self.assertNotIn(private, output)
+            self.assertIn({"code": "source_lookup_failed", "count": 1}, result["diagnostics"])
+
+    def test_candidate_manifest_preflight_checks_identity_structure_and_chronology(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            old = root / "old"; old.mkdir()
+            new = root / "new"; new.mkdir()
+            create_candidate_manifest(old / "manifest.sqlite", backup="1", finish="2026-10-18T02:00:00Z", include_sag=False)
+            create_candidate_manifest(new / "manifest.sqlite", backup="2", finish="2026-10-19T02:00:00Z", include_sag=True)
+            context = POC.validate_candidate_manifest_inputs(old, new, "100", "101")
+            self.assertEqual(context["report"]["totals"]["added"], 1)
+            self.assertEqual(context["old_finish"], "2026-10-18T02:00:00Z")
+            # Run IDs identify artifacts; manifest finish timestamps determine source chronology.
+            self.assertEqual(
+                POC.validate_candidate_manifest_inputs(old, new, "999", "100")["new_finish"],
+                "2026-10-19T02:00:00Z",
+            )
+            with self.assertRaises(POC.PocError) as raised:
+                POC.validate_candidate_manifest_inputs(old, new, "100", "100")
+            self.assertEqual(raised.exception.category, "workflow_run_ids_must_differ")
+
+    def test_candidate_backup_must_match_new_manifest_sha_finish_and_schema(self) -> None:
+        context = {"report": {"new": {"backup_sha256": "b" * 64, "backup_finish_date": "finish"},
+                              "schema_fingerprint": "c" * 64}}
+        POC.validate_candidate_backup_identity("b" * 64, "finish", "c" * 64, context)
+        for sha, finish, schema, category in (
+            ("d" * 64, "finish", "c" * 64, "candidate_backup_sha_mismatch"),
+            ("b" * 64, "other", "c" * 64, "candidate_backup_finish_mismatch"),
+            ("b" * 64, "finish", "d" * 64, "candidate_schema_mismatch"),
+        ):
+            with self.subTest(category=category), self.assertRaises(POC.PocError) as raised:
+                POC.validate_candidate_backup_identity(sha, finish, schema, context)
+            self.assertEqual(raised.exception.category, category)
+
+    def test_candidate_provider_uses_normalized_primary_key_metadata(self) -> None:
+        from folketinget_sql_provider import PROJECTIONS, SQLServerFolketingetProvider
+
+        entities = {"objects": {entity: ("dbo", "USER_TABLE") for entity in POC.REQUIRED_ENTITIES}}
+        schemas = {
+            entity: {
+                "primary_key": ["id"],
+                "columns": [{"name": field, "type_name": "int"} for field in PROJECTIONS[entity]],
+            }
+            for entity in POC.REQUIRED_ENTITIES
+        }
+        provider = POC.create_candidate_sql_provider("private", entities, schemas)
+        self.assertIsInstance(provider, SQLServerFolketingetProvider)
+        with self.assertRaises(POC.PocError) as raised:
+            POC.create_candidate_sql_provider(
+                "private", entities,
+                {entity: {"schema_name": "dbo", "columns": schemas[entity]["columns"]}
+                 for entity in POC.REQUIRED_ENTITIES},
+            )
+        self.assertEqual(raised.exception.category, "candidate_provider_schema_invalid")
+
+    def test_candidate_bundle_is_private_temporary_and_removed_after_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            old, new = root / "old.sqlite", root / "new.sqlite"
+            create_candidate_manifest(old, backup="1", finish="2026-10-18T02:00:00Z", include_sag=False)
+            create_candidate_manifest(new, backup="2", finish="2026-10-19T02:00:00Z", include_sag=True)
+            provider = SimpleNamespace()
+            # The extraction result is synthetic and deliberately contains private content;
+            # only its aggregate summary may leave this helper.
+            fake_bundle = {
+                "format_version": 1,
+                "source": "folketinget",
+                "candidate_case_count": 1,
+                "cases": [{"titel": "PRIVATE TITLE", "external_id": "private-id"}],
+                "complete": True,
+                "diagnostics": [],
+                "diff": {
+                    "entities": {entity: dict.fromkeys(POC.snapshot_diff.CATEGORIES, 0)
+                                 for entity in POC.REQUIRED_ENTITIES},
+                    "totals": dict.fromkeys(POC.snapshot_diff.CATEGORIES, 0),
+                },
+                "_summary": {"affected_case_count": 1, "hydrated_case_count": 1},
+            }
+            fake_bundle["diff"]["totals"]["added"] = 1
+            temp_files_before = set(root.iterdir())
+            with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=fake_bundle):
+                summary = POC.run_candidate_extraction(
+                    old, new, provider, root, "old-finish", "new-finish"
+                )
+            self.assertEqual(set(root.iterdir()), temp_files_before)
+            rendered = json.dumps(summary)
+            self.assertNotIn("PRIVATE TITLE", rendered)
+            self.assertNotIn("private-id", rendered)
+            self.assertEqual(summary["candidate_case_count"], 1)
+
+    def test_candidate_workflow_is_manual_and_does_not_publish_candidate_bundle(self) -> None:
+        workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
+        self.assertIn("- EXTRACT_SNAPSHOT_CANDIDATES", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertIn("inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES'", workflow)
+        self.assertIn("OLD_MANIFEST_PATH:", workflow)
+        self.assertIn("NEW_MANIFEST_PATH:", workflow)
+        self.assertIn("INPUT_OLD_RUN_ID:", workflow)
+        self.assertIn("INPUT_NEW_RUN_ID:", workflow)
+        self.assertIn("if: inputs.mode != 'DIFF_MANIFESTS'", workflow)
+        self.assertNotIn("candidate-bundle", workflow)
+        self.assertNotIn("EXTRACT_SNAPSHOT_CANDIDATES\n        uses: actions/upload-artifact", workflow)
+        self.assertIn("if: success() && inputs.mode == 'CREATE_MANIFEST_BASELINE'", workflow)
+
     def test_repository_imports_work_from_repository_and_external_cwd(self) -> None:
         script_path = ROOT / "tools" / "folketinget_backup_poc.py"
         code = f"""
