@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -22,6 +24,41 @@ SPEC.loader.exec_module(POC)
 
 
 class BackupPocSafetyTests(unittest.TestCase):
+    def test_repository_imports_work_from_repository_and_external_cwd(self) -> None:
+        script_path = ROOT / "tools" / "folketinget_backup_poc.py"
+        code = f"""
+import importlib.util
+import sys
+script = {str(script_path)!r}
+spec = importlib.util.spec_from_file_location('isolated_backup_poc', script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module.REPOSITORY_ROOT == {str(ROOT)!r}
+assert sys.path.count(module.REPOSITORY_ROOT) == 1
+from collectors.folketinget_models import normalize_many
+assert callable(normalize_many)
+try:
+    module.exercise_sql_provider(None, {{}})
+except module.PocError as error:
+    assert error.category == 'sql_provider_sample_validation_failed'
+else:
+    raise AssertionError('invalid smoke fixture unexpectedly passed')
+"""
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        with tempfile.TemporaryDirectory() as external_directory:
+            for working_directory in (ROOT, pathlib.Path(external_directory)):
+                with self.subTest(working_directory=str(working_directory)):
+                    result = subprocess.run(
+                        [sys.executable, "-c", code],
+                        cwd=working_directory,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, msg="isolated import probe failed")
+
     def test_confirmation_must_be_exact_true(self) -> None:
         for value in ("", "false", "TRUE", "yes"):
             with self.subTest(value=value), self.assertRaises(POC.PocError):

@@ -24,6 +24,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+REPOSITORY_ROOT = str(Path(__file__).resolve().parents[1])
+if REPOSITORY_ROOT not in sys.path:
+    sys.path.insert(0, REPOSITORY_ROOT)
 TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
 if TOOLS_DIRECTORY not in sys.path:
     sys.path.insert(0, TOOLS_DIRECTORY)
