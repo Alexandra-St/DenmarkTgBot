@@ -103,6 +103,72 @@ async function sqlWithoutRestart(sql: string): Promise<any[]> {
   return Array.isArray(parsed) ? parsed.map((item) => item.results ?? []) : parsed.results ?? [];
 }
 
+function sqlText(value: string): string {
+  return "'" + value.replaceAll("'", "''") + "'";
+}
+
+function testSnapshot(backup_sha256: string, backup_finish_date: string, schema_fingerprint = "a".repeat(64)) {
+  return { backup_sha256, backup_finish_date, schema_fingerprint };
+}
+
+async function seedSnapshotTestSource(sourceId: number): Promise<string> {
+  const now = "2026-10-19T00:00:00.000Z";
+  const baselineRunId = `00000000-0000-4000-8000-${String(sourceId).padStart(12, "0")}`;
+  await query(
+    `INSERT INTO sources (id, code, name, base_url, created_at, updated_at) VALUES (${sourceId}, ${sqlText("snapshot-test-" + sourceId)}, 'Local snapshot test', 'https://example.invalid/', ${sqlText(now)}, ${sqlText(now)});` +
+    `INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at, completed_at) VALUES (${sqlText(baselineRunId)}, ${sourceId}, 'historical', 1, 1, 'COMMITTED', '{}', '{}', 'local-test', ${sqlText(now)}, ${sqlText(now)}, ${sqlText(now)});` +
+    `INSERT INTO source_ingestion_baselines (source_id, baseline_run_id, initialized_at) VALUES (${sourceId}, ${sqlText(baselineRunId)}, ${sqlText(now)});`,
+  );
+  return baselineRunId;
+}
+
+async function createSnapshotRun(
+  sourceId: number,
+  runId: string,
+  base: ReturnType<typeof testSnapshot> | null,
+  target: ReturnType<typeof testSnapshot>,
+  stateKind = "snapshot",
+): Promise<void> {
+  const now = "2026-10-19T00:00:01.000Z";
+  const baseJson = stateKind === "snapshot" && base !== null ? sqlText(JSON.stringify(base)) : "NULL";
+  const targetJson = stateKind === "snapshot" ? sqlText(JSON.stringify(target)) : "NULL";
+  const mode = stateKind === "snapshot" && base === null ? "historical" : "incremental";
+  await query(
+    `INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at, state_kind, base_snapshot_json, target_snapshot_json) VALUES (${sqlText(runId)}, ${sourceId}, ${sqlText(mode)}, 1, 1, 'COMMITTING', '{}', '{}', 'local-test', ${sqlText(now)}, ${sqlText(now)}, ${sqlText(stateKind)}, ${baseJson}, ${targetJson});`,
+  );
+}
+
+async function addSnapshotBatch(runId: string): Promise<void> {
+  await query(`INSERT INTO ingestion_batches (run_id, batch_index, payload_hash, record_count, accepted_at) VALUES (${sqlText(runId)}, 0, 'local-test', 0, '2026-10-19T00:00:02.000Z')`);
+}
+
+async function insertSnapshotState(sourceId: number, runId: string, snapshot: ReturnType<typeof testSnapshot>, generation = 1): Promise<void> {
+  await query(
+    `INSERT INTO source_snapshot_states (source_id, backup_sha256, backup_finish_date, schema_fingerprint, generation, last_run_id, initialized_at, updated_at) VALUES (${sourceId}, ${sqlText(snapshot.backup_sha256)}, ${sqlText(snapshot.backup_finish_date)}, ${sqlText(snapshot.schema_fingerprint)}, ${generation}, ${sqlText(runId)}, '2026-10-19T00:00:03.000Z', '2026-10-19T00:00:03.000Z')`,
+  );
+}
+
+async function seedCommittedSnapshotState(
+  sourceId: number,
+  baselineRunId: string,
+  runId: string,
+  snapshot: ReturnType<typeof testSnapshot>,
+): Promise<void> {
+  await query(
+    `INSERT INTO sources (id, code, name, base_url, created_at, updated_at) VALUES (${sourceId}, ${sqlText("snapshot-test-" + sourceId)}, 'Local snapshot test', 'https://example.invalid/', '2026-10-19T00:00:00.000Z', '2026-10-19T00:00:00.000Z');` +
+    `INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at, completed_at) VALUES (${sqlText(baselineRunId)}, ${sourceId}, 'historical', 1, 1, 'COMMITTED', '{}', '{}', 'local-test', '2026-10-19T00:00:00.000Z', '2026-10-19T00:00:00.000Z', '2026-10-19T00:00:00.000Z');` +
+    `INSERT INTO source_ingestion_baselines (source_id, baseline_run_id, initialized_at) VALUES (${sourceId}, ${sqlText(baselineRunId)}, '2026-10-19T00:00:00.000Z');` +
+    `INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at, state_kind, base_snapshot_json, target_snapshot_json) VALUES (${sqlText(runId)}, ${sourceId}, 'historical', 1, 1, 'COMMITTING', '{}', '{}', 'local-test', '2026-10-19T00:00:01.000Z', '2026-10-19T00:00:01.000Z', 'snapshot', NULL, ${sqlText(JSON.stringify(snapshot))});` +
+    `INSERT INTO ingestion_batches (run_id, batch_index, payload_hash, record_count, accepted_at) VALUES (${sqlText(runId)}, 0, 'local-test', 0, '2026-10-19T00:00:02.000Z');` +
+    `INSERT INTO source_snapshot_states (source_id, backup_sha256, backup_finish_date, schema_fingerprint, generation, last_run_id, initialized_at, updated_at) VALUES (${sourceId}, ${sqlText(snapshot.backup_sha256)}, ${sqlText(snapshot.backup_finish_date)}, ${sqlText(snapshot.schema_fingerprint)}, 1, ${sqlText(runId)}, '2026-10-19T00:00:03.000Z', '2026-10-19T00:00:03.000Z');` +
+    `UPDATE ingestion_runs SET status='COMMITTED', completed_at='2026-10-19T00:00:04.000Z' WHERE run_id=${sqlText(runId)};`,
+  );
+}
+
+async function expectLocalSqlFailure(sql: string): Promise<void> {
+  await assert.rejects(query(sql));
+}
+
 before(async () => {
   persistPath = await mkdtemp(join(tmpdir(), "denmarktgbot-d1-"));
   const cwd = new URL("..", import.meta.url).pathname;
@@ -162,6 +228,8 @@ test("internal routes authenticate before reading state; reject invalid JSON and
 test("valid writes persist once; batch retry and identical reingestion do not duplicate events or modify timestamps", async () => {
   const run = "00000000-0000-4000-8000-000000000001";
   assert.equal((await start(run)).status, 201);
+  const runStateKind = await query("SELECT state_kind, base_snapshot_json, target_snapshot_json, snapshot_state_writes FROM ingestion_runs WHERE run_id='00000000-0000-4000-8000-000000000001'");
+  assert.deepEqual(runStateKind[0], { state_kind: "checkpoint", base_snapshot_json: null, target_snapshot_json: null, snapshot_state_writes: 0 });
   const first = await batch(run, [publication()]);
   assert.equal(first.status, 201);
   assert.equal((await batch(run, [publication()])).body.idempotent, true);
@@ -492,5 +560,93 @@ test("local D1 stores deduplicated snapshots, event transitions and notification
   assert.equal(checkpoints.length, 8);
   const folketingetSag = checkpoints.find((row) => row.source_id === 1 && row.stream_key === "Sag");
   assert.deepEqual(JSON.parse(folketingetSag?.checkpoint), { timestamp: "2026-10-16T10:11:12.1234567", id: 45 });
+});
+
+test("snapshot-state D1 triggers enforce initial insert, CAS progression, strategy separation, and finalization", async () => {
+  const initial = testSnapshot("1".repeat(64), "2026-10-19 02:01:05.000");
+  const next = testSnapshot("2".repeat(64), "2026-10-20 02:01:05.000");
+  const validSourceId = 100;
+  await seedSnapshotTestSource(validSourceId);
+
+  const initialRun = "00000000-0000-4000-8000-000000000101";
+  await createSnapshotRun(validSourceId, initialRun, null, initial);
+  await insertSnapshotState(validSourceId, initialRun, initial);
+  await addSnapshotBatch(initialRun);
+  await query(`UPDATE ingestion_runs SET status='COMMITTED', completed_at='2026-10-19T00:01:00.000Z' WHERE run_id=${sqlText(initialRun)}`);
+
+  const progressionRun = "00000000-0000-4000-8000-000000000102";
+  await createSnapshotRun(validSourceId, progressionRun, initial, next);
+  await query(
+    `UPDATE source_snapshot_states SET backup_sha256=${sqlText(next.backup_sha256)}, backup_finish_date=${sqlText(next.backup_finish_date)}, schema_fingerprint=${sqlText(next.schema_fingerprint)}, generation=2, last_run_id=${sqlText(progressionRun)}, updated_at='2026-10-20T00:00:00.000Z' WHERE source_id=${validSourceId}`,
+  );
+  await addSnapshotBatch(progressionRun);
+  await query(`UPDATE ingestion_runs SET status='COMMITTED', completed_at='2026-10-20T00:01:00.000Z' WHERE run_id=${sqlText(progressionRun)}`);
+  const saved = await query(`SELECT backup_sha256, backup_finish_date, generation, last_run_id FROM source_snapshot_states WHERE source_id=${validSourceId}`);
+  assert.deepEqual(saved[0], {
+    backup_sha256: next.backup_sha256,
+    backup_finish_date: next.backup_finish_date,
+    generation: 2,
+    last_run_id: progressionRun,
+  });
+  const writes = await query(`SELECT snapshot_state_writes FROM ingestion_runs WHERE run_id=${sqlText(progressionRun)}`);
+  assert.equal(writes[0].snapshot_state_writes, 1);
+
+  const rejectedUpdate = async (
+    sourceId: number,
+    base: ReturnType<typeof testSnapshot>,
+    target: ReturnType<typeof testSnapshot>,
+    attempted: ReturnType<typeof testSnapshot>,
+    generation: number,
+    lastRunId?: string,
+  ) => {
+    const baselineRun = `00000000-0000-4000-8000-${String(sourceId).padStart(12, "0")}`;
+    const committedRun = `00000000-0000-4000-8000-${String(sourceId + 1000).padStart(12, "0")}`;
+    await seedCommittedSnapshotState(sourceId, baselineRun, committedRun, initial);
+    const runId = `00000000-0000-4000-8000-${String(sourceId + 2000).padStart(12, "0")}`;
+    await createSnapshotRun(sourceId, runId, base, target);
+    const usedRunId = lastRunId ?? runId;
+    await expectLocalSqlFailure(
+      `UPDATE source_snapshot_states SET backup_sha256=${sqlText(attempted.backup_sha256)}, backup_finish_date=${sqlText(attempted.backup_finish_date)}, schema_fingerprint=${sqlText(attempted.schema_fingerprint)}, generation=${generation}, last_run_id=${sqlText(usedRunId)}, updated_at='2026-10-21T00:00:00.000Z' WHERE source_id=${sourceId}`,
+    );
+  };
+
+  const stale = testSnapshot("f".repeat(64), "2026-10-19 02:01:05.000");
+  await rejectedUpdate(110, stale, next, next, 2);
+  await rejectedUpdate(111, initial, next, testSnapshot("3".repeat(64), "2026-10-20 02:01:05.000"), 2);
+  await rejectedUpdate(112, initial, next, next, 3);
+  const wrongRunBaseline = "00000000-0000-4000-8000-000000001113";
+  await rejectedUpdate(113, initial, next, next, 2, wrongRunBaseline);
+
+  const snapshotCheckpointSource = 114;
+  await seedSnapshotTestSource(snapshotCheckpointSource);
+  const snapshotRun = `00000000-0000-4000-8000-${String(snapshotCheckpointSource + 3000).padStart(12, "0")}`;
+  await createSnapshotRun(snapshotCheckpointSource, snapshotRun, null, initial);
+  await expectLocalSqlFailure(
+    `INSERT INTO source_states (source_id, stream_key, last_success_at, checkpoint, updated_at) VALUES (${snapshotCheckpointSource}, 'snapshot-must-not-write', NULL, NULL, '2026-10-19T00:00:00.000Z')`,
+  );
+
+  const checkpointSource = 115;
+  await seedSnapshotTestSource(checkpointSource);
+  const checkpointRun = `00000000-0000-4000-8000-${String(checkpointSource + 3000).padStart(12, "0")}`;
+  await createSnapshotRun(checkpointSource, checkpointRun, null, initial, "checkpoint");
+  await expectLocalSqlFailure(
+    `INSERT INTO source_snapshot_states (source_id, backup_sha256, backup_finish_date, schema_fingerprint, generation, last_run_id, initialized_at, updated_at) VALUES (${checkpointSource}, ${sqlText(initial.backup_sha256)}, ${sqlText(initial.backup_finish_date)}, ${sqlText(initial.schema_fingerprint)}, 1, ${sqlText(checkpointRun)}, '2026-10-19T00:00:00.000Z', '2026-10-19T00:00:00.000Z')`,
+  );
+
+  const missingWriteSource = 116;
+  await seedSnapshotTestSource(missingWriteSource);
+  const missingWriteRun = `00000000-0000-4000-8000-${String(missingWriteSource + 3000).padStart(12, "0")}`;
+  await createSnapshotRun(missingWriteSource, missingWriteRun, null, initial);
+  await addSnapshotBatch(missingWriteRun);
+  await expectLocalSqlFailure(`UPDATE ingestion_runs SET status='COMMITTED' WHERE run_id=${sqlText(missingWriteRun)}`);
+
+  const multipleWriteSource = 117;
+  await seedSnapshotTestSource(multipleWriteSource);
+  const multipleWriteRun = `00000000-0000-4000-8000-${String(multipleWriteSource + 3000).padStart(12, "0")}`;
+  await createSnapshotRun(multipleWriteSource, multipleWriteRun, null, initial);
+  await insertSnapshotState(multipleWriteSource, multipleWriteRun, initial);
+  await addSnapshotBatch(multipleWriteRun);
+  await query(`UPDATE ingestion_runs SET snapshot_state_writes=2 WHERE run_id=${sqlText(multipleWriteRun)}`);
+  await expectLocalSqlFailure(`UPDATE ingestion_runs SET status='COMMITTED' WHERE run_id=${sqlText(multipleWriteRun)}`);
 });
 
