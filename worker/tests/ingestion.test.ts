@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import { after, before, test } from "node:test";
@@ -34,6 +35,11 @@ function cursors(id: number): Record<string, unknown> {
   return Object.fromEntries(["Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"].map((name) => [
     name, { timestamp: "2026-10-16T10:11:12.1234567", id },
   ]));
+}
+function canonicalTest(value: any): string {
+  if (Array.isArray(value)) return "[" + value.map(canonicalTest).join(",") + "]";
+  if (value && typeof value === "object") return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonicalTest(value[key])).join(",") + "}";
+  return JSON.stringify(value) ?? "null";
 }
 function publication(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const title = overrides.title ?? "Forslag om Ukrainesærloven";
@@ -228,8 +234,13 @@ test("internal routes authenticate before reading state; reject invalid JSON and
 test("valid writes persist once; batch retry and identical reingestion do not duplicate events or modify timestamps", async () => {
   const run = "00000000-0000-4000-8000-000000000001";
   assert.equal((await start(run)).status, 201);
+  const expectedLegacyHash = createHash("sha256").update(canonicalTest({
+    run_id: run, source: "folketinget", mode: "incremental", expected_batches: 1,
+    collection_complete: true, proposed_checkpoints: cursors(1),
+  })).digest("hex");
   const runStateKind = await query("SELECT state_kind, base_snapshot_json, target_snapshot_json, snapshot_state_writes FROM ingestion_runs WHERE run_id='00000000-0000-4000-8000-000000000001'");
   assert.deepEqual(runStateKind[0], { state_kind: "checkpoint", base_snapshot_json: null, target_snapshot_json: null, snapshot_state_writes: 0 });
+  assert.equal((await query("SELECT start_request_hash FROM ingestion_runs WHERE run_id='00000000-0000-4000-8000-000000000001'"))[0]?.start_request_hash, expectedLegacyHash);
   const first = await batch(run, [publication()]);
   assert.equal(first.status, 201);
   assert.equal((await batch(run, [publication()])).body.idempotent, true);
@@ -648,5 +659,115 @@ test("snapshot-state D1 triggers enforce initial insert, CAS progression, strate
   await addSnapshotBatch(multipleWriteRun);
   await query(`UPDATE ingestion_runs SET snapshot_state_writes=2 WHERE run_id=${sqlText(multipleWriteRun)}`);
   await expectLocalSqlFailure(`UPDATE ingestion_runs SET status='COMMITTED' WHERE run_id=${sqlText(multipleWriteRun)}`);
+});
+
+test("snapshot ingestion API initializes, progresses, retries, and never advances OData checkpoints", async () => {
+  const now = "2026-10-19T00:00:00.000Z";
+  // Run last in this suite: temporarily bind the public Folketinget source code to a fresh local source.
+  await query(
+    `UPDATE sources SET code='folketinget-legacy-test' WHERE code='folketinget';` +
+    `INSERT INTO sources (id, code, name, base_url, created_at, updated_at) VALUES (3, 'folketinget', 'Local snapshot API test', 'https://oda.ft.dk/', ${sqlText(now)}, ${sqlText(now)});`,
+  );
+  const initial = testSnapshot("1".repeat(64), "2026-10-19 02:01:05.000");
+  const next = testSnapshot("2".repeat(64), "2026-10-20 02:01:05.000");
+  const third = testSnapshot("3".repeat(64), "2026-10-21 02:01:05.000");
+  const snapshotStart = (runId: string, mode: "historical" | "incremental", base: unknown, target: unknown, extra: Record<string, unknown> = {}) => request("/internal/ingest", "POST", {
+    action: "start", run_id: runId, source: "folketinget", mode, state_kind: "snapshot",
+    expected_batches: 1, collection_complete: true, base_snapshot: base, target_snapshot: target, ...extra,
+  });
+
+  assert.equal((await query("SELECT COUNT(*) AS count FROM source_ingestion_baselines WHERE source_id=3"))[0]?.count, 0);
+  const historicalRun = "00000000-0000-4000-8000-000000000141";
+  const started = await snapshotStart(historicalRun, "historical", null, initial);
+  assert.equal(started.status, 201);
+  assert.equal(started.body.state_kind, "snapshot");
+  assert.equal((await query("SELECT COUNT(*) AS count FROM source_snapshot_states WHERE source_id=3"))[0]?.count, 0);
+  assert.equal((await snapshotStart(historicalRun, "historical", null, initial)).body.idempotent, true);
+  assert.equal((await snapshotStart(historicalRun, "historical", null, next)).body.error, "run_id_conflict");
+  assert.equal((await snapshotStart("00000000-0000-4000-8000-000000000142", "historical", null, initial, { proposed_checkpoints: {} })).body.error, "snapshot_checkpoints_not_allowed");
+  assert.equal((await request("/internal/ingest", "POST", {
+    action: "start", run_id: "00000000-0000-4000-8000-000000000143", source: "hoeringsportalen", mode: "historical",
+    state_kind: "snapshot", expected_batches: 1, collection_complete: true, base_snapshot: null, target_snapshot: initial,
+  })).body.error, "snapshot_source_unsupported");
+  assert.equal((await snapshotStart("00000000-0000-4000-8000-000000000144", "historical", initial, initial)).body.error, "snapshot_base_must_be_null");
+  assert.equal((await snapshotStart("00000000-0000-4000-8000-000000000145", "historical", null, { ...initial, backup_sha256: "invalid" })).body.error, "snapshot_identity_invalid");
+
+  const sourceStatesBefore = await query("SELECT COUNT(*) AS count FROM source_states WHERE source_id=3");
+  assert.equal(sourceStatesBefore[0]?.count, 0);
+  assert.equal((await batch(historicalRun, [])).status, 201);
+  const historicalCommit = await commit(historicalRun);
+  assert.deepEqual({ status: historicalCommit.body.status, checkpoints_advanced: historicalCommit.body.checkpoints_advanced, snapshot_advanced: historicalCommit.body.snapshot_advanced, generation: historicalCommit.body.snapshot_generation }, {
+    status: "COMMITTED", checkpoints_advanced: false, snapshot_advanced: true, generation: 1,
+  });
+  assert.equal((await commit(historicalRun)).body.snapshot_advanced, true);
+  assert.equal((await commit(historicalRun)).body.snapshot_generation, 1);
+  assert.equal((await query("SELECT baseline_run_id FROM source_ingestion_baselines WHERE source_id=3"))[0]?.baseline_run_id, historicalRun);
+  assert.deepEqual((await query("SELECT generation, last_run_id FROM source_snapshot_states WHERE source_id=3"))[0], { generation: 1, last_run_id: historicalRun });
+  assert.equal((await query("SELECT COUNT(*) AS count FROM source_states WHERE source_id=3"))[0]?.count, 0);
+
+  const incrementalRun = "00000000-0000-4000-8000-000000000146";
+  assert.equal((await snapshotStart(incrementalRun, "incremental", initial, next)).status, 201);
+  const invalidSnapshotRecord = publication({ historical: true, external_id: "42" });
+  assert.equal((await batch(incrementalRun, [invalidSnapshotRecord])).body.error, "invalid_historical_flag");
+  assert.equal((await batch(incrementalRun, [publication({ external_id: "43" })])).status, 201);
+  const incrementalCommit = await commit(incrementalRun);
+  assert.deepEqual({ status: incrementalCommit.body.status, checkpoints_advanced: incrementalCommit.body.checkpoints_advanced, snapshot_advanced: incrementalCommit.body.snapshot_advanced, generation: incrementalCommit.body.snapshot_generation }, {
+    status: "COMMITTED", checkpoints_advanced: false, snapshot_advanced: true, generation: 2,
+  });
+  assert.equal((await query("SELECT historical FROM publications WHERE source_id=3 AND external_id='43'"))[0]?.historical, 0);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM source_states WHERE source_id=3"))[0]?.count, 0);
+  assert.equal((await snapshotStart(incrementalRun, "incremental", initial, next)).body.idempotent, true);
+  const oldCommitRetry = await commit(historicalRun);
+  assert.equal(oldCommitRetry.body.snapshot_advanced, true);
+  assert.equal(oldCommitRetry.body.snapshot_generation, 1);
+
+  const failedStarts: Array<[string, unknown, unknown, string]> = [
+    ["00000000-0000-4000-8000-000000000147", initial, next, "snapshot_base_stale"],
+    ["00000000-0000-4000-8000-000000000148", next, initial, "snapshot_regression"],
+    ["00000000-0000-4000-8000-000000000149", next, { ...next, backup_sha256: "4".repeat(64) }, "snapshot_identity_conflict"],
+    ["00000000-0000-4000-8000-000000000150", next, { ...third, schema_fingerprint: "b".repeat(64) }, "snapshot_schema_changed"],
+    ["00000000-0000-4000-8000-000000000151", next, next, "snapshot_already_current"],
+  ];
+  for (const [runId, base, target, code] of failedStarts) assert.equal((await snapshotStart(runId, "incremental", base, target)).body.error, code);
+  assert.equal((await snapshotStart("00000000-0000-4000-8000-000000000152", "incremental", null, third)).body.error, "snapshot_base_required");
+
+  const incompleteRun = "00000000-0000-4000-8000-000000000153";
+  assert.equal((await snapshotStart(incompleteRun, "incremental", next, third)).status, 201);
+  assert.equal((await batch(incompleteRun, [publication({ external_id: "45", complete: false })])).status, 201);
+  const blocked = await commit(incompleteRun);
+  assert.equal(blocked.body.status, "BLOCKED");
+  assert.equal(blocked.body.snapshot_advanced, false);
+  assert.deepEqual((await query("SELECT generation, backup_sha256, backup_finish_date FROM source_snapshot_states WHERE source_id=3"))[0], {
+    generation: 2, backup_sha256: next.backup_sha256, backup_finish_date: next.backup_finish_date,
+  });
+
+  const concurrentRun = "00000000-0000-4000-8000-000000000154";
+  assert.equal((await snapshotStart(concurrentRun, "incremental", next, third)).status, 201);
+  assert.equal((await batch(concurrentRun, [])).status, 201);
+  const concurrent = await Promise.all([commit(concurrentRun), commit(concurrentRun)]);
+  assert.ok(concurrent.every((result) => result.status === 200 || result.status === 409));
+  const final = (await query("SELECT generation, backup_sha256, last_run_id FROM source_snapshot_states WHERE source_id=3"))[0];
+  assert.deepEqual(final, { generation: 3, backup_sha256: third.backup_sha256, last_run_id: concurrentRun });
+  assert.equal((await commit(concurrentRun)).body.snapshot_generation, 3);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM source_states WHERE source_id=3"))[0]?.count, 0);
+
+  // A separate source proves a historical snapshot containing records follows the same publication contract.
+  await query(
+    `UPDATE sources SET code='folketinget-test-3' WHERE id=3;` +
+    `INSERT INTO sources (id, code, name, base_url, created_at, updated_at) VALUES (4, 'folketinget', 'Local snapshot record test', 'https://oda.ft.dk/', ${sqlText(now)}, ${sqlText(now)});`,
+  );
+  const existingBaselineRun = "00000000-0000-4000-8000-000000000156";
+  await query(
+    `INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at, completed_at) VALUES (${sqlText(existingBaselineRun)}, 4, 'historical', 1, 1, 'COMMITTED', '{}', '{}', 'test-existing-baseline', ${sqlText(now)}, ${sqlText(now)}, ${sqlText(now)});` +
+    `INSERT INTO source_ingestion_baselines (source_id, baseline_run_id, initialized_at) VALUES (4, ${sqlText(existingBaselineRun)}, ${sqlText(now)});`,
+  );
+  const recordHistoryRun = "00000000-0000-4000-8000-000000000155";
+  const recordSnapshot = testSnapshot("5".repeat(64), "2026-10-19 02:01:05.000");
+  assert.equal((await snapshotStart(recordHistoryRun, "historical", null, recordSnapshot)).status, 201);
+  assert.equal((await batch(recordHistoryRun, [publication({ historical: false, external_id: "44" })])).body.error, "invalid_historical_flag");
+  assert.equal((await batch(recordHistoryRun, [publication({ historical: true, external_id: "44" })])).status, 201);
+  assert.equal((await commit(recordHistoryRun)).body.snapshot_generation, 1);
+  assert.equal((await query("SELECT historical FROM publications WHERE source_id=4 AND external_id='44'"))[0]?.historical, 1);
+  assert.equal((await query("SELECT baseline_run_id FROM source_ingestion_baselines WHERE source_id=4"))[0]?.baseline_run_id, existingBaselineRun);
 });
 

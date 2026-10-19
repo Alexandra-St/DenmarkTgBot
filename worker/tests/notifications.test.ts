@@ -601,7 +601,7 @@ test("local end-to-end: historical baseline, incremental changes, preference que
   };
 
   try {
-    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql"]) {
+    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql", "0007_snapshot_ingestion_state.sql"]) {
       db.exec(await readFile(new URL("../migrations/" + migration, import.meta.url), "utf8"));
     }
     const timestamp = new Date().toISOString();

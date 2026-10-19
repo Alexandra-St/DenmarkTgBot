@@ -1,3 +1,11 @@
+import {
+  SnapshotIdentityError,
+  snapshotIdentityEquals,
+  validateSnapshotIdentity,
+  validateSnapshotProgression,
+  type SnapshotIdentity,
+} from "./snapshot_state.ts";
+
 type SourceCode = "folketinget" | "hoeringsportalen";
 type Relevance = "DIRECT" | "POTENTIAL" | "IRRELEVANT";
 type JsonObject = Record<string, unknown>;
@@ -248,6 +256,8 @@ async function startRun(body: JsonObject, db: D1Database): Promise<Response> {
   if (body.mode !== "historical" && body.mode !== "incremental") throw new RequestError(400, "invalid_mode");
   if (!integer(body.expected_batches) || body.expected_batches < 1 || body.expected_batches > MAX_RUN_BATCHES) throw new RequestError(400, "invalid_batch_count");
   if (body.collection_complete !== true) throw new RequestError(409, "incomplete_collection");
+  if (body.state_kind !== undefined && body.state_kind !== "checkpoint" && body.state_kind !== "snapshot") throw new RequestError(400, "invalid_state_kind");
+  if (body.state_kind === "snapshot") return await startSnapshotRun(body, db);
   const id = await getSourceId(db, source);
   const current = await readStates(db, id);
   const streamKeys: readonly string[] = source === "folketinget" ? ODA_STREAMS : HEARING_FEEDS;
@@ -268,6 +278,84 @@ async function startRun(body: JsonObject, db: D1Database): Promise<Response> {
       .bind(body.run_id, id, body.mode, body.expected_batches, canonical(proposed), canonical(base), startHash, now, now).run();
   } catch { throw new RequestError(409, "source_run_active_or_run_conflict"); }
   return json({ accepted: true, run_id: body.run_id, status: "OPEN", expected_batches: body.expected_batches, idempotent: false }, 201);
+}
+
+function snapshotIdentityFromJson(value: string): SnapshotIdentity {
+  try { return validateSnapshotIdentity(JSON.parse(value) as unknown); }
+  catch { throw new RequestError(500, "snapshot_state_corrupt"); }
+}
+
+function snapshotIdentityError(error: unknown): never {
+  if (error instanceof SnapshotIdentityError) throw new RequestError(error.code === "snapshot_identity_invalid" ? 400 : 409, error.code);
+  throw error;
+}
+
+async function startSnapshotRun(body: JsonObject, db: D1Database): Promise<Response> {
+  if (body.source !== "folketinget") throw new RequestError(400, "snapshot_source_unsupported");
+  if (Object.hasOwn(body, "proposed_checkpoints")) throw new RequestError(400, "snapshot_checkpoints_not_allowed");
+  if (body.mode !== "historical" && body.mode !== "incremental") throw new RequestError(400, "invalid_mode");
+  if (!integer(body.expected_batches) || body.expected_batches < 1 || body.expected_batches > MAX_RUN_BATCHES) throw new RequestError(400, "invalid_batch_count");
+  if (body.collection_complete !== true) throw new RequestError(409, "incomplete_collection");
+
+  let target: SnapshotIdentity;
+  try { target = validateSnapshotIdentity(body.target_snapshot); }
+  catch (error) { snapshotIdentityError(error); }
+  let base: SnapshotIdentity | null = null;
+  if (body.mode === "historical") {
+    if (body.base_snapshot !== null) throw new RequestError(400, "snapshot_base_must_be_null");
+  } else {
+    if (body.base_snapshot === null || body.base_snapshot === undefined) throw new RequestError(400, "snapshot_base_required");
+    try { base = validateSnapshotIdentity(body.base_snapshot); }
+    catch (error) { snapshotIdentityError(error); }
+  }
+
+  const normalizedBase = base;
+  const startHash = await sha256(canonical({
+    run_id: body.run_id,
+    source: body.source,
+    mode: body.mode,
+    state_kind: "snapshot",
+    expected_batches: body.expected_batches,
+    collection_complete: true,
+    base_snapshot: normalizedBase,
+    target_snapshot: target,
+  }));
+  const oldRun = await db.prepare("SELECT status, start_request_hash, expected_batches, state_kind FROM ingestion_runs WHERE run_id = ?")
+    .bind(body.run_id).first<{ status: string; start_request_hash: string; expected_batches: number; state_kind: string }>();
+  if (oldRun) {
+    if (oldRun.start_request_hash !== startHash || oldRun.state_kind !== "snapshot") throw new RequestError(409, "run_id_conflict");
+    return json({ accepted: true, run_id: body.run_id, status: oldRun.status, expected_batches: oldRun.expected_batches, state_kind: "snapshot", idempotent: true });
+  }
+
+  const sourceId = await getSourceId(db, "folketinget");
+  const current = await db.prepare("SELECT backup_sha256, backup_finish_date, schema_fingerprint, generation FROM source_snapshot_states WHERE source_id = ?")
+    .bind(sourceId).first<{ backup_sha256: string; backup_finish_date: string; schema_fingerprint: string; generation: number }>();
+  const baseline = await db.prepare("SELECT source_id FROM source_ingestion_baselines WHERE source_id = ?").bind(sourceId).first<{ source_id: number }>();
+  if (body.mode === "historical") {
+    if (current) throw new RequestError(409, "snapshot_state_already_initialized");
+  } else {
+    if (!current) throw new RequestError(409, "snapshot_state_not_initialized");
+    if (!baseline) throw new RequestError(409, "historical_baseline_required");
+    const saved = {
+      backup_sha256: current.backup_sha256,
+      backup_finish_date: current.backup_finish_date,
+      schema_fingerprint: current.schema_fingerprint,
+    };
+    if (!base || !snapshotIdentityEquals(base, saved)) throw new RequestError(409, "snapshot_base_stale");
+    try {
+      if (validateSnapshotProgression(saved, target) === "same") throw new RequestError(409, "snapshot_already_current");
+    } catch (error) {
+      if (error instanceof RequestError) throw error;
+      snapshotIdentityError(error);
+    }
+  }
+
+  const now = new Date().toISOString();
+  try {
+    await db.prepare("INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at, state_kind, base_snapshot_json, target_snapshot_json) VALUES (?, ?, ?, ?, 1, 'OPEN', '{}', '{}', ?, ?, ?, 'snapshot', ?, ?)")
+      .bind(body.run_id, sourceId, body.mode, body.expected_batches, startHash, now, now, normalizedBase === null ? null : canonical(normalizedBase), canonical(target)).run();
+  } catch { throw new RequestError(409, "source_run_active_or_run_conflict"); }
+  return json({ accepted: true, run_id: body.run_id, status: "OPEN", expected_batches: body.expected_batches, state_kind: "snapshot", idempotent: false }, 201);
 }
 
 async function submitBatch(body: JsonObject, db: D1Database): Promise<Response> {
@@ -396,10 +484,20 @@ async function processStaged(db: D1Database, runId: string, sourceId: number, mo
 
 async function commitRun(body: JsonObject, db: D1Database): Promise<Response> {
   if (typeof body.run_id !== "string") throw new RequestError(400, "invalid_run_id");
-  const run = await db.prepare("SELECT run_id, source_id, mode, expected_batches, status, proposed_checkpoints_json, base_checkpoints_json, had_incomplete FROM ingestion_runs WHERE run_id = ?").bind(body.run_id)
-    .first<{ run_id: string; source_id: number; mode: "historical" | "incremental"; expected_batches: number; status: string; proposed_checkpoints_json: string; base_checkpoints_json: string; had_incomplete: number }>();
+  const run = await db.prepare("SELECT run_id, source_id, mode, expected_batches, status, proposed_checkpoints_json, base_checkpoints_json, had_incomplete, state_kind, base_snapshot_json, target_snapshot_json FROM ingestion_runs WHERE run_id = ?").bind(body.run_id)
+    .first<{ run_id: string; source_id: number; mode: "historical" | "incremental"; expected_batches: number; status: string; proposed_checkpoints_json: string; base_checkpoints_json: string; had_incomplete: number; state_kind: "checkpoint" | "snapshot"; base_snapshot_json: string | null; target_snapshot_json: string | null }>();
   if (!run) throw new RequestError(404, "run_not_found");
-  if (run.status === "COMMITTED" || run.status === "BLOCKED") return json({ run_id: run.run_id, status: run.status, processed_records: 0, checkpoints_advanced: run.status === "COMMITTED", idempotent: true });
+  if (run.status === "COMMITTED" || run.status === "BLOCKED") {
+    if (run.state_kind === "checkpoint") return json({ run_id: run.run_id, status: run.status, processed_records: 0, checkpoints_advanced: run.status === "COMMITTED", idempotent: true });
+    if (run.status === "BLOCKED") return json({ run_id: run.run_id, status: run.status, processed_records: 0, checkpoints_advanced: false, snapshot_advanced: false, idempotent: true });
+    if (run.target_snapshot_json === null) throw new RequestError(500, "snapshot_run_state_corrupt");
+    const target = snapshotIdentityFromJson(run.target_snapshot_json);
+    const generation = await db.prepare("SELECT COUNT(*) AS generation FROM ingestion_runs WHERE source_id = ? AND state_kind = 'snapshot' AND status = 'COMMITTED' AND json_extract(target_snapshot_json, '$.backup_finish_date') <= ?")
+      .bind(run.source_id, target.backup_finish_date).first<{ generation: number }>();
+    const saved = await db.prepare("SELECT generation FROM source_snapshot_states WHERE source_id = ?").bind(run.source_id).first<{ generation: number }>();
+    if (!generation || generation.generation < 1 || !saved || saved.generation < generation.generation) throw new RequestError(500, "snapshot_commit_state_missing");
+    return json({ run_id: run.run_id, status: run.status, processed_records: 0, checkpoints_advanced: false, snapshot_advanced: true, snapshot_generation: generation.generation, idempotent: true });
+  }
   if (run.status !== "OPEN" && run.status !== "COMMITTING") throw new RequestError(409, "run_not_committable");
   const count = await db.prepare("SELECT COUNT(*) AS count FROM ingestion_batches WHERE run_id = ?").bind(run.run_id).first<{ count: number }>();
   if (count?.count !== run.expected_batches) throw new RequestError(409, "batches_incomplete");
@@ -413,13 +511,48 @@ async function commitRun(body: JsonObject, db: D1Database): Promise<Response> {
     processed += 1;
   }
   const remaining = await db.prepare("SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id = ? AND processed = 0").bind(run.run_id).first<{ count: number }>();
-  if ((remaining?.count ?? 0) > 0) return json({ run_id: run.run_id, status: "COMMITTING", processed_records: processed, remaining_records: remaining?.count ?? 0, checkpoints_advanced: false });
+  if ((remaining?.count ?? 0) > 0) return json({
+    run_id: run.run_id, status: "COMMITTING", processed_records: processed, remaining_records: remaining?.count ?? 0,
+    checkpoints_advanced: false, ...(run.state_kind === "snapshot" ? { snapshot_advanced: false } : {}),
+  });
   const state = await db.prepare("SELECT had_incomplete FROM ingestion_runs WHERE run_id = ?").bind(run.run_id).first<{ had_incomplete: number }>();
   if (state?.had_incomplete) {
     const now = new Date().toISOString();
     await db.prepare("UPDATE ingestion_runs SET status = 'BLOCKED', error_code = 'incomplete_publication', completed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'COMMITTING'")
       .bind(now, now, run.run_id).run();
-    return json({ run_id: run.run_id, status: "BLOCKED", processed_records: processed, checkpoints_advanced: false, error: "incomplete_publication" });
+    return json({ run_id: run.run_id, status: "BLOCKED", processed_records: processed, checkpoints_advanced: false, ...(run.state_kind === "snapshot" ? { snapshot_advanced: false } : {}), error: "incomplete_publication" });
+  }
+  if (run.state_kind === "snapshot") {
+    if (run.target_snapshot_json === null) throw new RequestError(500, "snapshot_run_state_corrupt");
+    const target = snapshotIdentityFromJson(run.target_snapshot_json);
+    const now = new Date().toISOString();
+    const statements: D1PreparedStatement[] = [];
+    if (run.mode === "historical") {
+      if (run.base_snapshot_json !== null) throw new RequestError(500, "snapshot_run_state_corrupt");
+      // The existing historical-baseline gate remains authoritative; preserve any earlier baseline.
+      statements.push(db.prepare("INSERT INTO source_ingestion_baselines (source_id, baseline_run_id, initialized_at) VALUES (?, ?, ?) ON CONFLICT (source_id) DO NOTHING")
+        .bind(run.source_id, run.run_id, now));
+      statements.push(db.prepare("INSERT INTO source_snapshot_states (source_id, backup_sha256, backup_finish_date, schema_fingerprint, generation, last_run_id, initialized_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)")
+        .bind(run.source_id, target.backup_sha256, target.backup_finish_date, target.schema_fingerprint, run.run_id, now, now));
+    } else {
+      if (run.base_snapshot_json === null) throw new RequestError(500, "snapshot_run_state_corrupt");
+      const base = snapshotIdentityFromJson(run.base_snapshot_json);
+      statements.push(db.prepare("UPDATE source_snapshot_states SET backup_sha256 = ?, backup_finish_date = ?, schema_fingerprint = ?, generation = generation + 1, last_run_id = ?, updated_at = ? WHERE source_id = ? AND backup_sha256 = ? AND backup_finish_date = ? AND schema_fingerprint = ?")
+        .bind(target.backup_sha256, target.backup_finish_date, target.schema_fingerprint, run.run_id, now, run.source_id, base.backup_sha256, base.backup_finish_date, base.schema_fingerprint));
+    }
+    statements.push(db.prepare("UPDATE ingestion_runs SET status = 'COMMITTED', completed_at = ?, updated_at = ? WHERE run_id = ? AND status = 'COMMITTING' AND had_incomplete = 0")
+      .bind(now, now, run.run_id));
+    try { await db.batch(statements); }
+    catch { throw new RequestError(409, "snapshot_commit_conflict"); }
+    const committed = await db.prepare("SELECT status, snapshot_state_writes FROM ingestion_runs WHERE run_id = ?").bind(run.run_id)
+      .first<{ status: string; snapshot_state_writes: number }>();
+    const saved = await db.prepare("SELECT generation, backup_sha256, backup_finish_date, schema_fingerprint, last_run_id FROM source_snapshot_states WHERE source_id = ?").bind(run.source_id)
+      .first<{ generation: number; backup_sha256: string; backup_finish_date: string; schema_fingerprint: string; last_run_id: string }>();
+    if (committed?.status !== "COMMITTED" || committed.snapshot_state_writes !== 1 || !saved || saved.last_run_id !== run.run_id ||
+      saved.backup_sha256 !== target.backup_sha256 || saved.backup_finish_date !== target.backup_finish_date || saved.schema_fingerprint !== target.schema_fingerprint) {
+      throw new RequestError(409, "snapshot_commit_conflict");
+    }
+    return json({ run_id: run.run_id, status: "COMMITTED", processed_records: processed, checkpoints_advanced: false, snapshot_advanced: true, snapshot_generation: saved.generation });
   }
   const proposed = JSON.parse(run.proposed_checkpoints_json) as Record<string, Cursor | null>;
   const base = JSON.parse(run.base_checkpoints_json) as Record<string, Cursor | null>;
