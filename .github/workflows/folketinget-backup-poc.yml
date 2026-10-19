@@ -60,15 +60,29 @@ jobs:
             echo "snapshot_diff=FAIL category=workflow_run_ids_must_differ"
             exit 2
           fi
-          workflow_id=$(gh api "repos/$GH_REPOSITORY/actions/workflows/folketinget-backup-poc.yml" --jq '.id')
+          workflow_id=$(gh api "repos/$GH_REPOSITORY/actions/workflows/folketinget-backup-poc.yml" --jq '.id') || {
+            echo "snapshot_diff=FAIL category=manifest_run_not_successful"
+            exit 2
+          }
+          if [[ ! "$workflow_id" =~ ^[0-9]+$ ]]; then
+            echo "snapshot_diff=FAIL category=manifest_run_not_successful"
+            exit 2
+          fi
           for run_id in "$OLD_RUN_ID" "$NEW_RUN_ID"; do
             run_path="repos/$GH_REPOSITORY/actions/runs/$run_id"
-            valid_run=$(gh api "$run_path" --jq --argjson workflow_id "$workflow_id" 'select(.status == "completed" and .conclusion == "success" and .event == "workflow_dispatch" and .workflow_id == $workflow_id) | .id' || true)
-            if [[ "$valid_run" != "$run_id" ]]; then
+            run_fields=$(gh api "$run_path" --jq '[.id, .status, .conclusion, .event, .workflow_id] | @tsv') || {
+              echo "snapshot_diff=FAIL category=manifest_run_not_successful"
+              exit 2
+            }
+            IFS=$'\t' read -r actual_id status conclusion event actual_workflow_id <<< "$run_fields"
+            if [[ "$actual_id" != "$run_id" || "$status" != "completed" || "$conclusion" != "success" || "$event" != "workflow_dispatch" || "$actual_workflow_id" != "$workflow_id" ]]; then
               echo "snapshot_diff=FAIL category=manifest_run_not_successful"
               exit 2
             fi
-            artifact_count=$(gh api "repos/$GH_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" --jq --arg expected "folketinget-snapshot-manifest-$run_id" '[.artifacts[] | select(.name == $expected and .expired == false and .size_in_bytes > 0)] | length')
+            artifact_count=$(gh api "repos/$GH_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"folketinget-snapshot-manifest-$run_id\" and .expired == false and .size_in_bytes > 0)] | length") || {
+              echo "snapshot_diff=FAIL category=manifest_artifact_missing_or_ambiguous"
+              exit 2
+            }
             if [[ "$artifact_count" != "1" ]]; then
               echo "snapshot_diff=FAIL category=manifest_artifact_missing_or_ambiguous"
               exit 2
