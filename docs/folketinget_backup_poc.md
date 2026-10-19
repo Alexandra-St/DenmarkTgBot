@@ -11,13 +11,27 @@ Add these repository Actions secrets before a run:
 
 They are HTTP Basic Authentication credentials for the official ODA backup endpoint. The workflow fails closed if either is absent. Do not put credentials in variables, workflow inputs, files, or logs.
 
-The job uses a GitHub-hosted x64 `ubuntu-latest` runner, checks that it is Ubuntu 24.04, and installs **SQL Server 2025 Express only**. It stops if Express cannot be installed or verified; it does not fall back to Developer, Evaluation, or another edition.
+The restore job uses a GitHub-hosted x64 `ubuntu-24.04` runner and installs **SQL Server 2025 Express only**. It stops if Express cannot be installed or verified; it does not fall back to Developer, Evaluation, or another edition.
 
 ## What a manual run does
 
 In **Actions → Folketinget backup restore PoC → Run workflow**, the operator must explicitly enable the confirmation checkbox. The job then checks disk space, requests the backup size, downloads the official HTTPS backup to temporary runner storage, and reports only byte size, SHA-256 and download duration. It runs `RESTORE HEADERONLY`, `RESTORE FILELISTONLY`, restores to a temporary database, runs `DBCC CHECKDB`, and reports presence, row counts, primary-key columns, and declared foreign-key relationships for `Sag`, `Sagstrin`, `SagDokument`, `Dokument`, `Afstemning`, and `Sagsstatus`.
 
-It does not print table contents, record IDs, credentials, or the authenticated URL. It does not upload artifacts. The temporary database and backup files are removed in cleanup; the runner is ephemeral and is discarded after the job.
+It does not print table contents, record IDs, credentials, or the authenticated URL. In `CREATE_MANIFEST_BASELINE` mode, it uploads only the validated `manifest.sqlite` for two days; backup and SQL Server database files are not uploaded. The temporary database and backup files are removed in cleanup; the runner is ephemeral and is discarded after the job.
+
+## Comparing two manifest artifacts
+
+The workflow remains `workflow_dispatch` only. Select `DIFF_MANIFESTS`, confirm the manual operation, and enter two distinct run IDs from successful manual `CREATE_MANIFEST_BASELINE` runs. The workflow checks that both runs completed successfully from this workflow and that each has exactly one unexpired manifest artifact before downloading it. The extracted artifact directory must contain only `manifest.sqlite`.
+
+The diff tool checks SQLite integrity, the exact version 1 manifest table/column and key layout, entity counts, required entities, and matching schema fingerprints. It aggregates changes using SQLite joins and emits a machine-readable JSON report with aggregate counts and snapshot metadata only. It never prints record keys, individual hashes, or row contents. A fingerprint mismatch or invalid artifact stops comparison.
+
+For local manifests, run:
+
+```sh
+python3 tools/folketinget_snapshot_diff.py --old /path/to/older/manifest.sqlite --new /path/to/newer/manifest.sqlite
+```
+
+No restore, source request, ingestion, Worker/D1 call, or notification occurs in `DIFF_MANIFESTS` mode.
 
 ## Limits and risks before authorizing a run
 

@@ -4,21 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       confirm_restore:
-        description: "Confirm a temporary, non-production restore of the official ODA backup"
+        description: "Confirm the requested manual PoC operation (restore or manifest comparison)"
         required: true
         type: boolean
         default: false
       mode:
-        description: "Choose restore validation or deterministic manifest generation"
+        description: "Choose restore validation, manifest generation, or manifest comparison"
         required: true
         type: choice
         options:
           - RESTORE_VALIDATE
           - CREATE_MANIFEST_BASELINE
+          - DIFF_MANIFESTS
         default: RESTORE_VALIDATE
+      old_run_id:
+        description: "Successful manual baseline run ID for the older manifest (DIFF_MANIFESTS only)"
+        required: false
+        type: string
+      new_run_id:
+        description: "Successful manual baseline run ID for the newer manifest (DIFF_MANIFESTS only)"
+        required: false
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: folketinget-backup-restore-poc
@@ -31,7 +41,70 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+      - name: Validate manifest run IDs and artifacts
+        if: inputs.mode == 'DIFF_MANIFESTS'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          OLD_RUN_ID: ${{ inputs.old_run_id }}
+          NEW_RUN_ID: ${{ inputs.new_run_id }}
+        run: |
+          set -euo pipefail
+          for run_id in "$OLD_RUN_ID" "$NEW_RUN_ID"; do
+            if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+              echo "snapshot_diff=FAIL category=workflow_run_id_invalid"
+              exit 2
+            fi
+          done
+          if [[ "$OLD_RUN_ID" == "$NEW_RUN_ID" ]]; then
+            echo "snapshot_diff=FAIL category=workflow_run_ids_must_differ"
+            exit 2
+          fi
+          workflow_id=$(gh api "repos/$GH_REPOSITORY/actions/workflows/folketinget-backup-poc.yml" --jq '.id')
+          for run_id in "$OLD_RUN_ID" "$NEW_RUN_ID"; do
+            run_path="repos/$GH_REPOSITORY/actions/runs/$run_id"
+            valid_run=$(gh api "$run_path" --jq --argjson workflow_id "$workflow_id" 'select(.status == "completed" and .conclusion == "success" and .event == "workflow_dispatch" and .workflow_id == $workflow_id) | .id' || true)
+            if [[ "$valid_run" != "$run_id" ]]; then
+              echo "snapshot_diff=FAIL category=manifest_run_not_successful"
+              exit 2
+            fi
+            artifact_count=$(gh api "repos/$GH_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" --jq --arg expected "folketinget-snapshot-manifest-$run_id" '[.artifacts[] | select(.name == $expected and .expired == false and .size_in_bytes > 0)] | length')
+            if [[ "$artifact_count" != "1" ]]; then
+              echo "snapshot_diff=FAIL category=manifest_artifact_missing_or_ambiguous"
+              exit 2
+            fi
+          done
+      - name: Download older manifest artifact
+        if: inputs.mode == 'DIFF_MANIFESTS'
+        uses: actions/download-artifact@v4
+        with:
+          name: folketinget-snapshot-manifest-${{ inputs.old_run_id }}
+          path: ${{ runner.temp }}/folketinget-manifest-old
+          run-id: ${{ inputs.old_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+      - name: Download newer manifest artifact
+        if: inputs.mode == 'DIFF_MANIFESTS'
+        uses: actions/download-artifact@v4
+        with:
+          name: folketinget-snapshot-manifest-${{ inputs.new_run_id }}
+          path: ${{ runner.temp }}/folketinget-manifest-new
+          run-id: ${{ inputs.new_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+      - name: Compare validated manifests
+        if: inputs.mode == 'DIFF_MANIFESTS'
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python3 tools/folketinget_snapshot_diff.py \
+            --old "$RUNNER_TEMP/folketinget-manifest-old" \
+            --new "$RUNNER_TEMP/folketinget-manifest-new" \
+            | tee "$RUNNER_TEMP/folketinget-snapshot-diff.json" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Verify and restore official backup
+        if: inputs.mode != 'DIFF_MANIFESTS'
         env:
           INPUT_CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
           INPUT_MODE: ${{ inputs.mode }}
