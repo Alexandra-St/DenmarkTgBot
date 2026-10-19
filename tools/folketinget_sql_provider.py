@@ -1,7 +1,7 @@
 """Read-only SQL Server provider for Folketinget candidate extraction.
 
 The caller supplies only the database password and a query executor that
-returns the decoded JSON string from the backup PoC's strict chunk transport.
+returns the decoded JSON string from the shared strict chunk transport.
 No caller-controlled SQL fragments are accepted.
 """
 
@@ -16,7 +16,7 @@ TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
 if TOOLS_DIRECTORY not in sys.path:
     sys.path.insert(0, TOOLS_DIRECTORY)
 
-from folketinget_backup_poc import build_chunked_json_query, quote_identifier
+from folketinget_sql_transport import build_chunked_json_query, quote_identifier
 
 
 REQUIRED_ENTITIES = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
@@ -111,25 +111,28 @@ class SQLServerFolketingetProvider:
         self._field(entity, field)
         if not values:
             return ()
-        expressions = []
-        for name in PROJECTIONS[entity]:
-            identifier = quote_identifier(name)
-            sql_type = self._column_types[entity].get(name)
-            if sql_type == "text":
-                expression = f"CONVERT(varchar(max), {identifier})"
-            elif sql_type == "ntext":
-                expression = f"CONVERT(nvarchar(max), {identifier})"
-            else:
-                expression = identifier
-            expressions.append(f"{expression} AS {quote_identifier(name)}")
-        projection = ", ".join(expressions)
-        numeric_values = ",".join(str(value) for value in values)
-        table = f"{quote_identifier(self._schemas[entity])}.{quote_identifier(entity)}"
-        select = (
-            f"SELECT {projection} FROM {table} WHERE {quote_identifier(field)} IN ({numeric_values}) "
-            f"ORDER BY {quote_identifier('id')} FOR JSON PATH, INCLUDE_NULL_VALUES"
-        )
-        query = build_chunked_json_query(select, variable="provider")
+        try:
+            expressions = []
+            for name in PROJECTIONS[entity]:
+                identifier = quote_identifier(name)
+                sql_type = self._column_types[entity].get(name)
+                if sql_type == "text":
+                    expression = f"CONVERT(varchar(max), {identifier})"
+                elif sql_type == "ntext":
+                    expression = f"CONVERT(nvarchar(max), {identifier})"
+                else:
+                    expression = identifier
+                expressions.append(f"{expression} AS {quote_identifier(name)}")
+            projection = ", ".join(expressions)
+            numeric_values = ",".join(str(value) for value in values)
+            table = f"{quote_identifier(self._schemas[entity])}.{quote_identifier(entity)}"
+            select = (
+                f"SELECT {projection} FROM {table} WHERE {quote_identifier(field)} IN ({numeric_values}) "
+                f"ORDER BY {quote_identifier('id')} FOR JSON PATH, INCLUDE_NULL_VALUES"
+            )
+            query = build_chunked_json_query(select, variable="provider")
+        except ValueError:
+            raise SQLProviderError("provider_query_invalid") from None
         try:
             payload = self._query_executor(query, entity)
         except SQLProviderError:

@@ -4,6 +4,8 @@ import importlib.util
 import json
 import pathlib
 import re
+import subprocess
+import sys
 import unittest
 import base64
 from unittest import mock
@@ -94,6 +96,128 @@ class SQLServerProviderTests(unittest.TestCase):
         self.assertIn("-W", argv)
         self.assertNotIn("-y", argv)
         self.assertEqual(argv[argv.index("-w") + 1], "6100")
+
+    def test_shared_transport_imports_in_either_order_without_poc_dependency(self) -> None:
+        scripts = (
+            "import sys; from pathlib import Path; "
+            f"sys.path.insert(0, {str(ROOT / 'tools')!r}); "
+        )
+        assertions = (
+            "import folketinget_sql_transport as t; "
+            "import folketinget_backup_poc as p; "
+            "import folketinget_sql_provider as q; "
+            "assert p._build_chunked_json_query is t.build_chunked_json_query; "
+            "assert q.build_chunked_json_query is t.build_chunked_json_query; "
+            "assert p._quote_identifier is t.quote_identifier; "
+            "assert q.quote_identifier is t.quote_identifier"
+        )
+        reverse_assertions = (
+            "import folketinget_sql_transport as t; "
+            "import folketinget_sql_provider as q; "
+            "assert 'folketinget_backup_poc' not in sys.modules; "
+            "assert q.build_chunked_json_query is t.build_chunked_json_query; "
+            "import folketinget_backup_poc as p; "
+            "assert p._build_chunked_json_query is t.build_chunked_json_query; "
+            "assert p._quote_identifier is t.quote_identifier"
+        )
+        for code in (scripts + assertions, scripts + reverse_assertions):
+            result = subprocess.run(
+                [sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, msg="import topology subprocess failed")
+
+    def test_shared_transport_keeps_exact_bounded_chunk_protocol(self) -> None:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import folketinget_sql_transport as transport
+
+        query = transport.build_chunked_json_query("SELECT [id] FROM [dbo].[Sag] FOR JSON PATH", variable="provider")
+        self.assertEqual(query, POC.build_chunked_json_query(
+            "SELECT [id] FROM [dbo].[Sag] FOR JSON PATH", variable="provider"
+        ))
+        self.assertIn("varchar(6000)", query)
+        self.assertIn("CAST(sequence_number AS varchar(5)) + '|'", query)
+        self.assertIn("ORDER BY sequence_number", query)
+        self.assertIn("OPTION (MAXRECURSION 30000)", query)
+
+    def test_provider_validation_unexpected_sample_error_is_phase_categorized(self) -> None:
+        entities = {"objects": {entity: ("dbo", "USER_TABLE") for entity in ENTITIES}}
+        output = []
+        with mock.patch.object(POC, "read_sql_provider_sample_ids", side_effect=RuntimeError("private failure")):
+            with mock.patch("builtins.print", side_effect=lambda *args, **kwargs: output.append(args[0])):
+                with self.assertRaises(POC.PocError) as raised:
+                    POC.validate_sql_provider("secret", entities)
+        self.assertEqual(raised.exception.category, "sql_provider_sample_validation_failed")
+        self.assertEqual(output, ["progress=sql_provider_import", "progress=sql_provider_sample_ids"])
+        self.assertNotIn("private", str(raised.exception))
+
+    def test_provider_validation_reports_all_successful_phases_in_order(self) -> None:
+        import folketinget_sql_provider as canonical_provider
+
+        entities = {"objects": {entity: ("dbo", "USER_TABLE") for entity in ENTITIES}}
+        columns = {
+            entity: {"columns": [{"name": field, "type_name": "int"} for field in canonical_provider.PROJECTIONS[entity]]}
+            for entity in ENTITIES
+        }
+        fixture_rows = {
+            "Sag": row("Sag", 1, nummer="L 1", titel="test", statusid=6),
+            "Sagstrin": row("Sagstrin", 2, sagid=1, titel="test"),
+            "SagDokument": row("SagDokument", 3, sagid=1, dokumentid=4),
+            "Dokument": row("Dokument", 4, titel="test"),
+            "Afstemning": row("Afstemning", 5, sagstrinid=2, nummer=1, vedtaget=True),
+            "Sagsstatus": row("Sagsstatus", 6, status="aktiv"),
+        }
+        samples = {entity: fixture_rows[entity]["id"] for entity in ENTITIES}
+
+        class FixtureProvider:
+            def __init__(self, schemas, executor, *, column_types):
+                self.schemas = schemas
+
+            def get_by_ids(self, entity, ids):
+                return (fixture_rows[entity],)
+
+            def find_by_field(self, entity, field, values):
+                return ()
+
+        output = []
+        with (
+            mock.patch.object(POC, "read_sql_provider_sample_ids", return_value=samples),
+            mock.patch.object(POC, "read_sql_provider_relation_samples", return_value=[]),
+            mock.patch.object(POC, "manifest_schema", side_effect=lambda password, entity, schema: columns[entity]),
+            mock.patch.object(canonical_provider, "SQLServerFolketingetProvider", FixtureProvider),
+            mock.patch("builtins.print", side_effect=lambda *args, **kwargs: output.append(args[0])),
+        ):
+            result = POC.validate_sql_provider("private", entities)
+        self.assertEqual(result["entities_tested"], 6)
+        self.assertEqual(output, [
+            "progress=sql_provider_import",
+            "progress=sql_provider_sample_ids",
+            "progress=sql_provider_relation_samples",
+            "progress=sql_provider_schema_check",
+            "progress=sql_provider_construct",
+            "progress=sql_provider_get_by_ids",
+            "progress=sql_provider_relation_checks",
+        ])
+
+    def test_provider_get_and_relation_failures_have_separate_safe_phases(self) -> None:
+        sample_ids = {entity: 1 for entity in ENTITIES}
+        output = []
+        provider = mock.Mock()
+        provider.get_by_ids.side_effect = RuntimeError("private ID and row")
+        with mock.patch("builtins.print", side_effect=lambda *args, **kwargs: output.append(args[0])):
+            with self.assertRaises(POC.PocError) as raised:
+                POC.exercise_sql_provider(provider, sample_ids)
+        self.assertEqual(raised.exception.category, "sql_provider_get_by_ids_failed")
+        self.assertEqual(output, ["progress=sql_provider_get_by_ids"])
+
+        provider = mock.Mock()
+        provider.get_by_ids.side_effect = lambda entity, ids: (row(entity, 1),)
+        provider.find_by_field.side_effect = RuntimeError("private relation row")
+        output.clear()
+        with mock.patch("builtins.print", side_effect=lambda *args, **kwargs: output.append(args[0])):
+            with self.assertRaises(POC.PocError) as raised:
+                POC.exercise_sql_provider(provider, sample_ids, [("Sag", "statusid", 2)])
+        self.assertEqual(raised.exception.category, "sql_provider_relation_validation_failed")
+        self.assertEqual(output, ["progress=sql_provider_get_by_ids", "progress=sql_provider_relation_checks"])
 
     def test_all_six_projections_match_the_existing_model_contract(self) -> None:
         self.assertEqual(PROVIDER_MODULE.PROJECTIONS, {

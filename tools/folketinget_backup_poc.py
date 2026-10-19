@@ -28,6 +28,13 @@ TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
 if TOOLS_DIRECTORY not in sys.path:
     sys.path.insert(0, TOOLS_DIRECTORY)
 import folketinget_snapshot_manifest as snapshot_manifest
+from folketinget_sql_transport import (
+    MANIFEST_BASE64_CHUNK_SIZE,
+    MANIFEST_MAX_BASE64_CHUNKS,
+    MANIFEST_SQL_ROW_WIDTH,
+    build_chunked_json_query as _build_chunked_json_query,
+    quote_identifier as _quote_identifier,
+)
 
 ODA_URL = "https://oda.ft.dk/odapublish/oda.bak"
 ODA_ORIGIN = ("https", "oda.ft.dk", 443)
@@ -45,11 +52,6 @@ CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 VALIDATE_SQL_PROVIDER = "VALIDATE_SQL_PROVIDER"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
-MANIFEST_BASE64_CHUNK_SIZE = 6000
-# 64 MiB UTF-8 JSON needs at most 128 MiB UTF-16LE, or 29,827 chunks.
-MANIFEST_MAX_BASE64_CHUNKS = 30000
-# Five sequence digits + one delimiter + 6000 ASCII bytes = at most 6006 columns.
-MANIFEST_SQL_ROW_WIDTH = 6100
 SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
 
 
@@ -122,9 +124,10 @@ def validate_backup_header(major: int, backup_type: int, damaged: bool) -> None:
 
 
 def quote_identifier(value: str) -> str:
-    if not value or "\x00" in value:
-        raise PocError("backup_metadata_invalid")
-    return "[" + value.replace("]", "]]" ) + "]"
+    try:
+        return _quote_identifier(value)
+    except (TypeError, ValueError):
+        raise PocError("backup_metadata_invalid") from None
 
 
 def quote_literal(value: str) -> str:
@@ -785,24 +788,11 @@ def manifest_page_json(
 
 
 def build_chunked_json_query(select_query: str, *, variable: str) -> str:
-    """Wrap a trusted JSON SELECT in the validated fixed-width Base64 transport."""
-    if variable not in {"manifest", "provider"} or not select_query.startswith("SELECT "):
-        raise PocError("manifest_page_invalid")
-    json_variable = f"@{variable}_json"
-    b64_variable = f"@{variable}_b64"
-    return (
-        f"SET NOCOUNT ON; DECLARE {json_variable} nvarchar(max); "
-        f"SET {json_variable} = ({select_query}); "
-        f"DECLARE {b64_variable} varchar(max); "
-        f"SET {b64_variable} = BASE64_ENCODE(CONVERT(varbinary(max), {json_variable})); "
-        ";WITH chunk_sequence AS ("
-        "SELECT CAST(1 AS int) AS sequence_number UNION ALL "
-        f"SELECT sequence_number + 1 FROM chunk_sequence WHERE sequence_number * {MANIFEST_BASE64_CHUNK_SIZE} < LEN({b64_variable})) "
-        "SELECT CAST(CAST(sequence_number AS varchar(5)) + '|' + "
-        f"CAST(SUBSTRING({b64_variable}, ((sequence_number - 1) * {MANIFEST_BASE64_CHUNK_SIZE}) + 1, "
-        f"{MANIFEST_BASE64_CHUNK_SIZE}) AS varchar({MANIFEST_BASE64_CHUNK_SIZE})) AS varchar(6006)) AS chunk_line "
-        f"FROM chunk_sequence ORDER BY sequence_number OPTION (MAXRECURSION {MANIFEST_MAX_BASE64_CHUNKS});"
-    )
+    """Keep the PoC's safe error vocabulary around the shared query builder."""
+    try:
+        return _build_chunked_json_query(select_query, variable=variable)
+    except (AttributeError, TypeError, ValueError):
+        raise PocError("manifest_page_invalid") from None
 
 
 def run_provider_chunked_json(password: str, query: str, entity: str) -> str:
@@ -1003,16 +993,18 @@ def exercise_sql_provider(
     relation_samples: list[tuple[str, str, int]] | None = None,
 ) -> dict[str, int]:
     """Exercise by-ID and relationship reads; return aggregate-only results."""
-    from collectors.folketinget_models import normalize_many
+    def phase(marker: str, category: str, operation):  # type: ignore[no-untyped-def]
+        print(f"progress={marker}")
+        try:
+            return operation()
+        except PocError:
+            raise
+        except Exception:
+            raise PocError(category) from None
 
-    if set(sample_ids) != set(REQUIRED_ENTITIES) or any(
-        isinstance(value, bool) or not isinstance(value, int) for value in sample_ids.values()
-    ):
-        raise PocError("sql_provider_validation_failed")
     failures = 0
-    sample_rows: dict[str, dict[str, Any]] = {}
 
-    def validate_rows(entity: str, rows: Any) -> tuple[dict[str, Any], ...]:
+    def validate_rows(normalize_many, entity: str, rows: Any) -> tuple[dict[str, Any], ...]:
         nonlocal failures
         result = normalize_many(list(rows), entity)
         failures += len(result.diagnostics)
@@ -1020,64 +1012,119 @@ def exercise_sql_provider(
             failures += 1
         return tuple(row for row in rows if isinstance(row, dict))
 
-    try:
-        get_checks = 0
+    def get_by_ids_checks() -> int:
+        from collectors.folketinget_models import normalize_many
+
+        if set(sample_ids) != set(REQUIRED_ENTITIES) or any(
+            isinstance(value, bool) or not isinstance(value, int) for value in sample_ids.values()
+        ):
+            raise PocError("sql_provider_sample_validation_failed")
+        count = 0
         for entity in REQUIRED_ENTITIES:
             rows = tuple(provider.get_by_ids(entity, (sample_ids[entity],)))
             if len(rows) != 1 or rows[0].get("id") != sample_ids[entity]:
-                raise PocError("sql_provider_validation_failed")
-            normalized = validate_rows(entity, rows)
+                raise PocError("sql_provider_sample_validation_failed")
+            normalized = validate_rows(normalize_many, entity, rows)
             if len(normalized) != 1:
-                raise PocError("sql_provider_validation_failed")
-            sample_rows[entity] = normalized[0]
-            get_checks += 1
+                raise PocError("sql_provider_sample_validation_failed")
+            count += 1
+        return count
 
-        relations = relation_samples or []
+    get_checks = phase(
+        "sql_provider_get_by_ids", "sql_provider_get_by_ids_failed", get_by_ids_checks
+    )
+
+    def relation_checks() -> int:
+        from collectors.folketinget_models import normalize_many
         from folketinget_sql_provider import RELATION_FIELDS
 
+        relations = relation_samples or []
         if any(entity not in RELATION_FIELDS or field not in RELATION_FIELDS[entity]
                or isinstance(value, bool) or not isinstance(value, int) for entity, field, value in relations):
-            raise PocError("sql_provider_validation_failed")
-
+            raise PocError("sql_provider_relation_validation_failed")
         for entity, field, value in relations:
             rows = tuple(provider.find_by_field(entity, field, (value,)))
-            validate_rows(entity, rows)
+            validate_rows(normalize_many, entity, rows)
         if failures:
             raise PocError("sql_provider_normalization_failed")
-        return {"entities_tested": len(REQUIRED_ENTITIES), "get_by_ids_checks": get_checks,
-                "relation_checks": len(relations), "normalization_failures": failures}
-    except PocError:
-        raise
-    except Exception:
-        raise PocError("sql_provider_validation_failed") from None
+        return len(relations)
+
+    relation_count = phase(
+        "sql_provider_relation_checks", "sql_provider_relation_validation_failed", relation_checks
+    )
+    return {
+        "entities_tested": len(REQUIRED_ENTITIES),
+        "get_by_ids_checks": get_checks,
+        "relation_checks": relation_count,
+        "normalization_failures": failures,
+    }
 
 
 def validate_sql_provider(password: str, entities: dict[str, Any]) -> dict[str, int]:
-    from folketinget_sql_provider import SQLServerFolketingetProvider
+    def phase(marker: str, category: str, operation):  # type: ignore[no-untyped-def]
+        print(f"progress={marker}")
+        try:
+            return operation()
+        except PocError:
+            raise
+        except Exception:
+            raise PocError(category) from None
 
-    samples = read_sql_provider_sample_ids(password, entities)
-    relation_samples = read_sql_provider_relation_samples(password, entities)
     try:
-        column_types: dict[str, dict[str, str]] = {}
-        for entity in REQUIRED_ENTITIES:
-            schema_name, object_type = entities["objects"][entity]
-            schema = manifest_schema(password, entity, schema_name)
-            available_types = {column["name"]: column["type_name"] for column in schema["columns"]}
-            from folketinget_sql_provider import PROJECTIONS
+        def import_provider():
+            from folketinget_sql_provider import (
+                PROJECTIONS,
+                SQLServerFolketingetProvider,
+            )
+            return PROJECTIONS, SQLServerFolketingetProvider
 
-            if set(PROJECTIONS[entity]) - set(available_types):
-                raise PocError("sql_provider_schema_invalid")
-            column_types[entity] = {name: available_types[name] for name in PROJECTIONS[entity]}
-        provider = SQLServerFolketingetProvider(
-            entities["objects"],
-            lambda query, entity: run_provider_chunked_json(password, query, entity),
-            column_types=column_types,
+        projections, provider_class = phase(
+            "sql_provider_import", "sql_provider_import_failed", import_provider
         )
+        samples = phase(
+            "sql_provider_sample_ids",
+            "sql_provider_sample_validation_failed",
+            lambda: read_sql_provider_sample_ids(password, entities),
+        )
+        relation_samples = phase(
+            "sql_provider_relation_samples",
+            "sql_provider_relation_sample_failed",
+            lambda: read_sql_provider_relation_samples(password, entities),
+        )
+
+        def check_schema():
+            column_types: dict[str, dict[str, str]] = {}
+            for entity in REQUIRED_ENTITIES:
+                schema_name, object_type = entities["objects"][entity]
+                if object_type != "USER_TABLE":
+                    raise PocError("sql_provider_schema_invalid")
+                schema = manifest_schema(password, entity, schema_name)
+                available_types = {column["name"]: column["type_name"] for column in schema["columns"]}
+                if set(projections[entity]) - set(available_types):
+                    raise PocError("sql_provider_schema_invalid")
+                column_types[entity] = {name: available_types[name] for name in projections[entity]}
+            return column_types
+
+        column_types = phase(
+            "sql_provider_schema_check",
+            "sql_provider_schema_validation_failed",
+            check_schema,
+        )
+        provider = phase(
+            "sql_provider_construct",
+            "sql_provider_construction_failed",
+            lambda: provider_class(
+                entities["objects"],
+                lambda query, entity: run_provider_chunked_json(password, query, entity),
+                column_types=column_types,
+            ),
+        )
+        return exercise_sql_provider(provider, samples, relation_samples)
     except PocError:
         raise
     except Exception:
+        # Last-resort guard: no provider-validation exception reaches main().
         raise PocError("sql_provider_validation_failed") from None
-    return exercise_sql_provider(provider, samples, relation_samples)
 
 
 def write_summary(summary: dict[str, Any]) -> None:
