@@ -56,6 +56,7 @@ RESTORE_VALIDATE = "RESTORE_VALIDATE"
 CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 VALIDATE_SQL_PROVIDER = "VALIDATE_SQL_PROVIDER"
 EXTRACT_SNAPSHOT_CANDIDATES = "EXTRACT_SNAPSHOT_CANDIDATES"
+CLASSIFY_SNAPSHOT_CANDIDATES = "CLASSIFY_SNAPSHOT_CANDIDATES"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
@@ -80,6 +81,7 @@ def validate_mode(value: str) -> str:
         CREATE_MANIFEST_BASELINE,
         VALIDATE_SQL_PROVIDER,
         EXTRACT_SNAPSHOT_CANDIDATES,
+        CLASSIFY_SNAPSHOT_CANDIDATES,
     }:
         raise PocError("workflow_mode_invalid")
     return value
@@ -1312,6 +1314,7 @@ def run_candidate_extraction(
     runner_temp: Path,
     old_finish: str,
     new_finish: str,
+    classify_candidates: bool = False,
 ) -> dict[str, Any]:
     """Run the established extractor and return only validated aggregate data."""
     bundle_path: Path | None = None
@@ -1385,7 +1388,7 @@ def run_candidate_extraction(
         candidate_count = persisted_bundle.get("candidate_case_count")
         if isinstance(candidate_count, bool) or not isinstance(candidate_count, int) or candidate_count < 0:
             raise PocError("candidate_summary_invalid")
-        return {
+        result = {
             "complete": summary.get("complete") is True,
             "diff_totals": clean_totals,
             "diff_entities": clean_entity_counts,
@@ -1395,8 +1398,135 @@ def run_candidate_extraction(
             "old_finish": old_finish,
             "new_finish": new_finish,
         }
+        if classify_candidates:
+            result["classification"] = _classify_candidate_bundle(persisted_bundle)
+        return result
     finally:
         cleanup_candidate_bundle(bundle_path, runner_temp)
+
+
+def _classify_candidate_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    """Classify candidate cases in memory and return aggregate-only results."""
+    try:
+        from collectors import relevance
+    except Exception:
+        raise PocError("candidate_classifier_import_failed") from None
+    cases = bundle.get("cases")
+    candidate_count = bundle.get("candidate_case_count")
+    if (
+        not isinstance(cases, list)
+        or isinstance(candidate_count, bool)
+        or not isinstance(candidate_count, int)
+        or candidate_count != len(cases)
+    ):
+        raise PocError("candidate_classification_count_mismatch")
+
+    category_counts = {
+        relevance.DIRECT: 0,
+        relevance.POTENTIAL: 0,
+        relevance.IRRELEVANT: 0,
+    }
+    classified_count = 0
+    notification_blocked_count = 0
+    diagnostics_count = 0
+    ruleset_version = relevance.RULESET_VERSION
+    for case in cases:
+        if (
+            not isinstance(case, dict)
+            or case.get("source") != "folketinget"
+            or case.get("historical") is not False
+            or case.get("notify_eligible") is not None
+        ):
+            raise PocError("candidate_classification_case_invalid")
+        try:
+            classification = relevance.classify(case)
+        except Exception:
+            raise PocError("candidate_classification_failed") from None
+        category = getattr(classification, "relevance", None)
+        result_ruleset = getattr(classification, "ruleset_version", None)
+        diagnostics = getattr(classification, "diagnostics", None)
+        notification_blocked = getattr(classification, "notification_blocked", None)
+        if (
+            category not in category_counts
+            or result_ruleset != ruleset_version
+            or not isinstance(diagnostics, (tuple, list))
+            or not isinstance(notification_blocked, bool)
+        ):
+            raise PocError("candidate_classification_result_invalid")
+        category_counts[category] += 1
+        classified_count += 1
+        diagnostics_count += len(diagnostics)
+        notification_blocked_count += int(notification_blocked)
+
+    if classified_count != candidate_count:
+        raise PocError("candidate_classification_count_mismatch")
+    extraction_complete = bundle.get("complete") is True
+    extraction_diagnostics = bundle.get("diagnostics")
+    if not isinstance(extraction_diagnostics, list):
+        raise PocError("candidate_bundle_validation_failed")
+    clean_extraction_diagnostics: list[dict[str, Any]] = []
+    for diagnostic in extraction_diagnostics:
+        if (
+            not isinstance(diagnostic, dict)
+            or not re.fullmatch(r"[a-z0-9_]{1,80}", str(diagnostic.get("code", "")))
+            or isinstance(diagnostic.get("count"), bool)
+            or not isinstance(diagnostic.get("count"), int)
+            or diagnostic["count"] < 0
+        ):
+            raise PocError("candidate_bundle_validation_failed")
+        clean_extraction_diagnostics.append({"code": diagnostic["code"], "count": diagnostic["count"]})
+    return {
+        "candidate_case_count": candidate_count,
+        "classified_case_count": classified_count,
+        "relevance_counts": category_counts,
+        "notification_blocked_count": notification_blocked_count,
+        "classification_diagnostics_count": diagnostics_count,
+        "ruleset_version": ruleset_version,
+        "extraction_complete": extraction_complete,
+        "complete": extraction_complete,
+        "extraction_diagnostics": clean_extraction_diagnostics,
+    }
+
+
+def write_candidate_classification_summary(summary: dict[str, Any]) -> None:
+    classification = summary["classification"]
+    state = "PASS" if classification["complete"] else "INCOMPLETE"
+    relevance_counts = classification["relevance_counts"]
+    lines = [
+        f"Snapshot relevance dry-run: {state}",
+        "",
+        f"- candidate case count: {classification['candidate_case_count']}",
+        f"- classified case count: {classification['classified_case_count']}",
+        f"- DIRECT: {relevance_counts['DIRECT']}",
+        f"- POTENTIAL: {relevance_counts['POTENTIAL']}",
+        f"- IRRELEVANT: {relevance_counts['IRRELEVANT']}",
+        f"- notification_blocked count: {classification['notification_blocked_count']}",
+        f"- classification diagnostics count: {classification['classification_diagnostics_count']}",
+        f"- ruleset_version: {classification['ruleset_version']}",
+        f"- extraction complete: {str(classification['extraction_complete']).lower()}",
+        "- extraction diagnostics:",
+    ]
+    if classification["extraction_diagnostics"]:
+        lines.extend(
+            f"  - {item['code']}: {item['count']}"
+            for item in classification["extraction_diagnostics"]
+        )
+    else:
+        lines.append("  - none")
+    lines.extend([
+        f"- old backup finish: {summary['old_finish']}",
+        f"- new backup finish: {summary['new_finish']}",
+        "",
+    ])
+    text = "\n".join(lines)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as output:
+                output.write(text)
+        except OSError:
+            raise PocError("candidate_classification_summary_write_failed") from None
+    print(text, end="")
 
 
 def write_candidate_extraction_summary(summary: dict[str, Any]) -> None:
@@ -1544,7 +1674,7 @@ def main() -> int:
     try:
         mode = validate_mode(os.environ.get("INPUT_MODE", RESTORE_VALIDATE))
         validate_confirmation(os.environ.get("INPUT_CONFIRM_RESTORE", ""))
-        if mode == EXTRACT_SNAPSHOT_CANDIDATES:
+        if mode in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
             candidate_context = validate_candidate_manifest_inputs(
                 Path(os.environ.get("OLD_MANIFEST_PATH", "")),
                 Path(os.environ.get("NEW_MANIFEST_PATH", "")),
@@ -1558,13 +1688,13 @@ def main() -> int:
         require_x64_ubuntu24(platform.machine(), release)
         runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
         initial_free = free_bytes(runner_temp)
-        if mode != EXTRACT_SNAPSHOT_CANDIDATES:
+        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
             print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
         check_free_space(initial_free, 8 * GIB)
         password = __import__("secrets").token_urlsafe(32) + "Aa1!"
         run_sql_server_setup(password)
         after_install = free_bytes(runner_temp)
-        if mode != EXTRACT_SNAPSHOT_CANDIDATES:
+        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
             print(f"sql_server_edition=Express 2025 free_disk_before_download_bytes={after_install}")
         opener = make_oda_opener(username, credential)
         content_length = request_content_length(opener)
@@ -1582,7 +1712,7 @@ def main() -> int:
         download = download_backup(opener, download_temp_path, content_length)
         print("progress=backup_download_complete")
         backup_size, backup_checksum, download_seconds = validate_download_metadata(download, content_length)
-        if mode != EXTRACT_SNAPSHOT_CANDIDATES:
+        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
             print(f"backup_bytes={backup_size} sha256={backup_checksum} download_seconds={download_seconds}")
         print("progress=backup_staging_copy")
         run_checked(
@@ -1599,7 +1729,7 @@ def main() -> int:
         )
         restore_free = check_restore_disk_space(restore_parent, 1)
         validate_backup_readable_by_sql_server(backup_path, backup_size)
-        if mode != EXTRACT_SNAPSHOT_CANDIDATES:
+        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
             print(f"free_disk_before_restore_bytes={restore_free}")
         print("progress=restore_header_check")
         header_output = sqlcmd(
@@ -1637,7 +1767,7 @@ def main() -> int:
         entities = validate_entities(password)
         if entities["missing"] or entities["no_primary_key"]:
             raise PocError("required_entity_validation_failed")
-        if mode == EXTRACT_SNAPSHOT_CANDIDATES:
+        if mode in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES}:
             if candidate_context is None:
                 raise PocError("candidate_manifest_context_missing")
             print("progress=candidate_schema_discovery")
@@ -1674,8 +1804,15 @@ def main() -> int:
                 runner_temp,
                 candidate_context["old_finish"],
                 candidate_context["new_finish"],
+                classify_candidates=mode == CLASSIFY_SNAPSHOT_CANDIDATES,
             )
-            write_candidate_extraction_summary(candidate_result)
+            if mode == CLASSIFY_SNAPSHOT_CANDIDATES:
+                write_candidate_classification_summary(candidate_result)
+                if not candidate_result["classification"]["complete"]:
+                    print("restore_validation=INCOMPLETE")
+                    return 2
+            else:
+                write_candidate_extraction_summary(candidate_result)
             print("restore_validation=PASS")
         else:
             summary = {

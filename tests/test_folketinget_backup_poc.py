@@ -62,6 +62,120 @@ def create_candidate_manifest(
 
 
 class BackupPocSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _candidate_bundle(cases, *, complete=True, diagnostics=None, candidate_count=None):
+        return {
+            "format_version": 1,
+            "source": "folketinget",
+            "candidate_case_count": len(cases) if candidate_count is None else candidate_count,
+            "cases": cases,
+            "complete": complete,
+            "diagnostics": diagnostics or [],
+            "diff": {
+                "entities": {entity: dict.fromkeys(POC.snapshot_diff.CATEGORIES, 0)
+                             for entity in POC.REQUIRED_ENTITIES},
+                "totals": dict.fromkeys(POC.snapshot_diff.CATEGORIES, 0),
+            },
+            "_summary": {"affected_case_count": len(cases), "hydrated_case_count": len(cases)},
+        }
+
+    def _run_classification(self, root, bundle):
+        stamp = "2026-10-19T02:00:00Z"
+        old, new = root / "old.sqlite", root / "new.sqlite"
+        create_candidate_manifest(old, backup="1", finish="2026-10-18T02:00:00Z", include_sag=False)
+        create_candidate_manifest(new, backup="2", finish=stamp, include_sag=False)
+        with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=bundle):
+            return POC.run_candidate_extraction(
+                old, new, SimpleNamespace(), root, "2026-10-18T02:00:00Z", stamp,
+                classify_candidates=True,
+            )
+
+    def test_snapshot_classification_handles_zero_direct_potential_and_irrelevant(self) -> None:
+        from collectors import relevance
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            zero = self._run_classification(root, self._candidate_bundle([]))
+            self.assertEqual(zero["classification"], {
+                "candidate_case_count": 0,
+                "classified_case_count": 0,
+                "relevance_counts": {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0},
+                "notification_blocked_count": 0,
+                "classification_diagnostics_count": 0,
+                "ruleset_version": relevance.RULESET_VERSION,
+                "extraction_complete": True,
+                "complete": True,
+                "extraction_diagnostics": [],
+            })
+            cases = [
+                {"source": "folketinget", "historical": False, "notify_eligible": None,
+                 "title": "Fordrevne fra Ukraine"},
+                {"source": "folketinget", "historical": False, "notify_eligible": None,
+                 "title": "Ændring af udlændingeloven om opholdstilladelse"},
+                {"source": "folketinget", "historical": False, "notify_eligible": None,
+                 "title": "PRIVATE IRRELEVANT TITLE"},
+            ]
+            result = self._run_classification(root, self._candidate_bundle(cases))
+            classification = result["classification"]
+            self.assertEqual(classification["relevance_counts"], {"DIRECT": 1, "POTENTIAL": 1, "IRRELEVANT": 1})
+            self.assertEqual(classification["classified_case_count"], 3)
+            self.assertEqual(classification["ruleset_version"], "1.1")
+            output = StringIO()
+            with redirect_stdout(output):
+                POC.write_candidate_classification_summary(result)
+            rendered = output.getvalue()
+            for private in ("PRIVATE IRRELEVANT TITLE", "external_id", "Fordrevne fra Ukraine", "documents"):
+                self.assertNotIn(private, rendered)
+            self.assertIn("Snapshot relevance dry-run: PASS", rendered)
+
+    def test_snapshot_classification_aggregates_blocked_and_diagnostics_and_preserves_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            cases = [
+                {"source": "folketinget", "historical": False, "notify_eligible": None,
+                 "title": "PRIVATE TITLE", "complete": False},
+            ]
+            extraction_diagnostics = [{"code": "source_lookup_failed", "count": 1}]
+            result = self._run_classification(
+                root, self._candidate_bundle(cases, complete=False, diagnostics=extraction_diagnostics)
+            )
+            classification = result["classification"]
+            self.assertEqual(classification["notification_blocked_count"], 1)
+            self.assertEqual(classification["classification_diagnostics_count"], 1)
+            self.assertFalse(classification["complete"])
+            self.assertFalse(classification["extraction_complete"])
+            self.assertEqual(classification["extraction_diagnostics"], extraction_diagnostics)
+            output = StringIO()
+            with redirect_stdout(output):
+                POC.write_candidate_classification_summary(result)
+            self.assertIn("Snapshot relevance dry-run: INCOMPLETE", output.getvalue())
+            self.assertIn("source_lookup_failed: 1", output.getvalue())
+            self.assertNotIn("PRIVATE TITLE", output.getvalue())
+
+    def test_snapshot_classification_count_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = self._candidate_bundle([{"title": "PRIVATE"}], candidate_count=2)
+            with self.assertRaises(POC.PocError) as raised:
+                self._run_classification(pathlib.Path(temp), bundle)
+            self.assertEqual(raised.exception.category, "candidate_classification_count_mismatch")
+
+    def test_snapshot_classification_candidate_file_is_private_and_cleaned(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            bundle = self._candidate_bundle([])
+            observed_modes = []
+            original = POC._write_private_candidate_bundle
+
+            def inspect_private_file(payload, directory):
+                path = original(payload, directory)
+                observed_modes.append(path.stat().st_mode & 0o777)
+                return path
+
+            with mock.patch.object(POC, "_write_private_candidate_bundle", side_effect=inspect_private_file):
+                self._run_classification(root, bundle)
+            self.assertEqual(observed_modes, [0o600])
+            self.assertEqual(list(root.glob("denmarkbot-candidate-bundle-*.json")), [])
+
     def test_candidate_orchestration_handles_zero_diff_added_sag_and_changed_child(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider
 
@@ -241,8 +355,9 @@ class BackupPocSafetyTests(unittest.TestCase):
     def test_candidate_workflow_is_manual_and_does_not_publish_candidate_bundle(self) -> None:
         workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
         self.assertIn("- EXTRACT_SNAPSHOT_CANDIDATES", workflow)
+        self.assertIn("- CLASSIFY_SNAPSHOT_CANDIDATES", workflow)
         self.assertNotIn("schedule:", workflow)
-        self.assertIn("inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES'", workflow)
+        self.assertIn("inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES'", workflow)
         self.assertIn("OLD_MANIFEST_PATH:", workflow)
         self.assertIn("NEW_MANIFEST_PATH:", workflow)
         self.assertIn("INPUT_OLD_RUN_ID:", workflow)
@@ -253,6 +368,15 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertNotIn("candidate-bundle", workflow)
         self.assertNotIn("EXTRACT_SNAPSHOT_CANDIDATES\n        uses: actions/upload-artifact", workflow)
         self.assertIn("if: success() && inputs.mode == 'CREATE_MANIFEST_BASELINE'", workflow)
+
+    def test_classify_mode_is_explicit_and_restores_without_production_integrations(self) -> None:
+        self.assertEqual(POC.validate_mode("CLASSIFY_SNAPSHOT_CANDIDATES"), "CLASSIFY_SNAPSHOT_CANDIDATES")
+        workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
+        self.assertIn("on:\n  workflow_dispatch:", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertNotIn("/internal/", workflow)
+        self.assertNotIn("sendMessage", workflow)
+        self.assertNotIn("notification", workflow.lower())
 
     def test_repository_imports_work_from_repository_and_external_cwd(self) -> None:
         script_path = ROOT / "tools" / "folketinget_backup_poc.py"

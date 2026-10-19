@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
       mode:
-        description: "Choose restore validation, SQL provider validation, manifest generation, comparison, or candidate extraction"
+        description: "Choose a manual restore, validation, manifest, diff, extraction, or relevance dry-run"
         required: true
         type: choice
         options:
@@ -18,13 +18,14 @@ on:
           - CREATE_MANIFEST_BASELINE
           - DIFF_MANIFESTS
           - EXTRACT_SNAPSHOT_CANDIDATES
+          - CLASSIFY_SNAPSHOT_CANDIDATES
         default: RESTORE_VALIDATE
       old_run_id:
-        description: "Successful manual baseline run ID for the older manifest (diff/extraction modes)"
+        description: "Successful manual baseline run ID for the older manifest (diff/extraction/classification modes)"
         required: false
         type: string
       new_run_id:
-        description: "Successful manual baseline run ID for the newer manifest (diff/extraction modes)"
+        description: "Successful manual baseline run ID for the newer manifest (diff/extraction/classification modes)"
         required: false
         type: string
 
@@ -44,7 +45,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
       - name: Validate manifest run IDs and artifacts
-        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES'
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
@@ -91,7 +92,7 @@ jobs:
             fi
           done
       - name: Download older manifest artifact
-        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES'
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES'
         uses: actions/download-artifact@v4
         with:
           name: folketinget-snapshot-manifest-${{ inputs.old_run_id }}
@@ -100,7 +101,7 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
       - name: Download newer manifest artifact
-        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES'
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES'
         uses: actions/download-artifact@v4
         with:
           name: folketinget-snapshot-manifest-${{ inputs.new_run_id }}
@@ -150,7 +151,7 @@ jobs:
             rm -rf -- "$target"
           fi
       - name: Remove downloaded manifest artifacts
-        if: always() && (inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES')
+        if: always() && (inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES')
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
