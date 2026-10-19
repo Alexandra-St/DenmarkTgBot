@@ -128,7 +128,7 @@ class FolketingetSnapshotDiffTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("- DIFF_MANIFESTS", workflow)
         self.assertIn("actions: read", workflow)
-        self.assertIn("actions/download-artifact@v4", workflow)
+        self.assertIn("actions/download-artifact@v8", workflow)
         self.assertIn("OLD_RUN_ID", workflow)
         self.assertIn("NEW_RUN_ID", workflow)
         self.assertNotIn("--arg ", workflow)
