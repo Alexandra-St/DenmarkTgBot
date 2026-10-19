@@ -119,18 +119,6 @@ jobs:
             --new "$RUNNER_TEMP/folketinget-manifest-new" \
             | tee "$RUNNER_TEMP/folketinget-snapshot-diff.json" \
             | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Remove downloaded manifest artifacts
-        if: always() && (inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES')
-        env:
-          RUNNER_TEMP: ${{ runner.temp }}
-        run: |
-          set -euo pipefail
-          for name in folketinget-manifest-old folketinget-manifest-new; do
-            target="$RUNNER_TEMP/$name"
-            if [ -d "$target" ] && [ ! -L "$target" ]; then
-              rm -rf -- "$target"
-            fi
-          done
       - name: Verify and restore official backup
         if: inputs.mode != 'DIFF_MANIFESTS'
         env:
@@ -161,3 +149,15 @@ jobs:
           if [ -d "$target" ] && [ ! -L "$target" ]; then
             rm -rf -- "$target"
           fi
+      - name: Remove downloaded manifest artifacts
+        if: always() && (inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES')
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          for name in folketinget-manifest-old folketinget-manifest-new; do
+            target="$RUNNER_TEMP/$name"
+            if [ -d "$target" ] && [ ! -L "$target" ]; then
+              rm -rf -- "$target"
+            fi
+          done

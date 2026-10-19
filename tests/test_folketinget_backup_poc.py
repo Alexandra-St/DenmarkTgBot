@@ -248,6 +248,8 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("INPUT_OLD_RUN_ID:", workflow)
         self.assertIn("INPUT_NEW_RUN_ID:", workflow)
         self.assertIn("if: inputs.mode != 'DIFF_MANIFESTS'", workflow)
+        self.assertLess(workflow.index("name: Verify and restore official backup"),
+                        workflow.index("name: Remove downloaded manifest artifacts"))
         self.assertNotIn("candidate-bundle", workflow)
         self.assertNotIn("EXTRACT_SNAPSHOT_CANDIDATES\n        uses: actions/upload-artifact", workflow)
         self.assertIn("if: success() && inputs.mode == 'CREATE_MANIFEST_BASELINE'", workflow)
