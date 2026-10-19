@@ -44,8 +44,11 @@ RESTORE_VALIDATE = "RESTORE_VALIDATE"
 CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
-MANIFEST_BASE64_COLUMN_HEADER = "manifest_payload_b64"
-EXPECTED_MANIFEST_HEADER_SHA256 = hashlib.sha256(MANIFEST_BASE64_COLUMN_HEADER.encode("utf-8")).hexdigest()
+MANIFEST_BASE64_CHUNK_SIZE = 6000
+# 64 MiB UTF-8 JSON needs at most 128 MiB UTF-16LE, or 29,827 chunks.
+MANIFEST_MAX_BASE64_CHUNKS = 30000
+# Five sequence digits + one delimiter + 6000 ASCII bytes = at most 6006 columns.
+MANIFEST_SQL_ROW_WIDTH = 6100
 
 
 class PocError(Exception):
@@ -761,17 +764,26 @@ def manifest_page_json(
         f"SELECT {selected} FROM {quote_identifier(schema_name)}.{quote_identifier(entity)} "
         f"ORDER BY {ordering} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY "
         "FOR JSON PATH, INCLUDE_NULL_VALUES); "
-        "SELECT BASE64_ENCODE(CONVERT(varbinary(max), @manifest_json)) AS [manifest_payload_b64];"
+        "DECLARE @manifest_b64 varchar(max); "
+        "SET @manifest_b64 = BASE64_ENCODE(CONVERT(varbinary(max), @manifest_json)); "
+        ";WITH chunk_sequence AS ("
+        "SELECT CAST(1 AS int) AS sequence_number UNION ALL "
+        f"SELECT sequence_number + 1 FROM chunk_sequence WHERE sequence_number * {MANIFEST_BASE64_CHUNK_SIZE} < LEN(@manifest_b64)) "
+        "SELECT CAST(CAST(sequence_number AS varchar(5)) + '|' + "
+        f"CAST(SUBSTRING(@manifest_b64, ((sequence_number - 1) * {MANIFEST_BASE64_CHUNK_SIZE}) + 1, "
+        f"{MANIFEST_BASE64_CHUNK_SIZE}) AS varchar({MANIFEST_BASE64_CHUNK_SIZE})) AS varchar(6006)) AS chunk_line "
+        f"FROM chunk_sequence ORDER BY sequence_number OPTION (MAXRECURSION {MANIFEST_MAX_BASE64_CHUNKS});"
     )
     output = run_manifest_page_sql(
         [SQLCMD, "-S", "localhost", "-U", "sa", "-C", "-b", "-r",
-         "-s", "|", "-w", "65535", "-y", "0", "-d", DATABASE, "-Q", query],
+         "-h", "-1", "-W", "-s", "|", "-w", str(MANIFEST_SQL_ROW_WIDTH),
+         "-d", DATABASE, "-Q", query],
         password,
         entity=entity,
         offset=offset,
         timeout=600,
     )
-    payload = parse_manifest_page_output(output)
+    payload = parse_manifest_page_output(output, entity=entity, offset=offset)
     try:
         if len(payload.encode("utf-8")) > snapshot_manifest.MAX_BATCH_JSON_BYTES:
             raise PocError("manifest_page_too_large")
@@ -780,49 +792,45 @@ def manifest_page_json(
     return payload
 
 
-def parse_manifest_page_output(output: str) -> str:
-    """Decode a Base64-wrapped UTF-16LE JSON result from sqlcmd."""
+def parse_manifest_page_output(output: str, *, entity: str, offset: int) -> str:
+    """Reassemble strict sequence-numbered Base64 chunks from sqlcmd rows."""
+    if entity not in REQUIRED_ENTITIES or offset < 0:
+        raise PocError("manifest_page_invalid")
     lines = [line.removesuffix("\r") for line in output.split("\n")]
-    line_count = len(lines)
-    encoded_chars: int | None = None
+    if lines and lines[-1] == "":
+        lines.pop()
+    chunk_count = len(lines)
+    encoded_chars = 0
 
     def fail(stage: str, category: str) -> None:
-        diagnostic = f"manifest_page_parse_failure stage={stage} line_count={line_count}"
-        if encoded_chars is not None:
-            diagnostic += f" encoded_chars={encoded_chars}"
-        print(diagnostic, file=sys.stderr)
+        print(
+            f"manifest_page_parse_failure entity={entity} offset={offset} "
+            f"chunk_count={chunk_count} encoded_chars={encoded_chars} stage={stage} category={category}",
+            file=sys.stderr,
+        )
         raise PocError(category)
 
-    while lines and not lines[0].strip(" \t"):
-        lines.pop(0)
-    while lines and not lines[-1].strip(" \t"):
-        lines.pop()
-    if not lines:
-        fail("header", "manifest_page_header_invalid")
-    stripped_header = lines[0].strip()
-    if stripped_header != MANIFEST_BASE64_COLUMN_HEADER:
-        header_bytes = stripped_header.encode("utf-8", errors="replace")
-        diagnostic = (
-            f"manifest_page_parse_failure stage=header line_count={line_count} "
-            f"header_chars={len(stripped_header)} header_utf8_bytes={len(header_bytes)} "
-            f"header_sha256={hashlib.sha256(header_bytes).hexdigest()} "
-            f"starts_with_utf8_bom={'true' if stripped_header.startswith(chr(0xFEFF)) else 'false'} "
-            f"ascii_only={'true' if stripped_header.isascii() else 'false'}"
-        )
-        print(diagnostic, file=sys.stderr)
-        raise PocError("manifest_page_header_invalid")
-    if len(lines) < 3:
-        fail("separator", "manifest_page_separator_invalid")
-    if not re.fullmatch(r"[ \t]*-{3,}[ \t]*", lines[1]):
-        fail("separator", "manifest_page_separator_invalid")
-    if any(not line.strip(" \t") for line in lines[2:]):
-        fail("base64_format", "manifest_page_base64_format_invalid")
-    # Formatting whitespace is safe to remove only after SQL encoded the payload.
-    encoded = "".join(lines[2:])
-    encoded = re.sub(r"[\t\n\r\v\f ]", "", encoded)
-    encoded_chars = len(encoded)
-    if not encoded or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", encoded) or len(encoded) % 4:
-        fail("base64_format", "manifest_page_base64_format_invalid")
+    if not lines or chunk_count > MANIFEST_MAX_BASE64_CHUNKS:
+        fail("sequence", "manifest_page_chunk_sequence_invalid")
+    chunks: list[str] = []
+    for expected_sequence, line in enumerate(lines, start=1):
+        parts = line.split("|")
+        if len(parts) != 2 or not re.fullmatch(r"[1-9][0-9]{0,4}", parts[0]):
+            fail("row", "manifest_page_chunk_row_invalid")
+        sequence = int(parts[0], 10)
+        chunk = parts[1]
+        encoded_chars += len(chunk)
+        if sequence != expected_sequence:
+            fail("sequence", "manifest_page_chunk_sequence_invalid")
+        if not chunk or len(chunk) > MANIFEST_BASE64_CHUNK_SIZE or len(chunk) % 4:
+            fail("base64_format", "manifest_page_base64_format_invalid")
+        if not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", chunk):
+            fail("base64_format", "manifest_page_base64_format_invalid")
+        if expected_sequence < chunk_count:
+            if len(chunk) != MANIFEST_BASE64_CHUNK_SIZE or "=" in chunk:
+                fail("base64_format", "manifest_page_base64_format_invalid")
+        chunks.append(chunk)
+    encoded = "".join(chunks)
     try:
         raw = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error):
@@ -896,10 +904,6 @@ def report_manifest_entity(entity: str) -> None:
     if entity not in REQUIRED_ENTITIES:
         raise PocError("manifest_page_invalid")
     print(f"progress=manifest_entity entity={entity}")
-
-
-def report_expected_manifest_header_fingerprint() -> None:
-    print(f"manifest_expected_header_sha256={EXPECTED_MANIFEST_HEADER_SHA256}")
 
 
 def write_summary(summary: dict[str, Any]) -> None:
@@ -1116,7 +1120,6 @@ def main() -> int:
                 raise PocError("manifest_directory_setup_failed") from None
             manifest_path = manifest_directory / MANIFEST_FILENAME
             print("progress=manifest_generation")
-            report_expected_manifest_header_fingerprint()
             try:
                 started_entities: set[str] = set()
 
