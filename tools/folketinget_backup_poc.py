@@ -1004,6 +1004,29 @@ def exercise_sql_provider(
 
     failures = 0
 
+    def preserve_provider_failure(exc: Exception, phase_name: str, entity: str) -> None:
+        from folketinget_sql_provider import (
+            SAFE_PROVIDER_ERROR_CATEGORIES,
+            SAFE_TRANSPORT_CATEGORIES,
+        )
+
+        category = getattr(exc, "category", None)
+        if not isinstance(category, str) or category not in SAFE_PROVIDER_ERROR_CATEGORIES:
+            category = "provider_error_unknown"
+        transport_category = getattr(exc, "transport_category", None)
+        safe_transport = (
+            isinstance(transport_category, str)
+            and (
+                transport_category in SAFE_TRANSPORT_CATEGORIES
+                or re.fullmatch(r"manifest_page_sql_msg_[0-9]{1,6}", transport_category)
+            )
+        )
+        line = f"sql_provider_failure phase={phase_name} entity={entity} category={category}"
+        if category == "provider_transport_failed" and safe_transport:
+            line += f" transport_category={transport_category}"
+        print(line, file=sys.stderr)
+        raise PocError(f"sql_provider_{phase_name}_{category}") from None
+
     def validate_rows(normalize_many, entity: str, rows: Any) -> tuple[dict[str, Any], ...]:
         nonlocal failures
         result = normalize_many(list(rows), entity)
@@ -1021,7 +1044,15 @@ def exercise_sql_provider(
             raise PocError("sql_provider_sample_validation_failed")
         count = 0
         for entity in REQUIRED_ENTITIES:
-            rows = tuple(provider.get_by_ids(entity, (sample_ids[entity],)))
+            print(f"progress=sql_provider_get_by_ids entity={entity}")
+            try:
+                rows = tuple(provider.get_by_ids(entity, (sample_ids[entity],)))
+            except Exception as exc:
+                from folketinget_sql_provider import SQLProviderError
+
+                if isinstance(exc, SQLProviderError):
+                    preserve_provider_failure(exc, "get_by_ids", entity)
+                raise
             if len(rows) != 1 or rows[0].get("id") != sample_ids[entity]:
                 raise PocError("sql_provider_sample_validation_failed")
             normalized = validate_rows(normalize_many, entity, rows)
@@ -1043,7 +1074,15 @@ def exercise_sql_provider(
                or isinstance(value, bool) or not isinstance(value, int) for entity, field, value in relations):
             raise PocError("sql_provider_relation_validation_failed")
         for entity, field, value in relations:
-            rows = tuple(provider.find_by_field(entity, field, (value,)))
+            print(f"progress=sql_provider_relation_check entity={entity} field={field}")
+            try:
+                rows = tuple(provider.find_by_field(entity, field, (value,)))
+            except Exception as exc:
+                from folketinget_sql_provider import SQLProviderError
+
+                if isinstance(exc, SQLProviderError):
+                    preserve_provider_failure(exc, "relation_check", entity)
+                raise
             validate_rows(normalize_many, entity, rows)
         if failures:
             raise PocError("sql_provider_normalization_failed")

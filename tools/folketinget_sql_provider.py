@@ -8,6 +8,7 @@ No caller-controlled SQL fragments are accepted.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -40,13 +41,40 @@ MAX_IDS_PER_QUERY = 500
 MAX_LOOKUP_VALUES = 100_000
 SQL_INT_MIN = -(2**63)
 SQL_INT_MAX = 2**63 - 1
+SAFE_PROVIDER_ERROR_CATEGORIES = frozenset({
+    "provider_configuration_invalid",
+    "provider_entity_not_allowed",
+    "provider_values_invalid",
+    "provider_field_not_allowed",
+    "provider_query_invalid",
+    "provider_query_failed",
+    "provider_transport_failed",
+    "provider_json_invalid",
+    "provider_row_shape_invalid",
+    "provider_id_type_invalid",
+    "provider_relation_field_type_invalid",
+    "provider_unexpected_row",
+    "provider_duplicate_conflict",
+})
+SAFE_TRANSPORT_CATEGORIES = frozenset({
+    "manifest_page_invalid",
+    "manifest_page_chunk_sequence_invalid",
+    "manifest_page_chunk_row_invalid",
+    "manifest_page_base64_format_invalid",
+    "manifest_page_base64_decode_failed",
+    "manifest_page_utf16_decode_failed",
+    "manifest_page_json_invalid",
+    "manifest_page_too_large",
+    "manifest_page_sqlcmd_failed",
+})
 
 
 class SQLProviderError(Exception):
     """Safe provider failure category; contains no SQL or row data."""
 
-    def __init__(self, category: str) -> None:
+    def __init__(self, category: str, *, transport_category: str | None = None) -> None:
         self.category = category
+        self.transport_category = transport_category
         super().__init__(category)
 
 
@@ -137,7 +165,18 @@ class SQLServerFolketingetProvider:
             payload = self._query_executor(query, entity)
         except SQLProviderError:
             raise
-        except Exception:
+        except Exception as exc:
+            transport_category = getattr(exc, "category", None)
+            if (
+                isinstance(transport_category, str)
+                and (
+                    transport_category in SAFE_TRANSPORT_CATEGORIES
+                    or re.fullmatch(r"manifest_page_sql_msg_[0-9]{1,6}", transport_category)
+                )
+            ):
+                raise SQLProviderError(
+                    "provider_transport_failed", transport_category=transport_category
+                ) from None
             raise SQLProviderError("provider_query_failed") from None
         rows = self._parse_rows(payload, entity)
         requested = set(values)
@@ -160,11 +199,11 @@ class SQLServerFolketingetProvider:
                 raise SQLProviderError("provider_row_shape_invalid")
             identifier = row.get("id")
             if isinstance(identifier, bool) or not isinstance(identifier, int) or not SQL_INT_MIN <= identifier <= SQL_INT_MAX:
-                raise SQLProviderError("provider_row_shape_invalid")
+                raise SQLProviderError("provider_id_type_invalid")
             for field in RELATION_FIELDS[entity]:
                 value = row.get(field)
                 if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-                    raise SQLProviderError("provider_row_shape_invalid")
+                    raise SQLProviderError("provider_relation_field_type_invalid")
             rows.append(row)
         return tuple(rows)
 

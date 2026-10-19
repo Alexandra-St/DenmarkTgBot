@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import pathlib
 import re
@@ -195,6 +197,7 @@ class SQLServerProviderTests(unittest.TestCase):
             "progress=sql_provider_schema_check",
             "progress=sql_provider_construct",
             "progress=sql_provider_get_by_ids",
+            *[f"progress=sql_provider_get_by_ids entity={entity}" for entity in ENTITIES],
             "progress=sql_provider_relation_checks",
         ])
 
@@ -207,7 +210,10 @@ class SQLServerProviderTests(unittest.TestCase):
             with self.assertRaises(POC.PocError) as raised:
                 POC.exercise_sql_provider(provider, sample_ids)
         self.assertEqual(raised.exception.category, "sql_provider_get_by_ids_failed")
-        self.assertEqual(output, ["progress=sql_provider_get_by_ids"])
+        self.assertEqual(output, [
+            "progress=sql_provider_get_by_ids",
+            "progress=sql_provider_get_by_ids entity=Sag",
+        ])
 
         provider = mock.Mock()
         provider.get_by_ids.side_effect = lambda entity, ids: (row(entity, 1),)
@@ -217,7 +223,85 @@ class SQLServerProviderTests(unittest.TestCase):
             with self.assertRaises(POC.PocError) as raised:
                 POC.exercise_sql_provider(provider, sample_ids, [("Sag", "statusid", 2)])
         self.assertEqual(raised.exception.category, "sql_provider_relation_validation_failed")
-        self.assertEqual(output, ["progress=sql_provider_get_by_ids", "progress=sql_provider_relation_checks"])
+        self.assertEqual(output[:1], ["progress=sql_provider_get_by_ids"])
+        self.assertEqual(output[1:7], [f"progress=sql_provider_get_by_ids entity={entity}" for entity in ENTITIES])
+        self.assertEqual(output[7:], [
+            "progress=sql_provider_relation_checks",
+            "progress=sql_provider_relation_check entity=Sag field=statusid",
+        ])
+
+    def test_provider_category_survives_smoke_without_logging_ids_or_payload(self) -> None:
+        import folketinget_sql_provider as canonical_provider
+
+        provider = mock.Mock()
+        provider.get_by_ids.side_effect = canonical_provider.SQLProviderError("provider_row_shape_invalid")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(POC.PocError) as raised:
+                POC.exercise_sql_provider(provider, {entity: 987654321 for entity in ENTITIES})
+        self.assertEqual(raised.exception.category, "sql_provider_get_by_ids_provider_row_shape_invalid")
+        self.assertIn("sql_provider_failure phase=get_by_ids entity=Sag category=provider_row_shape_invalid", err.getvalue())
+        self.assertIn("progress=sql_provider_get_by_ids entity=Sag", out.getvalue())
+        for private_value in ("987654321", "row payload", "title", "SQL"):
+            self.assertNotIn(private_value, out.getvalue() + err.getvalue())
+
+    def test_relation_provider_category_survives_smoke_with_safe_field_marker(self) -> None:
+        import folketinget_sql_provider as canonical_provider
+
+        provider = mock.Mock()
+        provider.get_by_ids.side_effect = lambda entity, ids: (row(entity, ids[0]),)
+        provider.find_by_field.side_effect = canonical_provider.SQLProviderError("provider_unexpected_row")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(POC.PocError) as raised:
+                POC.exercise_sql_provider(provider, {entity: 1 for entity in ENTITIES}, [("Sag", "statusid", 987654321)])
+        self.assertEqual(raised.exception.category, "sql_provider_relation_check_provider_unexpected_row")
+        self.assertIn("progress=sql_provider_relation_check entity=Sag field=statusid", out.getvalue())
+        self.assertIn("sql_provider_failure phase=relation_check entity=Sag category=provider_unexpected_row", err.getvalue())
+        self.assertNotIn("987654321", out.getvalue() + err.getvalue())
+
+    def test_transport_poc_error_category_is_retained_safely(self) -> None:
+        import folketinget_sql_provider as canonical_provider
+
+        class TransportPocError(Exception):
+            category = "manifest_page_chunk_row_invalid"
+
+        def fail(query, entity):
+            raise TransportPocError("private query and payload")
+
+        provider = canonical_provider.SQLServerFolketingetProvider(SCHEMAS, fail)
+        with self.assertRaises(canonical_provider.SQLProviderError) as raised:
+            provider.get_by_ids("Sag", [1])
+        self.assertEqual(raised.exception.category, "provider_transport_failed")
+        self.assertEqual(raised.exception.transport_category, "manifest_page_chunk_row_invalid")
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(POC.PocError) as smoke_error:
+                POC.exercise_sql_provider(provider, {entity: 1 for entity in ENTITIES})
+        self.assertEqual(smoke_error.exception.category, "sql_provider_get_by_ids_provider_transport_failed")
+        self.assertIn("transport_category=manifest_page_chunk_row_invalid", err.getvalue())
+        self.assertNotIn("private", out.getvalue() + err.getvalue())
+
+    def test_provider_shape_errors_are_distinguished_without_field_leakage(self) -> None:
+        import folketinget_sql_provider as canonical_provider
+
+        expected = set(canonical_provider.PROJECTIONS["Sag"])
+        cases = [
+            ("not-json", "provider_json_invalid"),
+            (json.dumps([{"id": 1}]), "provider_row_shape_invalid"),
+            (json.dumps([{field: None for field in expected} | {"id": "private-id"}]), "provider_id_type_invalid"),
+            (json.dumps([row("Sag", 1, statusid="private-value")]), "provider_relation_field_type_invalid"),
+        ]
+        for payload, category in cases:
+            with self.subTest(category=category):
+                provider = canonical_provider.SQLServerFolketingetProvider(
+                    SCHEMAS, lambda query, entity, result=payload: result
+                )
+                with self.assertRaises(canonical_provider.SQLProviderError) as raised:
+                    provider.get_by_ids("Sag", [1])
+                self.assertEqual(raised.exception.category, category)
+                self.assertNotIn("private", str(raised.exception))
 
     def test_all_six_projections_match_the_existing_model_contract(self) -> None:
         self.assertEqual(PROVIDER_MODULE.PROJECTIONS, {
