@@ -9,7 +9,7 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
 if TOOLS_DIRECTORY not in sys.path:
@@ -197,6 +197,58 @@ def _counts_for_pair(old_path: Path, new_path: Path) -> dict[str, dict[str, int]
         return counts
     finally:
         connection.close()
+
+
+def _iter_manifest_changes_validated(old_path: Path, new_path: Path) -> Iterator[tuple[str, str, str]]:
+    """Yield (entity, category, canonical_key) for non-unchanged rows only.
+
+    Caller must first validate both manifests and their matching schema fingerprints.
+    The cursor is consumed in bounded batches; canonical keys never enter public output.
+    """
+    connection = _readonly_connection(old_path)
+    try:
+        try:
+            new_uri = new_path.resolve(strict=True).as_uri() + "?mode=ro"
+            connection.execute("ATTACH DATABASE ? AS newer", (new_uri,))
+            cursor = connection.execute('''
+                SELECT entity, category, canonical_key FROM (
+                  SELECT o.entity AS entity,
+                    CASE WHEN o.semantic_hash != n.semantic_hash THEN 'changed'
+                         WHEN o.full_hash != n.full_hash THEN 'technical_only' END AS category,
+                    o.canonical_key AS canonical_key
+                  FROM main."rows" o JOIN newer."rows" n
+                    ON n.entity=o.entity AND n.canonical_key=o.canonical_key
+                  WHERE o.semantic_hash != n.semantic_hash OR o.full_hash != n.full_hash
+                  UNION ALL
+                  SELECT o.entity, 'removed', o.canonical_key FROM main."rows" o
+                    LEFT JOIN newer."rows" n ON n.entity=o.entity AND n.canonical_key=o.canonical_key
+                    WHERE n.canonical_key IS NULL
+                  UNION ALL
+                  SELECT n.entity, 'added', n.canonical_key FROM newer."rows" n
+                    LEFT JOIN main."rows" o ON o.entity=n.entity AND o.canonical_key=n.canonical_key
+                    WHERE o.canonical_key IS NULL
+                ) ORDER BY entity, category, canonical_key
+            ''')
+            while batch := cursor.fetchmany(1000):
+                for entity, category, canonical_key in batch:
+                    if entity not in manifest.REQUIRED_ENTITIES or category not in {"added", "changed", "technical_only", "removed"} or not isinstance(canonical_key, str):
+                        raise DiffError("manifest_diff_result_invalid")
+                    yield entity, category, canonical_key
+        except DiffError:
+            raise
+        except (OSError, sqlite3.Error, ValueError):
+            raise DiffError("manifest_diff_query_failed") from None
+    finally:
+        connection.close()
+
+
+def _iter_manifest_changes(old_path: Path, new_path: Path) -> Iterator[tuple[str, str, str]]:
+    """Validated private key-level iterator; never use its keys in logs or reports."""
+    old = validate_manifest(old_path)
+    new = validate_manifest(new_path)
+    if old["schema_fingerprint"] != new["schema_fingerprint"]:
+        raise DiffError("manifest_schema_mismatch")
+    yield from _iter_manifest_changes_validated(old_path, new_path)
 
 
 def compare_manifests(old_value: Path, new_value: Path) -> dict[str, Any]:
