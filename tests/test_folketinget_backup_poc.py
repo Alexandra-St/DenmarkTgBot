@@ -28,6 +28,7 @@ SPEC.loader.exec_module(POC)
 def create_candidate_manifest(
     path: pathlib.Path, *, backup: str, finish: str, include_sag: bool,
     extra_records: dict[str, list[tuple[str, bytes, bytes]]] | None = None,
+    schema_fingerprint: str = "a" * 64,
 ) -> None:
     path.unlink(missing_ok=True)
     entities = POC.REQUIRED_ENTITIES
@@ -53,7 +54,7 @@ def create_candidate_manifest(
         )
         db.execute(
             "INSERT INTO snapshot_metadata VALUES (1, ?, ?, 17, ?, ?, ?)",
-            (backup * 64, finish, "a" * 64, "2026-10-19T00:00:00Z", total),
+            (backup * 64, finish, schema_fingerprint, "2026-10-19T00:00:00Z", total),
         )
         for entity in entities:
             db.execute("INSERT INTO entity_counts VALUES (?, ?)", (entity, len(records[entity])))
@@ -124,6 +125,20 @@ class BackupPocSafetyTests(unittest.TestCase):
                 classify_candidates=True, prepare_ingestion=True,
             )
         return result
+
+    def _run_snapshot_client_dry_run(self, root, cases, *, complete=True, diagnostics=None):
+        stamp = "2026-10-19 02:00:00.000"
+        old, new = root / "old.sqlite", root / "new.sqlite"
+        create_candidate_manifest(old, backup="1", finish="2026-10-18 02:00:00.000", include_sag=False)
+        create_candidate_manifest(new, backup="2", finish=stamp, include_sag=False)
+        context = POC.validate_candidate_manifest_inputs(old, new, "100", "101", require_newer_snapshot=True)
+        candidate_bundle = self._candidate_bundle(cases, complete=complete, diagnostics=diagnostics)
+        with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=candidate_bundle):
+            return POC.run_candidate_extraction(
+                old, new, SimpleNamespace(), root, context["old_finish"], context["new_finish"],
+                snapshot_ingestion_dry_run=True,
+                base_snapshot=context["base_snapshot"], target_snapshot=context["target_snapshot"],
+            )
 
     def test_snapshot_classification_handles_zero_direct_potential_and_irrelevant(self) -> None:
         from collectors import relevance
@@ -341,6 +356,122 @@ class BackupPocSafetyTests(unittest.TestCase):
             self.assertEqual(observed_modes, [0o600])
             self.assertEqual(list(root.glob("denmarkbot-candidate-bundle-*.json")), [])
 
+    def test_snapshot_client_dry_run_reuses_real_client_and_has_network_hard_guard(self) -> None:
+        from collectors import ingestion_client, snapshot_ingestion_client
+
+        case = self._ingestion_case(901, "Forslag om ophold for fordrevne fra Ukraine")
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            with mock.patch.object(snapshot_ingestion_client, "_post", side_effect=AssertionError("HTTP forbidden")) as post, \
+                    mock.patch.object(snapshot_ingestion_client.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")) as urlopen, \
+                    mock.patch.object(ingestion_client, "upload", side_effect=AssertionError("old upload forbidden")) as upload, \
+                    mock.patch.object(ingestion_client, "_request", side_effect=AssertionError("old HTTP helper forbidden")) as request, \
+                    mock.patch.object(ingestion_client, "proposed_checkpoints", side_effect=AssertionError("checkpoint helper forbidden")) as checkpoints, \
+                    mock.patch.object(ingestion_client, "collection_complete", side_effect=AssertionError("checkpoint helper forbidden")) as collection_complete, \
+                    mock.patch.object(snapshot_ingestion_client, "ingest_snapshot_candidates",
+                                      wraps=snapshot_ingestion_client.ingest_snapshot_candidates) as client:
+                result = self._run_snapshot_client_dry_run(root, [case])
+            post.assert_not_called()
+            urlopen.assert_not_called()
+            upload.assert_not_called()
+            request.assert_not_called()
+            checkpoints.assert_not_called()
+            collection_complete.assert_not_called()
+            client.assert_called_once()
+            self.assertIs(client.call_args.kwargs["dry_run"], True)
+            self.assertEqual(client.call_args.kwargs["mode"], "incremental")
+            ingestion = result["snapshot_ingestion"]
+            self.assertTrue(ingestion["complete"])
+            self.assertTrue(ingestion["collection_complete"])
+            self.assertTrue(ingestion["submission_eligible"])
+            self.assertEqual(ingestion["candidate_case_count"], 1)
+            self.assertEqual(ingestion["prepared_record_count"], 1)
+            self.assertEqual(ingestion["batch_count"], 1)
+            self.assertEqual(ingestion["base_finish"], "2026-10-18 02:00:00.000")
+            self.assertEqual(ingestion["target_finish"], "2026-10-19 02:00:00.000")
+            self.assertTrue(ingestion["schema_equal"])
+            self.assertEqual(list(root.glob("denmarkbot-candidate-bundle-*.json")), [])
+
+    def test_snapshot_client_zero_candidate_newer_backup_is_valid(self) -> None:
+        from collectors import snapshot_ingestion_client
+
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._run_snapshot_client_dry_run(pathlib.Path(temp), [])
+        ingestion = result["snapshot_ingestion"]
+        self.assertEqual((ingestion["candidate_case_count"], ingestion["prepared_record_count"], ingestion["batch_count"]), (0, 0, 1))
+        self.assertTrue(ingestion["complete"])
+        self.assertTrue(ingestion["submission_eligible"])
+        self.assertEqual(ingestion["relevance_counts"], {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0})
+
+    def test_snapshot_client_is_not_invoked_for_incomplete_extraction(self) -> None:
+        from collectors import snapshot_ingestion_client
+
+        diagnostics = [{"code": "source_lookup_failed", "count": 2}]
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(snapshot_ingestion_client, "ingest_snapshot_candidates", side_effect=AssertionError("incomplete bundle must not reach client")) as client:
+            result = self._run_snapshot_client_dry_run(
+                pathlib.Path(temp), [self._ingestion_case(902, "PRIVATE TITLE", complete=False)],
+                complete=False, diagnostics=diagnostics,
+            )
+        client.assert_not_called()
+        ingestion = result["snapshot_ingestion"]
+        self.assertFalse(ingestion["complete"])
+        self.assertFalse(ingestion["collection_complete"])
+        self.assertFalse(ingestion["submission_eligible"])
+        self.assertEqual(ingestion["prepared_record_count"], 0)
+        self.assertEqual(ingestion["extraction_diagnostics"], diagnostics)
+        output = StringIO()
+        with redirect_stdout(output):
+            POC.write_snapshot_ingestion_client_summary(result)
+        self.assertIn("Snapshot ingestion client dry-run: INCOMPLETE", output.getvalue())
+        self.assertIn("source_lookup_failed: 2", output.getvalue())
+        self.assertNotIn("PRIVATE TITLE", output.getvalue())
+
+    def test_snapshot_client_summary_is_aggregate_only(self) -> None:
+        case = self._ingestion_case(903, "PRIVATE SNAPSHOT TITLE")
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._run_snapshot_client_dry_run(pathlib.Path(temp), [case])
+        output = StringIO()
+        with redirect_stdout(output):
+            POC.write_snapshot_ingestion_client_summary(result)
+        rendered = output.getvalue()
+        for private in ("903", "PRIVATE SNAPSHOT TITLE", "https://oda.ft.dk", "backup_sha256", "prepared payload"):
+            self.assertNotIn(private, rendered)
+        self.assertIn("Snapshot ingestion client dry-run: PASS", rendered)
+
+    def test_snapshot_client_preflight_requires_progression_and_same_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            old, new = root / "old.sqlite", root / "new.sqlite"
+            create_candidate_manifest(old, backup="1", finish="2026-10-18 02:00:00.000", include_sag=False)
+            create_candidate_manifest(new, backup="1", finish="2026-10-18 02:00:00.000", include_sag=False)
+            with self.assertRaises(POC.PocError) as same:
+                POC.validate_candidate_manifest_inputs(old, new, "100", "101", require_newer_snapshot=True)
+            self.assertEqual(same.exception.category, "snapshot_dry_run_target_not_newer")
+            create_candidate_manifest(new, backup="2", finish="2026-10-17 02:00:00.000", include_sag=False)
+            with self.assertRaises(POC.PocError) as older:
+                POC.validate_candidate_manifest_inputs(old, new, "100", "101", require_newer_snapshot=True)
+            self.assertEqual(older.exception.category, "snapshot_dry_run_regression")
+            create_candidate_manifest(new, backup="2", finish="2026-10-19 02:00:00.000", include_sag=False,
+                                      schema_fingerprint="d" * 64)
+            with self.assertRaises(POC.PocError) as schema:
+                POC.validate_candidate_manifest_inputs(old, new, "100", "101", require_newer_snapshot=True)
+            self.assertEqual(schema.exception.category, "snapshot_dry_run_schema_changed")
+
+    def test_snapshot_client_mode_and_existing_manual_modes_remain(self) -> None:
+        self.assertEqual(POC.validate_mode("SNAPSHOT_INGESTION_DRY_RUN"), "SNAPSHOT_INGESTION_DRY_RUN")
+        for mode in ("RESTORE_VALIDATE", "VALIDATE_SQL_PROVIDER", "CREATE_MANIFEST_BASELINE",
+                     "EXTRACT_SNAPSHOT_CANDIDATES", "CLASSIFY_SNAPSHOT_CANDIDATES",
+                     "PREPARE_SNAPSHOT_INGESTION"):
+            self.assertEqual(POC.validate_mode(mode), mode)
+        workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
+        self.assertIn("- DIFF_MANIFESTS", workflow)
+        self.assertIn("- SNAPSHOT_INGESTION_DRY_RUN", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertEqual(workflow.count("uses: actions/download-artifact@v8"), 2)
+        self.assertNotIn("actions/download-artifact@v4", workflow)
+
     def test_candidate_orchestration_handles_zero_diff_added_sag_and_changed_child(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider
 
@@ -523,7 +654,7 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("- CLASSIFY_SNAPSHOT_CANDIDATES", workflow)
         self.assertIn("- PREPARE_SNAPSHOT_INGESTION", workflow)
         self.assertNotIn("schedule:", workflow)
-        self.assertIn("inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION'", workflow)
+        self.assertIn("inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION' || inputs.mode == 'SNAPSHOT_INGESTION_DRY_RUN'", workflow)
         self.assertIn("OLD_MANIFEST_PATH:", workflow)
         self.assertIn("NEW_MANIFEST_PATH:", workflow)
         self.assertIn("INPUT_OLD_RUN_ID:", workflow)

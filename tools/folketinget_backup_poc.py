@@ -58,6 +58,7 @@ VALIDATE_SQL_PROVIDER = "VALIDATE_SQL_PROVIDER"
 EXTRACT_SNAPSHOT_CANDIDATES = "EXTRACT_SNAPSHOT_CANDIDATES"
 CLASSIFY_SNAPSHOT_CANDIDATES = "CLASSIFY_SNAPSHOT_CANDIDATES"
 PREPARE_SNAPSHOT_INGESTION = "PREPARE_SNAPSHOT_INGESTION"
+SNAPSHOT_INGESTION_DRY_RUN = "SNAPSHOT_INGESTION_DRY_RUN"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
@@ -84,6 +85,7 @@ def validate_mode(value: str) -> str:
         EXTRACT_SNAPSHOT_CANDIDATES,
         CLASSIFY_SNAPSHOT_CANDIDATES,
         PREPARE_SNAPSHOT_INGESTION,
+        SNAPSHOT_INGESTION_DRY_RUN,
     }:
         raise PocError("workflow_mode_invalid")
     return value
@@ -1182,7 +1184,8 @@ def validate_sql_provider(password: str, entities: dict[str, Any]) -> dict[str, 
 
 
 def validate_candidate_manifest_inputs(
-    old_value: Path, new_value: Path, old_run_id: str, new_run_id: str
+    old_value: Path, new_value: Path, old_run_id: str, new_run_id: str,
+    require_newer_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Validate both downloaded manifests and their declared source chronology."""
     if not re.fullmatch(r"[0-9]+", old_run_id or "") or not re.fullmatch(r"[0-9]+", new_run_id or ""):
@@ -1197,8 +1200,25 @@ def validate_candidate_manifest_inputs(
         report = snapshot_diff.compare_manifests(old_path, new_path)
     except snapshot_diff.DiffError as error:
         if error.category == "manifest_schema_mismatch":
-            raise PocError("candidate_schema_mismatch") from None
+            raise PocError("snapshot_dry_run_schema_changed" if require_newer_snapshot else "candidate_schema_mismatch") from None
         raise PocError(error.category) from None
+    base_snapshot = {
+        "backup_sha256": report["old"]["backup_sha256"],
+        "backup_finish_date": report["old"]["backup_finish_date"],
+        "schema_fingerprint": report["schema_fingerprint"],
+    }
+    target_snapshot = {
+        "backup_sha256": report["new"]["backup_sha256"],
+        "backup_finish_date": report["new"]["backup_finish_date"],
+        "schema_fingerprint": report["schema_fingerprint"],
+    }
+    if require_newer_snapshot:
+        try:
+            from collectors.snapshot_ingestion_client import validate_snapshot_identity
+            validate_snapshot_identity(base_snapshot)
+            validate_snapshot_identity(target_snapshot)
+        except Exception:
+            raise PocError("snapshot_dry_run_identity_invalid") from None
     try:
         old_finish = datetime.fromisoformat(report["old"]["backup_finish_date"].replace("Z", "+00:00"))
         new_finish = datetime.fromisoformat(report["new"]["backup_finish_date"].replace("Z", "+00:00"))
@@ -1207,13 +1227,17 @@ def validate_candidate_manifest_inputs(
     except (AttributeError, TypeError, ValueError):
         raise PocError("candidate_manifest_finish_invalid") from None
     if old_finish > new_finish:
-        raise PocError("candidate_manifest_order_invalid")
+        raise PocError("snapshot_dry_run_regression" if require_newer_snapshot else "candidate_manifest_order_invalid")
+    if require_newer_snapshot and old_finish == new_finish:
+        raise PocError("snapshot_dry_run_target_not_newer")
     return {
         "old_path": old_path,
         "new_path": new_path,
         "report": report,
         "old_finish": report["old"]["backup_finish_date"],
         "new_finish": report["new"]["backup_finish_date"],
+        "base_snapshot": base_snapshot,
+        "target_snapshot": target_snapshot,
     }
 
 
@@ -1318,6 +1342,9 @@ def run_candidate_extraction(
     new_finish: str,
     classify_candidates: bool = False,
     prepare_ingestion: bool = False,
+    snapshot_ingestion_dry_run: bool = False,
+    base_snapshot: dict[str, str] | None = None,
+    target_snapshot: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run the established extractor and return only validated aggregate data."""
     bundle_path: Path | None = None
@@ -1407,6 +1434,78 @@ def run_candidate_extraction(
             result["ingestion"] = _prepare_snapshot_ingestion(
                 persisted_bundle, result["classification"]
             )
+        if snapshot_ingestion_dry_run:
+            if base_snapshot is None or target_snapshot is None:
+                raise PocError("snapshot_dry_run_identity_missing")
+            if result["complete"] is not True:
+                result["snapshot_ingestion"] = {
+                    "complete": False,
+                    "candidate_case_count": result["candidate_case_count"],
+                    "prepared_record_count": 0,
+                    "batch_count": 0,
+                    "relevance_counts": {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0},
+                    "collection_complete": False,
+                    "submission_eligible": False,
+                    "base_finish": base_snapshot["backup_finish_date"],
+                    "target_finish": target_snapshot["backup_finish_date"],
+                    "schema_equal": base_snapshot["schema_fingerprint"] == target_snapshot["schema_fingerprint"],
+                    "extraction_diagnostics": clean_diagnostics,
+                }
+            else:
+                try:
+                    from collectors.snapshot_ingestion_client import (
+                        SnapshotIngestionError,
+                        ingest_snapshot_candidates,
+                    )
+                    client_result = ingest_snapshot_candidates(
+                        persisted_bundle,
+                        mode="incremental",
+                        base_snapshot=base_snapshot,
+                        target_snapshot=target_snapshot,
+                        dry_run=True,
+                    )
+                except SnapshotIngestionError as error:
+                    if re.fullmatch(r"[a-z0-9_]{1,80}", error.code):
+                        raise PocError(error.code) from None
+                    raise PocError("snapshot_ingestion_client_failed") from None
+                except Exception:
+                    raise PocError("snapshot_ingestion_client_failed") from None
+                counts = client_result.get("relevance_counts")
+                prepared_count = client_result.get("records")
+                batch_count = client_result.get("batches")
+                if (
+                    client_result.get("dry_run") is not True
+                    or client_result.get("mode") != "incremental"
+                    or client_result.get("state_kind") != "snapshot"
+                    or client_result.get("collection_complete") is not True
+                    or client_result.get("submission_eligible") is not True
+                    or isinstance(prepared_count, bool)
+                    or not isinstance(prepared_count, int)
+                    or prepared_count != result["candidate_case_count"]
+                    or isinstance(batch_count, bool)
+                    or not isinstance(batch_count, int)
+                    or batch_count < 1
+                    or client_result.get("base_snapshot") != base_snapshot
+                    or client_result.get("target_snapshot") != target_snapshot
+                    or not isinstance(counts, dict)
+                    or set(counts) != {"DIRECT", "POTENTIAL", "IRRELEVANT"}
+                    or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts.values())
+                    or sum(counts.values()) != result["candidate_case_count"]
+                ):
+                    raise PocError("snapshot_ingestion_client_result_invalid")
+                result["snapshot_ingestion"] = {
+                    "complete": True,
+                    "candidate_case_count": result["candidate_case_count"],
+                    "prepared_record_count": prepared_count,
+                    "batch_count": batch_count,
+                    "relevance_counts": counts,
+                    "collection_complete": True,
+                    "submission_eligible": True,
+                    "base_finish": base_snapshot["backup_finish_date"],
+                    "target_finish": target_snapshot["backup_finish_date"],
+                    "schema_equal": base_snapshot["schema_fingerprint"] == target_snapshot["schema_fingerprint"],
+                    "extraction_diagnostics": clean_diagnostics,
+                }
         return result
     finally:
         cleanup_candidate_bundle(bundle_path, runner_temp)
@@ -1708,6 +1807,42 @@ def write_snapshot_ingestion_summary(summary: dict[str, Any]) -> None:
     print(text, end="")
 
 
+def write_snapshot_ingestion_client_summary(summary: dict[str, Any]) -> None:
+    """Emit aggregate-only output from the client dry-run integration."""
+    ingestion = summary["snapshot_ingestion"]
+    state = "PASS" if ingestion["complete"] and summary["complete"] else "INCOMPLETE"
+    counts = ingestion["relevance_counts"]
+    lines = [
+        f"Snapshot ingestion client dry-run: {state}",
+        "",
+        f"- candidate cases: {ingestion['candidate_case_count']}",
+        f"- prepared records: {ingestion['prepared_record_count']}",
+        f"- batches: {ingestion['batch_count']}",
+        f"- DIRECT: {counts['DIRECT']}",
+        f"- POTENTIAL: {counts['POTENTIAL']}",
+        f"- IRRELEVANT: {counts['IRRELEVANT']}",
+        f"- collection complete: {str(ingestion['collection_complete']).lower()}",
+        f"- submission eligible: {str(ingestion['submission_eligible']).lower()}",
+        f"- base backup finish: {ingestion['base_finish']}",
+        f"- target backup finish: {ingestion['target_finish']}",
+        f"- base/target schema equality: {str(ingestion['schema_equal']).lower()}",
+        "- extraction diagnostics:",
+    ]
+    if ingestion["extraction_diagnostics"]:
+        lines.extend(f"  - {item['code']}: {item['count']}" for item in ingestion["extraction_diagnostics"])
+    else:
+        lines.append("  - none")
+    text = "\n".join(lines) + "\n"
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as output:
+                output.write(text)
+        except OSError:
+            raise PocError("snapshot_ingestion_summary_write_failed") from None
+    print(text, end="")
+
+
 def write_candidate_extraction_summary(summary: dict[str, Any]) -> None:
     totals = summary["diff_totals"]
     state = "PASS" if summary["complete"] else "INCOMPLETE"
@@ -1853,12 +1988,19 @@ def main() -> int:
     try:
         mode = validate_mode(os.environ.get("INPUT_MODE", RESTORE_VALIDATE))
         validate_confirmation(os.environ.get("INPUT_CONFIRM_RESTORE", ""))
-        if mode in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
+        candidate_modes = {
+            EXTRACT_SNAPSHOT_CANDIDATES,
+            CLASSIFY_SNAPSHOT_CANDIDATES,
+            PREPARE_SNAPSHOT_INGESTION,
+            SNAPSHOT_INGESTION_DRY_RUN,
+        }
+        if mode in candidate_modes:
             candidate_context = validate_candidate_manifest_inputs(
                 Path(os.environ.get("OLD_MANIFEST_PATH", "")),
                 Path(os.environ.get("NEW_MANIFEST_PATH", "")),
                 os.environ.get("INPUT_OLD_RUN_ID", ""),
                 os.environ.get("INPUT_NEW_RUN_ID", ""),
+                require_newer_snapshot=mode == SNAPSHOT_INGESTION_DRY_RUN,
             )
         username = os.environ.get("ODA_BACKUP_USERNAME", "")
         credential = os.environ.get("ODA_BACKUP_PASSWORD", "")
@@ -1867,13 +2009,13 @@ def main() -> int:
         require_x64_ubuntu24(platform.machine(), release)
         runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
         initial_free = free_bytes(runner_temp)
-        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
+        if mode not in candidate_modes:
             print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
         check_free_space(initial_free, 8 * GIB)
         password = __import__("secrets").token_urlsafe(32) + "Aa1!"
         run_sql_server_setup(password)
         after_install = free_bytes(runner_temp)
-        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
+        if mode not in candidate_modes:
             print(f"sql_server_edition=Express 2025 free_disk_before_download_bytes={after_install}")
         opener = make_oda_opener(username, credential)
         content_length = request_content_length(opener)
@@ -1891,7 +2033,7 @@ def main() -> int:
         download = download_backup(opener, download_temp_path, content_length)
         print("progress=backup_download_complete")
         backup_size, backup_checksum, download_seconds = validate_download_metadata(download, content_length)
-        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
+        if mode not in candidate_modes:
             print(f"backup_bytes={backup_size} sha256={backup_checksum} download_seconds={download_seconds}")
         print("progress=backup_staging_copy")
         run_checked(
@@ -1908,7 +2050,7 @@ def main() -> int:
         )
         restore_free = check_restore_disk_space(restore_parent, 1)
         validate_backup_readable_by_sql_server(backup_path, backup_size)
-        if mode not in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
+        if mode not in candidate_modes:
             print(f"free_disk_before_restore_bytes={restore_free}")
         print("progress=restore_header_check")
         header_output = sqlcmd(
@@ -1946,7 +2088,7 @@ def main() -> int:
         entities = validate_entities(password)
         if entities["missing"] or entities["no_primary_key"]:
             raise PocError("required_entity_validation_failed")
-        if mode in {EXTRACT_SNAPSHOT_CANDIDATES, CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION}:
+        if mode in candidate_modes:
             if candidate_context is None:
                 raise PocError("candidate_manifest_context_missing")
             print("progress=candidate_schema_discovery")
@@ -1985,8 +2127,16 @@ def main() -> int:
                 candidate_context["new_finish"],
                 classify_candidates=mode in {CLASSIFY_SNAPSHOT_CANDIDATES, PREPARE_SNAPSHOT_INGESTION},
                 prepare_ingestion=mode == PREPARE_SNAPSHOT_INGESTION,
+                snapshot_ingestion_dry_run=mode == SNAPSHOT_INGESTION_DRY_RUN,
+                base_snapshot=candidate_context["base_snapshot"],
+                target_snapshot=candidate_context["target_snapshot"],
             )
-            if mode == PREPARE_SNAPSHOT_INGESTION:
+            if mode == SNAPSHOT_INGESTION_DRY_RUN:
+                write_snapshot_ingestion_client_summary(candidate_result)
+                if not candidate_result["snapshot_ingestion"]["complete"]:
+                    print("restore_validation=INCOMPLETE")
+                    return 2
+            elif mode == PREPARE_SNAPSHOT_INGESTION:
                 write_snapshot_ingestion_summary(candidate_result)
                 if not candidate_result["ingestion"]["complete"]:
                     print("restore_validation=INCOMPLETE")

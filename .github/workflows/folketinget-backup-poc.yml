@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
       mode:
-        description: "Choose a manual restore, validation, manifest, diff, extraction, relevance, or ingestion-contract dry-run"
+        description: "Choose a manual restore, validation, manifest, diff, extraction, relevance, or snapshot-client dry-run"
         required: true
         type: choice
         options:
@@ -20,13 +20,14 @@ on:
           - EXTRACT_SNAPSHOT_CANDIDATES
           - CLASSIFY_SNAPSHOT_CANDIDATES
           - PREPARE_SNAPSHOT_INGESTION
+          - SNAPSHOT_INGESTION_DRY_RUN
         default: RESTORE_VALIDATE
       old_run_id:
-        description: "Successful manual baseline run ID for the older manifest (diff/extraction/classification/preparation modes)"
+        description: "Successful manual baseline run ID for the older manifest (diff/extraction/classification/preparation/snapshot-client dry-run modes)"
         required: false
         type: string
       new_run_id:
-        description: "Successful manual baseline run ID for the newer manifest (diff/extraction/classification/preparation modes)"
+        description: "Successful manual baseline run ID for the newer manifest (diff/extraction/classification/preparation/snapshot-client dry-run modes)"
         required: false
         type: string
 
@@ -46,7 +47,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
       - name: Validate manifest run IDs and artifacts
-        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION'
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION' || inputs.mode == 'SNAPSHOT_INGESTION_DRY_RUN'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
@@ -93,8 +94,8 @@ jobs:
             fi
           done
       - name: Download older manifest artifact
-        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION'
-        uses: actions/download-artifact@v4
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION' || inputs.mode == 'SNAPSHOT_INGESTION_DRY_RUN'
+        uses: actions/download-artifact@v8
         with:
           name: folketinget-snapshot-manifest-${{ inputs.old_run_id }}
           path: ${{ runner.temp }}/folketinget-manifest-old
@@ -102,8 +103,8 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
       - name: Download newer manifest artifact
-        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION'
-        uses: actions/download-artifact@v4
+        if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION' || inputs.mode == 'SNAPSHOT_INGESTION_DRY_RUN'
+        uses: actions/download-artifact@v8
         with:
           name: folketinget-snapshot-manifest-${{ inputs.new_run_id }}
           path: ${{ runner.temp }}/folketinget-manifest-new
@@ -152,7 +153,7 @@ jobs:
             rm -rf -- "$target"
           fi
       - name: Remove downloaded manifest artifacts
-        if: always() && (inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION')
+        if: always() && (inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION' || inputs.mode == 'SNAPSHOT_INGESTION_DRY_RUN')
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
