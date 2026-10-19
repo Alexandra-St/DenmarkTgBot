@@ -45,6 +45,7 @@ CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 MANIFEST_BASE64_COLUMN_HEADER = "manifest_payload_b64"
+EXPECTED_MANIFEST_HEADER_SHA256 = hashlib.sha256(MANIFEST_BASE64_COLUMN_HEADER.encode("utf-8")).hexdigest()
 
 
 class PocError(Exception):
@@ -796,8 +797,22 @@ def parse_manifest_page_output(output: str) -> str:
         lines.pop(0)
     while lines and not lines[-1].strip(" \t"):
         lines.pop()
-    if len(lines) < 3 or lines[0].strip(" \t") != MANIFEST_BASE64_COLUMN_HEADER:
+    if not lines:
         fail("header", "manifest_page_header_invalid")
+    stripped_header = lines[0].strip()
+    if stripped_header != MANIFEST_BASE64_COLUMN_HEADER:
+        header_bytes = stripped_header.encode("utf-8", errors="replace")
+        diagnostic = (
+            f"manifest_page_parse_failure stage=header line_count={line_count} "
+            f"header_chars={len(stripped_header)} header_utf8_bytes={len(header_bytes)} "
+            f"header_sha256={hashlib.sha256(header_bytes).hexdigest()} "
+            f"starts_with_utf8_bom={'true' if stripped_header.startswith(chr(0xFEFF)) else 'false'} "
+            f"ascii_only={'true' if stripped_header.isascii() else 'false'}"
+        )
+        print(diagnostic, file=sys.stderr)
+        raise PocError("manifest_page_header_invalid")
+    if len(lines) < 3:
+        fail("separator", "manifest_page_separator_invalid")
     if not re.fullmatch(r"[ \t]*-{3,}[ \t]*", lines[1]):
         fail("separator", "manifest_page_separator_invalid")
     if any(not line.strip(" \t") for line in lines[2:]):
@@ -881,6 +896,10 @@ def report_manifest_entity(entity: str) -> None:
     if entity not in REQUIRED_ENTITIES:
         raise PocError("manifest_page_invalid")
     print(f"progress=manifest_entity entity={entity}")
+
+
+def report_expected_manifest_header_fingerprint() -> None:
+    print(f"manifest_expected_header_sha256={EXPECTED_MANIFEST_HEADER_SHA256}")
 
 
 def write_summary(summary: dict[str, Any]) -> None:
@@ -1097,6 +1116,7 @@ def main() -> int:
                 raise PocError("manifest_directory_setup_failed") from None
             manifest_path = manifest_directory / MANIFEST_FILENAME
             print("progress=manifest_generation")
+            report_expected_manifest_header_fingerprint()
             try:
                 started_entities: set[str] = set()
 

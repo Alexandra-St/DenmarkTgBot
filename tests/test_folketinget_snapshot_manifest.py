@@ -282,12 +282,53 @@ class FolketingetManifestTests(unittest.TestCase):
                         poc.parse_manifest_page_output(malformed)
                 self.assertEqual(raised.exception.category, category)
                 rendered = diagnostic.getvalue()
-                self.assertRegex(
-                    rendered,
-                    rf"^manifest_page_parse_failure stage={stage} line_count=\d+( encoded_chars=\d+)?\n$",
-                )
+                if stage == "header":
+                    self.assertRegex(
+                        rendered,
+                        r"^manifest_page_parse_failure stage=header line_count=\d+ "
+                        r"header_chars=\d+ header_utf8_bytes=\d+ header_sha256=[0-9a-f]{64} "
+                        r"starts_with_utf8_bom=(true|false) ascii_only=(true|false)\n$",
+                    )
+                else:
+                    self.assertRegex(
+                        rendered,
+                        rf"^manifest_page_parse_failure stage={stage} line_count=\d+( encoded_chars=\d+)?\n$",
+                    )
                 for private in ("SECRET_HEADER", "SECRET_SEPARATOR", "UNEXPECTED_LINE", "not JSON"):
                     self.assertNotIn(private, rendered)
+
+    def test_manifest_header_bom_is_fingerprinted_but_not_silently_removed(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_header_bom_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        output = StringIO()
+        malformed = f"\ufeff{poc.MANIFEST_BASE64_COLUMN_HEADER}\n{'-' * 32}\nWwBd\n"
+        with redirect_stderr(output), self.assertRaises(poc.PocError) as raised:
+            poc.parse_manifest_page_output(malformed)
+        self.assertEqual(raised.exception.category, "manifest_page_header_invalid")
+        self.assertRegex(
+            output.getvalue(),
+            r"starts_with_utf8_bom=true ascii_only=false\n$",
+        )
+        self.assertNotIn(poc.MANIFEST_BASE64_COLUMN_HEADER, output.getvalue())
+
+    def test_expected_manifest_header_fingerprint_is_exposed(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_expected_header_hash_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        output = StringIO()
+        with redirect_stdout(output):
+            poc.report_expected_manifest_header_fingerprint()
+        self.assertEqual(
+            output.getvalue(),
+            "manifest_expected_header_sha256=9cdfbfbc9d07cf7b86373d8ff2404e844bdf2d721ed01d237076f64e40d0b5c6\n",
+        )
 
     def test_manifest_base64_decoded_size_limit_is_enforced(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(
