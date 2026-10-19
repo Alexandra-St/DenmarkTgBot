@@ -220,12 +220,39 @@ class SQLServerProviderTests(unittest.TestCase):
                 return tuple(item for item in fixture[entity] if item.get(field) in values)
 
         provider = FixtureProvider()
-        result = POC.exercise_sql_provider(provider, {entity: fixture[entity][0]["id"] for entity in ENTITIES})
+        result = POC.exercise_sql_provider(
+            provider,
+            {entity: fixture[entity][0]["id"] for entity in ENTITIES},
+            [("Sag", "statusid", 6), ("Sagstrin", "sagid", 1),
+             ("SagDokument", "sagid", 1), ("SagDokument", "dokumentid", 4),
+             ("Afstemning", "sagstrinid", 2)],
+        )
         self.assertEqual(result["entities_tested"], 6)
         self.assertEqual(result["get_by_ids_checks"], 6)
         self.assertEqual(result["normalization_failures"], 0)
         self.assertGreaterEqual(result["relation_checks"], 5)
         self.assertEqual(len(provider.lookups), result["relation_checks"])
+
+    def test_smoke_relation_sample_queries_are_allowlisted_and_fanout_bounded(self) -> None:
+        entities = {"objects": {entity: ("dbo", "USER_TABLE") for entity in ENTITIES}}
+        queries = []
+
+        def sqlcmd(query, *args, **kwargs):
+            queries.append(query)
+            return "sample_value|match_count\n------------|-----------\n42|4\n"
+
+        with mock.patch.object(POC, "sqlcmd", side_effect=sqlcmd):
+            samples = POC.read_sql_provider_relation_samples("private", entities)
+        self.assertEqual(len(samples), 5)
+        self.assertTrue(all(item[2] == 42 for item in samples))
+        self.assertEqual(len(queries), 5)
+        self.assertTrue(all("SELECT TOP (1)" in query and "GROUP BY" in query for query in queries))
+        self.assertTrue(all("ORDER BY COUNT_BIG(*) ASC" in query for query in queries))
+
+        with mock.patch.object(POC, "sqlcmd", return_value="sample_value|match_count\n------------|-----------\n42|1001\n"):
+            with self.assertRaises(POC.PocError) as raised:
+                POC.read_sql_provider_relation_samples("private", entities)
+        self.assertEqual(raised.exception.category, "sql_provider_relation_sample_too_large")
 
     def test_workflow_mode_is_manual_and_nonproduction(self) -> None:
         workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()

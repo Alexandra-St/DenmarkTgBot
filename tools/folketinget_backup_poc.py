@@ -50,6 +50,7 @@ MANIFEST_BASE64_CHUNK_SIZE = 6000
 MANIFEST_MAX_BASE64_CHUNKS = 30000
 # Five sequence digits + one delimiter + 6000 ASCII bytes = at most 6006 columns.
 MANIFEST_SQL_ROW_WIDTH = 6100
+SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
 
 
 class PocError(Exception):
@@ -945,7 +946,7 @@ def read_sql_provider_sample_ids(password: str, entities: dict[str, Any]) -> dic
                 failure_category="sql_provider_sample_query_failed",
             )
             value = simple_value(output)
-            if not re.fullmatch(r"[0-9]+", value):
+            if not re.fullmatch(r"-?[0-9]+", value):
                 raise PocError("sql_provider_sample_unavailable")
             samples[entity] = int(value, 10)
     except PocError:
@@ -955,7 +956,52 @@ def read_sql_provider_sample_ids(password: str, entities: dict[str, Any]) -> dic
     return samples
 
 
-def exercise_sql_provider(provider: Any, sample_ids: dict[str, int]) -> dict[str, int]:
+def read_sql_provider_relation_samples(password: str, entities: dict[str, Any]) -> list[tuple[str, str, int]]:
+    """Choose only relation values with a bounded matching row count."""
+    from folketinget_sql_provider import RELATION_FIELDS
+
+    samples: list[tuple[str, str, int]] = []
+    try:
+        for entity in REQUIRED_ENTITIES:
+            schema, object_type = entities["objects"][entity]
+            if object_type != "USER_TABLE":
+                raise PocError("sql_provider_schema_invalid")
+            table = f"{quote_identifier(schema)}.{quote_identifier(entity)}"
+            for field in sorted(RELATION_FIELDS[entity]):
+                column = quote_identifier(field)
+                query = (
+                    f"SELECT TOP (1) {column} AS [sample_value], COUNT_BIG(*) AS [match_count] FROM {table} "
+                    f"WHERE {column} IS NOT NULL GROUP BY {column} "
+                    f"ORDER BY COUNT_BIG(*) ASC, {column} ASC;"
+                )
+                output = sqlcmd(
+                    query, password, database=DATABASE,
+                    failure_category="sql_provider_relation_sample_query_failed",
+                )
+                headers, rows = parse_sqlcmd_table(output)
+                if len(rows) > 1:
+                    raise PocError("sql_provider_relation_sample_invalid")
+                if rows:
+                    value_index = field_index(headers, "sample_value")
+                    count_index = field_index(headers, "match_count")
+                    value_text, count_text = rows[0][value_index], rows[0][count_index]
+                    if not re.fullmatch(r"-?[0-9]+", value_text) or not re.fullmatch(r"[0-9]+", count_text):
+                        raise PocError("sql_provider_relation_sample_invalid")
+                    if int(count_text, 10) > SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS:
+                        raise PocError("sql_provider_relation_sample_too_large")
+                    samples.append((entity, field, int(value_text, 10)))
+    except PocError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise PocError("sql_provider_relation_sample_invalid") from None
+    return samples
+
+
+def exercise_sql_provider(
+    provider: Any,
+    sample_ids: dict[str, int],
+    relation_samples: list[tuple[str, str, int]] | None = None,
+) -> dict[str, int]:
     """Exercise by-ID and relationship reads; return aggregate-only results."""
     from collectors.folketinget_models import normalize_many
 
@@ -986,22 +1032,12 @@ def exercise_sql_provider(provider: Any, sample_ids: dict[str, int]) -> dict[str
             sample_rows[entity] = normalized[0]
             get_checks += 1
 
-        relations: list[tuple[str, str, object]] = []
-        sag_id = sample_rows["Sag"].get("id")
-        status_id = sample_rows["Sag"].get("statusid")
-        if isinstance(sag_id, int) and not isinstance(sag_id, bool):
-            relations.extend((("Sagstrin", "sagid", sag_id), ("SagDokument", "sagid", sag_id)))
-        if isinstance(status_id, int) and not isinstance(status_id, bool):
-            relations.append(("Sag", "statusid", status_id))
-        document_id = sample_rows["Dokument"].get("id")
-        if isinstance(document_id, int) and not isinstance(document_id, bool):
-            relations.append(("SagDokument", "dokumentid", document_id))
-        stage_id = sample_rows["Sagstrin"].get("id")
-        if isinstance(stage_id, int) and not isinstance(stage_id, bool):
-            relations.append(("Afstemning", "sagstrinid", stage_id))
-        source_status_id = sample_rows["Sagsstatus"].get("id")
-        if isinstance(source_status_id, int) and not isinstance(source_status_id, bool):
-            relations.append(("Sag", "statusid", source_status_id))
+        relations = relation_samples or []
+        from folketinget_sql_provider import RELATION_FIELDS
+
+        if any(entity not in RELATION_FIELDS or field not in RELATION_FIELDS[entity]
+               or isinstance(value, bool) or not isinstance(value, int) for entity, field, value in relations):
+            raise PocError("sql_provider_validation_failed")
 
         for entity, field, value in relations:
             rows = tuple(provider.find_by_field(entity, field, (value,)))
@@ -1020,6 +1056,7 @@ def validate_sql_provider(password: str, entities: dict[str, Any]) -> dict[str, 
     from folketinget_sql_provider import SQLServerFolketingetProvider
 
     samples = read_sql_provider_sample_ids(password, entities)
+    relation_samples = read_sql_provider_relation_samples(password, entities)
     try:
         column_types: dict[str, dict[str, str]] = {}
         for entity in REQUIRED_ENTITIES:
@@ -1040,7 +1077,7 @@ def validate_sql_provider(password: str, entities: dict[str, Any]) -> dict[str, 
         raise
     except Exception:
         raise PocError("sql_provider_validation_failed") from None
-    return exercise_sql_provider(provider, samples)
+    return exercise_sql_provider(provider, samples, relation_samples)
 
 
 def write_summary(summary: dict[str, Any]) -> None:
