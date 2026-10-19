@@ -266,6 +266,35 @@ class CandidateExtractionTests(unittest.TestCase):
         for value in ("SECRET", "SQL", "PRIVATE", "987654", "payload", "secret_category", "private_field"):
             self.assertNotIn(value, rendered)
 
+    def test_persistent_adaptive_transport_failure_remains_candidate_incomplete(self) -> None:
+        class PersistentProvider:
+            def get_by_ids(self, entity, ids):
+                if entity == "Sag":
+                    return (sag(901),)
+                return ()
+
+            def find_by_field(self, entity, field, values):
+                if entity == "Sagstrin" and field == "sagid":
+                    raise SQLProviderError(
+                        "provider_transport_failed", transport_category="manifest_page_chunk_row_invalid"
+                    )
+                return ()
+
+        # A Sag addition hydrates through a singleton stage lookup that remains failed.
+        old_rows = {entity: [] for entity in ENTITIES}
+        new_rows = {entity: [] for entity in ENTITIES}
+        new_rows["Sag"].append((canonical_key("Sag", 901), 1, 1))
+        make_manifest(self.old, old_rows, backup="1")
+        make_manifest(self.new, new_rows, backup="2")
+        bundle = CANDIDATES.extract_candidates(self.old, self.new, PersistentProvider())
+        self.assertFalse(bundle["complete"])
+        diagnostics = {item["code"]: item["count"] for item in bundle["diagnostics"]}
+        self.assertEqual(diagnostics["source_lookup_failed"], 1)
+        self.assertEqual(
+            diagnostics["source_lookup_failed_Sagstrin_by_field_sagid_provider_transport_failed_transport_manifest_page_chunk_row_invalid"],
+            1,
+        )
+
     def test_categorized_lookup_codes_are_hard_allowlisted(self) -> None:
         self.assertTrue(CANDIDATES.is_safe_diagnostic_code("source_lookup_failed"))
         self.assertTrue(CANDIDATES.is_safe_diagnostic_code(

@@ -78,6 +78,130 @@ class SQLServerProviderTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in results], list(range(1, 1202)))
         self.assertEqual(len(queries), 3)
 
+    def test_retryable_chunk_transport_errors_split_deterministically(self) -> None:
+        retryable = (
+            "manifest_page_chunk_row_invalid",
+            "manifest_page_chunk_sequence_invalid",
+            "manifest_page_too_large",
+        )
+        for category in retryable:
+            with self.subTest(category=category):
+                calls: list[tuple[int, ...]] = []
+
+                def execute(query: str, entity: str) -> str:
+                    match = re.search(r"WHERE \[id\] IN \(([-0-9,]+)\)", query)
+                    values = tuple(int(value) for value in match.group(1).split(","))
+                    calls.append(values)
+                    if len(values) > 1:
+                        raise PROVIDER_MODULE.SQLProviderError(
+                            "provider_transport_failed", transport_category=category
+                        )
+                    return json.dumps([row("Sag", values[0])])
+
+                provider = PROVIDER_MODULE.SQLServerFolketingetProvider(SCHEMAS, execute)
+                results = provider.get_by_ids("Sag", [4, 3, 2, 1])
+                self.assertEqual([item["id"] for item in results], [1, 2, 3, 4])
+                self.assertEqual(calls, [(1, 2, 3, 4), (1, 2), (1,), (2,), (3, 4), (3,), (4,)])
+                self.assertEqual(provider.adaptive_summary(), {
+                    "adaptive_split_count": 3,
+                    "adaptive_split_success_count": 1,
+                    "adaptive_split_max_depth": 2,
+                })
+
+    def test_nonretryable_errors_and_single_value_failures_propagate_without_splitting(self) -> None:
+        for error in (
+            PROVIDER_MODULE.SQLProviderError("provider_query_failed"),
+            PROVIDER_MODULE.SQLProviderError("provider_json_invalid"),
+            PROVIDER_MODULE.SQLProviderError(
+                "provider_transport_failed", transport_category="manifest_page_json_invalid"
+            ),
+        ):
+            calls = []
+
+            def execute(query, entity):
+                calls.append(query)
+                raise error
+
+            provider = PROVIDER_MODULE.SQLServerFolketingetProvider(SCHEMAS, execute)
+            with self.assertRaises(PROVIDER_MODULE.SQLProviderError) as raised:
+                provider.get_by_ids("Sag", [1, 2])
+            self.assertIs(raised.exception, error)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(provider.adaptive_summary()["adaptive_split_count"], 0)
+
+        persistent = PROVIDER_MODULE.SQLProviderError(
+            "provider_transport_failed", transport_category="manifest_page_chunk_row_invalid"
+        )
+        calls = []
+
+        def failing_single(query, entity):
+            calls.append(query)
+            raise persistent
+
+        provider = PROVIDER_MODULE.SQLServerFolketingetProvider(SCHEMAS, failing_single)
+        with self.assertRaises(PROVIDER_MODULE.SQLProviderError) as raised:
+            provider.get_by_ids("Sag", [42])
+        self.assertIs(raised.exception, persistent)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(provider.adaptive_summary(), {
+            "adaptive_split_count": 0,
+            "adaptive_split_success_count": 0,
+            "adaptive_split_max_depth": 0,
+        })
+
+    def test_adaptive_split_merge_preserves_duplicate_conflict_protection(self) -> None:
+        def execute(query: str, entity: str) -> str:
+            match = re.search(r"WHERE \[sagid\] IN \(([-0-9,]+)\)", query)
+            values = tuple(int(value) for value in match.group(1).split(","))
+            if len(values) > 1:
+                raise PROVIDER_MODULE.SQLProviderError(
+                    "provider_transport_failed", transport_category="manifest_page_too_large"
+                )
+            return json.dumps([row("Sagstrin", 99, sagid=values[0])])
+
+        provider = PROVIDER_MODULE.SQLServerFolketingetProvider(SCHEMAS, execute)
+        with self.assertRaises(PROVIDER_MODULE.SQLProviderError) as raised:
+            provider.find_by_field("Sagstrin", "sagid", [2, 1])
+        self.assertEqual(raised.exception.category, "provider_duplicate_conflict")
+        self.assertEqual(provider.adaptive_summary()["adaptive_split_count"], 1)
+        self.assertEqual(provider.adaptive_summary()["adaptive_split_success_count"], 0)
+
+    def test_adaptive_recursion_is_bounded_and_summary_contains_only_aggregates(self) -> None:
+        calls = 0
+
+        def execute(query: str, entity: str) -> str:
+            nonlocal calls
+            calls += 1
+            match = re.search(r"WHERE \[sagid\] IN \(([-0-9,]+)\)", query)
+            values = tuple(int(value) for value in match.group(1).split(","))
+            if len(values) > 1:
+                raise PROVIDER_MODULE.SQLProviderError(
+                    "provider_transport_failed", transport_category="manifest_page_chunk_row_invalid"
+                )
+            return "[]"
+
+        provider = PROVIDER_MODULE.SQLServerFolketingetProvider(SCHEMAS, execute)
+        requested_values = list(range(8000, 8500))
+        self.assertEqual(provider.find_by_field("Sagstrin", "sagid", requested_values), ())
+        metrics = provider.adaptive_summary()
+        self.assertEqual(metrics["adaptive_split_count"], 499)
+        self.assertEqual(metrics["adaptive_split_success_count"], 1)
+        self.assertEqual(metrics["adaptive_split_max_depth"], 9)
+        self.assertEqual(calls, 999)
+        self.assertLessEqual(metrics["adaptive_split_max_depth"], PROVIDER_MODULE.MAX_ADAPTIVE_SPLIT_DEPTH)
+        rendered = json.dumps(metrics)
+        for private in ("8000", "8500", "SELECT", "payload", "Sagstrin"):
+            self.assertNotIn(private, rendered)
+
+    def test_ordinary_success_has_zero_adaptive_metrics(self) -> None:
+        provider, _ = self.make_provider({"Sag": [row("Sag", 4)]})
+        self.assertEqual(provider.get_by_ids("Sag", [4]), (row("Sag", 4),))
+        self.assertEqual(provider.adaptive_summary(), {
+            "adaptive_split_count": 0,
+            "adaptive_split_success_count": 0,
+            "adaptive_split_max_depth": 0,
+        })
+
     def test_sql_uses_only_allowlisted_projection_and_chunk_transport(self) -> None:
         provider, queries = self.make_provider({"Afstemning": [row("Afstemning", 8, sagstrinid=7)]})
         provider.find_by_field("Afstemning", "sagstrinid", [7])

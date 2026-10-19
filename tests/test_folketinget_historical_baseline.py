@@ -19,7 +19,10 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(BASELINE)
 
 from folketinget_candidate_extraction import InMemoryFolketingetProvider
-from folketinget_sql_provider import SQLProviderError
+from folketinget_sql_provider import (
+    SQLProviderError,
+    SQLServerFolketingetProvider,
+)
 
 ENTITIES = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
 STAMP = "2026-10-18T12:00:00Z"
@@ -221,6 +224,52 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"].get(categorized), 1)
         self.assertEqual(result["incomplete_case_count"], 0)
         self.assertTrue(BASELINE.candidate_extraction.is_safe_diagnostic_code(categorized))
+
+    def test_historical_baseline_recovers_when_transient_lookup_failure_splits(self):
+        sag_ids = [10, 11]
+        create_manifest(self.manifest, sag_ids)
+        rows = {entity: [] for entity in ENTITIES}
+        for index, identifier in enumerate(sag_ids):
+            rows["Sag"].append({
+                "id": identifier, "nummer": f"L {identifier}", "titel": "Consultation",
+                "typeid": None, "kategoriid": None, "statusid": None,
+                "opdateringsdato": STAMP, "retsinformationsurl": None,
+            })
+            stage_id = 100 + index
+            rows["Sagstrin"].append({
+                "id": stage_id, "sagid": identifier, "titel": "Stage", "dato": None,
+                "typeid": None, "statusid": None, "opdateringsdato": STAMP,
+            })
+            rows["Afstemning"].append({
+                "id": 200 + index, "sagstrinid": stage_id, "nummer": 1, "vedtaget": True,
+                "konklusion": None, "kommentar": None, "mødeid": None, "typeid": None,
+                "opdateringsdato": STAMP,
+            })
+
+        def execute(query, entity):
+            import re
+            match = re.search(r"WHERE \[([^]]+)\] IN \(([-0-9,]+)\)", query)
+            field = match.group(1)
+            values = tuple(int(value) for value in match.group(2).split(","))
+            if entity == "Afstemning" and field == "sagstrinid" and len(values) > 1:
+                raise SQLProviderError(
+                    "provider_transport_failed", transport_category="manifest_page_chunk_row_invalid"
+                )
+            return json.dumps(
+                [row for row in rows[entity] if row.get(field) in values], ensure_ascii=False
+            )
+
+        provider = SQLServerFolketingetProvider(
+            {entity: ("dbo", "USER_TABLE") for entity in ENTITIES}, execute
+        )
+        result = BASELINE.run_historical_baseline(self.manifest, provider, batch_size=2)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["manifest_sag_count"], 2)
+        self.assertEqual(result["hydrated_case_count"], 2)
+        self.assertGreater(result["provider_adaptive_splits"], 0)
+        self.assertGreater(result["provider_adaptive_split_successes"], 0)
+        self.assertEqual(result["provider_max_split_depth"], 1)
+        self.assertEqual(result["diagnostics"], {})
 
 
 if __name__ == "__main__":

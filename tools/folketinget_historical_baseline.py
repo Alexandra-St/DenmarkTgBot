@@ -93,6 +93,37 @@ def _iter_sag_id_batches(path: Path, batch_size: int):
         connection.close()
 
 
+def _adaptive_provider_metrics(provider: object) -> dict[str, int]:
+    """Read only the SQL provider's aggregate counters, with a zero default for other providers."""
+    getter = getattr(provider, "adaptive_summary", None)
+    if getter is None:
+        return {
+            "provider_adaptive_splits": 0,
+            "provider_adaptive_split_successes": 0,
+            "provider_max_split_depth": 0,
+        }
+    if not callable(getter):
+        raise HistoricalBaselineError("provider_metrics_invalid")
+    try:
+        result = getter()
+    except Exception:
+        raise HistoricalBaselineError("provider_metrics_invalid") from None
+    if not isinstance(result, dict):
+        raise HistoricalBaselineError("provider_metrics_invalid")
+    values = (
+        result.get("adaptive_split_count"),
+        result.get("adaptive_split_success_count"),
+        result.get("adaptive_split_max_depth"),
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        raise HistoricalBaselineError("provider_metrics_invalid")
+    return {
+        "provider_adaptive_splits": values[0],
+        "provider_adaptive_split_successes": values[1],
+        "provider_max_split_depth": values[2],
+    }
+
+
 def run_historical_baseline(
     manifest_path: Path,
     provider: candidate_extraction.FolketingetReadOnlyProvider,
@@ -210,6 +241,7 @@ def run_historical_baseline(
         "diagnostics": dict(sorted(diagnostics.items())),
         "target_backup_finish": metadata["backup_finish_date"],
         "ruleset_version": RULESET_VERSION,
+        **_adaptive_provider_metrics(provider),
     }
 
 

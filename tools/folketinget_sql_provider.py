@@ -67,6 +67,12 @@ SAFE_TRANSPORT_CATEGORIES = frozenset({
     "manifest_page_too_large",
     "manifest_page_sqlcmd_failed",
 })
+ADAPTIVE_RETRY_TRANSPORT_CATEGORIES = frozenset({
+    "manifest_page_chunk_row_invalid",
+    "manifest_page_chunk_sequence_invalid",
+    "manifest_page_too_large",
+})
+MAX_ADAPTIVE_SPLIT_DEPTH = 9  # ceil(log2(MAX_IDS_PER_QUERY))
 
 
 class SQLProviderError(Exception):
@@ -101,6 +107,9 @@ class SQLServerFolketingetProvider:
             validated[entity] = schema
         self._schemas = validated
         self._query_executor = query_executor
+        self._adaptive_split_count = 0
+        self._adaptive_split_success_count = 0
+        self._adaptive_split_max_depth = 0
         self._column_types: dict[str, dict[str, str]] = {entity: {} for entity in REQUIRED_ENTITIES}
         if column_types is not None:
             if set(column_types) != set(REQUIRED_ENTITIES):
@@ -222,12 +231,47 @@ class SQLServerFolketingetProvider:
             selected[identifier] = row  # type: ignore[index]
         return tuple(selected[key] for key in sorted(selected))
 
+    def _query_with_adaptive_split(
+        self, entity: str, field: str, values: tuple[int, ...], *, depth: int = 0
+    ) -> tuple[Mapping[str, object], ...]:
+        """Retry only selected read-transport failures by deterministic bisection."""
+        try:
+            return self._query(entity, field, values)
+        except SQLProviderError as error:
+            if (error.category != "provider_transport_failed"
+                    or error.transport_category not in ADAPTIVE_RETRY_TRANSPORT_CATEGORIES
+                    or len(values) <= 1
+                    or depth >= MAX_ADAPTIVE_SPLIT_DEPTH):
+                raise
+            midpoint = len(values) // 2
+            left, right = values[:midpoint], values[midpoint:]
+            # Defensive invariant: recursive calls always strictly reduce the input.
+            if not left or not right or len(left) >= len(values) or len(right) >= len(values):
+                raise
+            self._adaptive_split_count += 1
+            self._adaptive_split_max_depth = max(self._adaptive_split_max_depth, depth + 1)
+            left_rows = self._query_with_adaptive_split(entity, field, left, depth=depth + 1)
+            right_rows = self._query_with_adaptive_split(entity, field, right, depth=depth + 1)
+            merged = self._merge((*left_rows, *right_rows))
+            # Count a success only when the original bounded lookup was fully recovered.
+            if depth == 0:
+                self._adaptive_split_success_count += 1
+            return merged
+
+    def adaptive_summary(self) -> dict[str, int]:
+        """Return aggregate-only adaptive query metrics; never includes lookup values."""
+        return {
+            "adaptive_split_count": self._adaptive_split_count,
+            "adaptive_split_success_count": self._adaptive_split_success_count,
+            "adaptive_split_max_depth": self._adaptive_split_max_depth,
+        }
+
     def _lookup(self, entity: str, field: str, values: Sequence[int]) -> tuple[Mapping[str, object], ...]:
         self._field(entity, field)
         selected = self._values(values)
         merged: list[Mapping[str, object]] = []
         for offset in range(0, len(selected), MAX_IDS_PER_QUERY):
-            merged.extend(self._query(entity, field, selected[offset : offset + MAX_IDS_PER_QUERY]))
+            merged.extend(self._query_with_adaptive_split(entity, field, selected[offset : offset + MAX_IDS_PER_QUERY]))
         return self._merge(merged)
 
     def get_by_ids(self, entity: str, ids: Sequence[int]) -> tuple[Mapping[str, object], ...]:

@@ -1937,13 +1937,15 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
     expected_integer_fields = (
         "manifest_sag_count", "hydrated_case_count", "prepared_record_count", "DIRECT", "POTENTIAL",
         "IRRELEVANT", "notification_blocked_count", "ingestion_batch_count", "largest_batch_records",
-        "largest_batch_bytes", "incomplete_case_count",
+        "largest_batch_bytes", "incomplete_case_count", "provider_adaptive_splits",
+        "provider_adaptive_split_successes", "provider_max_split_depth",
     )
     if summary.get("status") not in {"PASS", "INCOMPLETE"}:
         raise PocError("historical_baseline_summary_invalid")
     clean: dict[str, int] = {}
     for field in expected_integer_fields:
-        value = summary.get(field)
+        # Optional for compatibility with pre-adaptive fixture/provider summaries.
+        value = summary.get(field, 0)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise PocError("historical_baseline_summary_invalid")
         clean[field] = value
@@ -1978,6 +1980,9 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
         f"- largest ingestion batch records: {clean['largest_batch_records']}",
         f"- largest ingestion batch bytes: {clean['largest_batch_bytes']}",
         f"- incomplete case count: {clean['incomplete_case_count']}",
+        f"- provider adaptive splits: {clean['provider_adaptive_splits']}",
+        f"- provider adaptive split successes: {clean['provider_adaptive_split_successes']}",
+        f"- provider max split depth: {clean['provider_max_split_depth']}",
         "- diagnostics:",
         *(diagnostic_lines or ["  - none"]),
         f"- target backup finish: {finish}",
