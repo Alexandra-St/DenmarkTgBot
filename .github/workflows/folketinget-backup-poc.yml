@@ -21,6 +21,7 @@ on:
           - CLASSIFY_SNAPSHOT_CANDIDATES
           - PREPARE_SNAPSHOT_INGESTION
           - SNAPSHOT_INGESTION_DRY_RUN
+          - HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN
         default: RESTORE_VALIDATE
       old_run_id:
         description: "Successful manual baseline run ID for the older manifest (diff/extraction/classification/preparation/snapshot-client dry-run modes)"
@@ -28,6 +29,10 @@ on:
         type: string
       new_run_id:
         description: "Successful manual baseline run ID for the newer manifest (diff/extraction/classification/preparation/snapshot-client dry-run modes)"
+        required: false
+        type: string
+      manifest_run_id:
+        description: "Successful CREATE_MANIFEST_BASELINE run ID for the historical baseline dry-run"
         required: false
         type: string
 
@@ -93,6 +98,52 @@ jobs:
               exit 2
             fi
           done
+      - name: Validate historical manifest run and artifact
+        if: inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          MANIFEST_RUN_ID: ${{ inputs.manifest_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$MANIFEST_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "historical_baseline=FAIL category=workflow_run_id_invalid"
+            exit 2
+          fi
+          workflow_id=$(gh api "repos/$GH_REPOSITORY/actions/workflows/folketinget-backup-poc.yml" --jq '.id') || {
+            echo "historical_baseline=FAIL category=manifest_run_not_successful"
+            exit 2
+          }
+          if [[ ! "$workflow_id" =~ ^[0-9]+$ ]]; then
+            echo "historical_baseline=FAIL category=manifest_run_not_successful"
+            exit 2
+          fi
+          run_fields=$(gh api "repos/$GH_REPOSITORY/actions/runs/$MANIFEST_RUN_ID" --jq '[.id, .status, .conclusion, .event, .workflow_id] | @tsv') || {
+            echo "historical_baseline=FAIL category=manifest_run_not_successful"
+            exit 2
+          }
+          IFS=$'\t' read -r actual_id status conclusion event actual_workflow_id <<< "$run_fields"
+          if [[ "$actual_id" != "$MANIFEST_RUN_ID" || "$status" != "completed" || "$conclusion" != "success" || "$event" != "workflow_dispatch" || "$actual_workflow_id" != "$workflow_id" ]]; then
+            echo "historical_baseline=FAIL category=manifest_run_not_successful"
+            exit 2
+          fi
+          artifact_count=$(gh api "repos/$GH_REPOSITORY/actions/runs/$MANIFEST_RUN_ID/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"folketinget-snapshot-manifest-$MANIFEST_RUN_ID\" and .expired == false and .size_in_bytes > 0)] | length") || {
+            echo "historical_baseline=FAIL category=manifest_artifact_missing_or_ambiguous"
+            exit 2
+          }
+          if [[ "$artifact_count" != "1" ]]; then
+            echo "historical_baseline=FAIL category=manifest_artifact_missing_or_ambiguous"
+            exit 2
+          fi
+      - name: Download historical manifest artifact
+        if: inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'
+        uses: actions/download-artifact@v8
+        with:
+          name: folketinget-snapshot-manifest-${{ inputs.manifest_run_id }}
+          path: ${{ runner.temp }}/folketinget-manifest-${{ inputs.manifest_run_id }}
+          run-id: ${{ inputs.manifest_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
       - name: Download older manifest artifact
         if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION' || inputs.mode == 'SNAPSHOT_INGESTION_DRY_RUN'
         uses: actions/download-artifact@v8
@@ -129,8 +180,10 @@ jobs:
           INPUT_MODE: ${{ inputs.mode }}
           INPUT_OLD_RUN_ID: ${{ inputs.old_run_id }}
           INPUT_NEW_RUN_ID: ${{ inputs.new_run_id }}
+          INPUT_MANIFEST_RUN_ID: ${{ inputs.manifest_run_id }}
           OLD_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-old
           NEW_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-new
+          HISTORICAL_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-${{ inputs.manifest_run_id }}
           ODA_BACKUP_USERNAME: ${{ secrets.ODA_BACKUP_USERNAME }}
           ODA_BACKUP_PASSWORD: ${{ secrets.ODA_BACKUP_PASSWORD }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -164,3 +217,16 @@ jobs:
               rm -rf -- "$target"
             fi
           done
+      - name: Remove historical manifest artifact
+        if: always() && inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          MANIFEST_RUN_ID: ${{ inputs.manifest_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$MANIFEST_RUN_ID" =~ ^[0-9]+$ ]]; then
+            target="$RUNNER_TEMP/folketinget-manifest-$MANIFEST_RUN_ID"
+            if [ "$(dirname "$target")" = "$RUNNER_TEMP" ] && [ -d "$target" ] && [ ! -L "$target" ]; then
+              rm -rf -- "$target"
+            fi
+          fi

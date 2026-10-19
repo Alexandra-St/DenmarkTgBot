@@ -9,6 +9,7 @@ import sqlite3
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Callable
 
 REPOSITORY_ROOT = str(Path(__file__).resolve().parents[1])
 if REPOSITORY_ROOT not in sys.path:
@@ -99,6 +100,7 @@ def run_historical_baseline(
     provider: candidate_extraction.FolketingetReadOnlyProvider,
     *,
     batch_size: int = MAX_SAGS_PER_HYDRATION,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, object]:
     """Hydrate and prepare all current Sag records; performs no HTTP or submission."""
     manifest_count = _manifest_sag_count(Path(manifest_path))
@@ -175,6 +177,11 @@ def run_historical_baseline(
             encoded_bytes = len(json.dumps({"records": batch}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             largest_batch_records = max(largest_batch_records, len(batch))
             largest_batch_bytes = max(largest_batch_bytes, encoded_bytes)
+        if progress_callback is not None:
+            try:
+                progress_callback(processed_sags, manifest_count)
+            except Exception:
+                raise HistoricalBaselineError("progress_callback_failed") from None
 
     if processed_sags != manifest_count:
         raise HistoricalBaselineError("manifest_sag_count_mismatch")

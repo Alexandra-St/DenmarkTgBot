@@ -469,8 +469,120 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("- SNAPSHOT_INGESTION_DRY_RUN", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertNotIn("schedule:", workflow)
-        self.assertEqual(workflow.count("uses: actions/download-artifact@v8"), 2)
+        self.assertEqual(workflow.count("uses: actions/download-artifact@v8"), 3)
         self.assertNotIn("actions/download-artifact@v4", workflow)
+
+    def test_historical_baseline_mode_validates_one_exact_manifest_artifact(self) -> None:
+        self.assertEqual(POC.validate_mode("HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN"),
+                         "HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN")
+        with tempfile.TemporaryDirectory() as temp:
+            directory = pathlib.Path(temp) / "folketinget-manifest-12345"
+            directory.mkdir()
+            create_candidate_manifest(directory / "manifest.sqlite", backup="a", finish="2026-10-19T02:00:00Z", include_sag=False)
+            context = POC.validate_historical_manifest_input(directory, "12345")
+            self.assertEqual(context["path"], directory.resolve() / "manifest.sqlite")
+            self.assertEqual(context["report"]["new"]["backup_sha256"], "a" * 64)
+            with self.assertRaises(POC.PocError) as invalid_id:
+                POC.validate_historical_manifest_input(directory, "12x")
+            self.assertEqual(invalid_id.exception.category, "workflow_run_id_invalid")
+            (directory / "extra.txt").write_text("unexpected")
+            with self.assertRaises(POC.PocError) as ambiguous:
+                POC.validate_historical_manifest_input(directory, "12345")
+            self.assertEqual(ambiguous.exception.category, "manifest_artifact_invalid")
+
+    def test_historical_mode_requires_exact_restored_backup_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = pathlib.Path(temp) / "folketinget-manifest-77"
+            directory.mkdir()
+            create_candidate_manifest(directory / "manifest.sqlite", backup="a", finish="2026-10-19T02:00:00Z", include_sag=False)
+            context = POC.validate_historical_manifest_input(directory, "77")
+            POC.validate_candidate_backup_identity("a" * 64, "2026-10-19T02:00:00Z", "a" * 64, context)
+            for checksum, finish, fingerprint, category in (
+                ("b" * 64, "2026-10-19T02:00:00Z", "a" * 64, "candidate_backup_sha_mismatch"),
+                ("a" * 64, "2026-10-20T02:00:00Z", "a" * 64, "candidate_backup_finish_mismatch"),
+                ("a" * 64, "2026-10-19T02:00:00Z", "b" * 64, "candidate_schema_mismatch"),
+            ):
+                with self.subTest(category=category), self.assertRaises(POC.PocError) as raised:
+                    POC.validate_candidate_backup_identity(checksum, finish, fingerprint, context)
+                self.assertEqual(raised.exception.category, category)
+
+    def test_historical_dry_run_reuses_streaming_module_and_never_calls_submission_helpers(self) -> None:
+        from collectors import ingestion_client, snapshot_ingestion_client
+        import folketinget_historical_baseline as historical_baseline
+
+        context = {"path": pathlib.Path("private-manifest.sqlite")}
+        expected = {"status": "PASS", "manifest_sag_count": 0}
+        with mock.patch.object(historical_baseline, "run_historical_baseline", return_value=expected) as run, \
+                mock.patch.object(ingestion_client, "upload", side_effect=AssertionError("forbidden")), \
+                mock.patch.object(ingestion_client, "_request", side_effect=AssertionError("forbidden")), \
+                mock.patch.object(ingestion_client, "proposed_checkpoints", side_effect=AssertionError("forbidden")), \
+                mock.patch.object(ingestion_client, "collection_complete", side_effect=AssertionError("forbidden")), \
+                mock.patch.object(snapshot_ingestion_client, "_post", side_effect=AssertionError("forbidden")):
+            result = POC.run_historical_baseline_dry_run(context, SimpleNamespace(), progress_callback=lambda *_: None)
+        self.assertIs(result, expected)
+        run.assert_called_once_with(context["path"], mock.ANY, progress_callback=mock.ANY)
+
+    def test_historical_baseline_summary_is_aggregate_and_incomplete_is_explicit(self) -> None:
+        summary = {
+            "status": "INCOMPLETE", "manifest_sag_count": 3, "hydrated_case_count": 2,
+            "prepared_record_count": 2, "DIRECT": 1, "POTENTIAL": 0, "IRRELEVANT": 1,
+            "notification_blocked_count": 1, "ingestion_batch_count": 1, "largest_batch_records": 2,
+            "largest_batch_bytes": 500, "incomplete_case_count": 1,
+            "diagnostics": {"missing_status": 1}, "target_backup_finish": "2026-10-19T02:00:00Z",
+            "ruleset_version": "1.1", "private_title": "DO NOT PRINT", "external_id": "987654",
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            POC.write_historical_baseline_summary(summary)
+        rendered = output.getvalue()
+        self.assertIn("Historical snapshot baseline dry-run: INCOMPLETE", rendered)
+        self.assertEqual(POC.historical_baseline_exit_code(summary), 2)
+        self.assertIn("missing_status: 1", rendered)
+        self.assertNotIn("DO NOT PRINT", rendered)
+        self.assertNotIn("987654", rendered)
+        summary["status"] = "PASS"
+        output = StringIO()
+        with redirect_stdout(output):
+            POC.write_historical_baseline_summary(summary)
+        self.assertIn("Historical snapshot baseline dry-run: PASS", output.getvalue())
+        self.assertEqual(POC.historical_baseline_exit_code(summary), 0)
+
+    def test_historical_progress_reports_only_aggregate_counts_at_bounded_intervals(self) -> None:
+        reporter = POC.historical_baseline_progress_reporter()
+        output = StringIO()
+        with redirect_stdout(output):
+            reporter(4999, 10000)
+            reporter(5000, 10000)
+            reporter(5250, 10000)
+            reporter(10000, 10000)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "progress=historical_baseline processed=5000 manifest_total=10000",
+            "progress=historical_baseline processed=10000 manifest_total=10000",
+        ])
+        self.assertNotIn("id", output.getvalue())
+
+    def test_historical_workflow_is_manual_single_manifest_and_cleans_up(self) -> None:
+        workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertIn("- HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN", workflow)
+        self.assertIn("manifest_run_id:", workflow)
+        self.assertIn("inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'", workflow)
+        self.assertIn("actions/runs/$MANIFEST_RUN_ID", workflow)
+        self.assertIn('"$event" != "workflow_dispatch"', workflow)
+        self.assertIn('"$actual_workflow_id" != "$workflow_id"', workflow)
+        self.assertIn("folketinget-snapshot-manifest-$MANIFEST_RUN_ID", workflow)
+        self.assertIn("name: Download historical manifest artifact", workflow)
+        self.assertIn("uses: actions/download-artifact@v8", workflow)
+        self.assertIn("if: always() && inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'", workflow)
+        self.assertIn("INPUT_MANIFEST_RUN_ID:", workflow)
+        self.assertIn("HISTORICAL_MANIFEST_PATH:", workflow)
+        self.assertNotIn("INGEST_API_URL", workflow)
+        self.assertNotIn("INGEST_API_TOKEN", workflow)
+        self.assertNotIn("/internal/", workflow)
+        self.assertNotIn("sendMessage", workflow)
+        self.assertNotIn("snapshot-ingestion-client", workflow)
+        self.assertIn("actions/download-artifact@v8", workflow)
 
     def test_candidate_orchestration_handles_zero_diff_added_sag_and_changed_child(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider

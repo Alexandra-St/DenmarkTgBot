@@ -169,12 +169,15 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
         self.assertEqual(raised.exception.category, "duplicate_sag_key")
 
     def test_no_network_or_checkpoint_helpers_are_called(self):
-        result, _ = self.run_fixture([])
+        from collectors import snapshot_ingestion_client
+        create_manifest(self.manifest, [1])
+        with mock.patch.object(BASELINE.ingestion_client, "upload", side_effect=AssertionError("upload")), \
+                mock.patch.object(BASELINE.ingestion_client, "proposed_checkpoints", side_effect=AssertionError("checkpoints")), \
+                mock.patch.object(BASELINE.ingestion_client, "collection_complete", side_effect=AssertionError("complete")), \
+                mock.patch.object(BASELINE.ingestion_client, "_request", side_effect=AssertionError("network")), \
+                mock.patch.object(snapshot_ingestion_client, "_post", side_effect=AssertionError("snapshot HTTP")):
+            result = BASELINE.run_historical_baseline(self.manifest, TrackingProvider(source_rows([1])))
         self.assertEqual(result["status"], "PASS")
-        for name in ("upload", "proposed_checkpoints", "collection_complete", "_request"):
-            with mock.patch.object(BASELINE.ingestion_client, name, side_effect=AssertionError(name)):
-                empty = BASELINE.run_historical_baseline(self.manifest, TrackingProvider({}))
-                self.assertEqual(empty["status"], "PASS")
 
     def test_summary_does_not_leak_identifiers_titles_or_payload(self):
         result, _ = self.run_fixture([918273])
@@ -187,6 +190,15 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["manifest_sag_count"], 0)
         self.assertEqual(result["prepared_record_count"], 0)
+
+    def test_progress_callback_receives_only_aggregate_counts(self):
+        create_manifest(self.manifest, [1, 2])
+        progress = []
+        BASELINE.run_historical_baseline(
+            self.manifest, TrackingProvider(source_rows([1, 2])), batch_size=1,
+            progress_callback=lambda processed, total: progress.append((processed, total)),
+        )
+        self.assertEqual(progress, [(1, 2), (2, 2)])
 
 
 if __name__ == "__main__":

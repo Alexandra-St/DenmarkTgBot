@@ -59,6 +59,7 @@ EXTRACT_SNAPSHOT_CANDIDATES = "EXTRACT_SNAPSHOT_CANDIDATES"
 CLASSIFY_SNAPSHOT_CANDIDATES = "CLASSIFY_SNAPSHOT_CANDIDATES"
 PREPARE_SNAPSHOT_INGESTION = "PREPARE_SNAPSHOT_INGESTION"
 SNAPSHOT_INGESTION_DRY_RUN = "SNAPSHOT_INGESTION_DRY_RUN"
+HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN = "HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
@@ -86,6 +87,7 @@ def validate_mode(value: str) -> str:
         CLASSIFY_SNAPSHOT_CANDIDATES,
         PREPARE_SNAPSHOT_INGESTION,
         SNAPSHOT_INGESTION_DRY_RUN,
+        HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
     }:
         raise PocError("workflow_mode_invalid")
     return value
@@ -1255,6 +1257,91 @@ def validate_candidate_backup_identity(
         raise PocError("candidate_schema_mismatch")
 
 
+def validate_historical_manifest_input(value: Path, manifest_run_id: str) -> dict[str, Any]:
+    """Validate the one downloaded manifest artifact and retain only source identity metadata."""
+    if not re.fullmatch(r"[0-9]+", manifest_run_id or ""):
+        raise PocError("workflow_run_id_invalid")
+    try:
+        if value.is_symlink():
+            raise PocError("manifest_artifact_invalid")
+        manifest_directory = value.resolve(strict=True)
+        expected_directory = f"folketinget-manifest-{manifest_run_id}"
+        if manifest_directory.name != expected_directory or not manifest_directory.is_dir() or manifest_directory.is_symlink():
+            raise PocError("manifest_artifact_invalid")
+        manifest_path = snapshot_diff._manifest_file(manifest_directory)
+        metadata = snapshot_diff.validate_manifest(manifest_path)
+    except PocError:
+        raise
+    except snapshot_diff.DiffError as error:
+        raise PocError(error.category) from None
+    except Exception:
+        raise PocError("manifest_artifact_invalid") from None
+    return {
+        "path": manifest_path,
+        "report": {"new": metadata, "schema_fingerprint": metadata["schema_fingerprint"]},
+    }
+
+
+def discover_candidate_provider_schema(
+    password: str, entities: dict[str, Any], *, error_category: str = "candidate_schema_mismatch"
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """Discover and normalize the six allowlisted SQL provider schemas."""
+    try:
+        schemas: dict[str, dict[str, Any]] = {}
+        for entity in REQUIRED_ENTITIES:
+            schema_name, object_type = entities["objects"][entity]
+            if object_type != "USER_TABLE":
+                raise PocError(error_category)
+            schemas[entity] = manifest_schema(password, entity, schema_name)
+        restored_fingerprint = snapshot_manifest.schema_fingerprint(schemas)
+        provider_schemas = {
+            entity: snapshot_manifest.normalize_schema(entity, schemas[entity])
+            for entity in REQUIRED_ENTITIES
+        }
+        return restored_fingerprint, provider_schemas
+    except PocError:
+        raise
+    except Exception:
+        raise PocError(error_category) from None
+
+
+def run_historical_baseline_dry_run(
+    manifest_context: dict[str, Any], provider: Any, *, progress_callback: Any = None
+) -> dict[str, Any]:
+    """Call the streaming historical preparer only; never submit or advance state."""
+    try:
+        import folketinget_historical_baseline as historical_baseline
+    except Exception:
+        raise PocError("historical_baseline_import_failed") from None
+    try:
+        summary = historical_baseline.run_historical_baseline(
+            manifest_context["path"], provider, progress_callback=progress_callback
+        )
+    except historical_baseline.HistoricalBaselineError as error:
+        raise PocError(error.category) from None
+    except Exception:
+        raise PocError("historical_baseline_failed") from None
+    if not isinstance(summary, dict) or summary.get("status") not in {"PASS", "INCOMPLETE"}:
+        raise PocError("historical_baseline_summary_invalid")
+    return summary
+
+
+def historical_baseline_progress_reporter() -> Any:
+    """Return a callback that emits counts only, at 5,000-Sag intervals."""
+    next_progress = 5000
+
+    def report(processed: int, total: int) -> None:
+        nonlocal next_progress
+        if (isinstance(processed, bool) or not isinstance(processed, int) or processed < 0
+                or isinstance(total, bool) or not isinstance(total, int) or total < processed):
+            raise PocError("historical_progress_invalid")
+        if processed >= next_progress:
+            print(f"progress=historical_baseline processed={processed} manifest_total={total}")
+            next_progress = ((processed // 5000) + 1) * 5000
+
+    return report
+
+
 def create_candidate_sql_provider(
     password: str, entities: dict[str, Any], schemas: dict[str, dict[str, Any]]
 ) -> Any:
@@ -1843,6 +1930,77 @@ def write_snapshot_ingestion_client_summary(summary: dict[str, Any]) -> None:
     print(text, end="")
 
 
+def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
+    """Write only the documented aggregate fields for historical baseline dry-run."""
+    expected_integer_fields = (
+        "manifest_sag_count", "hydrated_case_count", "prepared_record_count", "DIRECT", "POTENTIAL",
+        "IRRELEVANT", "notification_blocked_count", "ingestion_batch_count", "largest_batch_records",
+        "largest_batch_bytes", "incomplete_case_count",
+    )
+    if summary.get("status") not in {"PASS", "INCOMPLETE"}:
+        raise PocError("historical_baseline_summary_invalid")
+    clean: dict[str, int] = {}
+    for field in expected_integer_fields:
+        value = summary.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise PocError("historical_baseline_summary_invalid")
+        clean[field] = value
+    finish = summary.get("target_backup_finish")
+    ruleset_version = summary.get("ruleset_version")
+    diagnostics = summary.get("diagnostics")
+    if (not isinstance(finish, str)
+            or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9:.+\-Z]{1,24}", finish)
+            or not isinstance(ruleset_version, str)
+            or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", ruleset_version)):
+        raise PocError("historical_baseline_summary_invalid")
+    if not isinstance(diagnostics, dict):
+        raise PocError("historical_baseline_summary_invalid")
+    diagnostic_lines = []
+    for code, count in sorted(diagnostics.items()):
+        if not isinstance(code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+            raise PocError("historical_baseline_summary_invalid")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise PocError("historical_baseline_summary_invalid")
+        diagnostic_lines.append(f"  - {code}: {count}")
+    lines = [
+        f"Historical snapshot baseline dry-run: {summary['status']}",
+        "",
+        f"- manifest Sag count: {clean['manifest_sag_count']}",
+        f"- hydrated case count: {clean['hydrated_case_count']}",
+        f"- prepared record count: {clean['prepared_record_count']}",
+        f"- DIRECT: {clean['DIRECT']}",
+        f"- POTENTIAL: {clean['POTENTIAL']}",
+        f"- IRRELEVANT: {clean['IRRELEVANT']}",
+        f"- notification_blocked count: {clean['notification_blocked_count']}",
+        f"- ingestion batch count: {clean['ingestion_batch_count']}",
+        f"- largest ingestion batch records: {clean['largest_batch_records']}",
+        f"- largest ingestion batch bytes: {clean['largest_batch_bytes']}",
+        f"- incomplete case count: {clean['incomplete_case_count']}",
+        "- diagnostics:",
+        *(diagnostic_lines or ["  - none"]),
+        f"- target backup finish: {finish}",
+        f"- ruleset_version: {ruleset_version}",
+        "",
+    ]
+    text = "\n".join(lines)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as output:
+                output.write(text)
+        except OSError:
+            raise PocError("historical_baseline_summary_write_failed") from None
+    print(text, end="")
+
+
+def historical_baseline_exit_code(summary: dict[str, Any]) -> int:
+    if summary.get("status") == "PASS":
+        return 0
+    if summary.get("status") == "INCOMPLETE":
+        return 2
+    raise PocError("historical_baseline_summary_invalid")
+
+
 def write_candidate_extraction_summary(summary: dict[str, Any]) -> None:
     totals = summary["diff_totals"]
     state = "PASS" if summary["complete"] else "INCOMPLETE"
@@ -1994,6 +2152,8 @@ def main() -> int:
             PREPARE_SNAPSHOT_INGESTION,
             SNAPSHOT_INGESTION_DRY_RUN,
         }
+        historical_mode = mode == HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN
+        historical_context: dict[str, Any] | None = None
         if mode in candidate_modes:
             candidate_context = validate_candidate_manifest_inputs(
                 Path(os.environ.get("OLD_MANIFEST_PATH", "")),
@@ -2002,6 +2162,11 @@ def main() -> int:
                 os.environ.get("INPUT_NEW_RUN_ID", ""),
                 require_newer_snapshot=mode == SNAPSHOT_INGESTION_DRY_RUN,
             )
+        elif historical_mode:
+            historical_context = validate_historical_manifest_input(
+                Path(os.environ.get("HISTORICAL_MANIFEST_PATH", "")),
+                os.environ.get("INPUT_MANIFEST_RUN_ID", ""),
+            )
         username = os.environ.get("ODA_BACKUP_USERNAME", "")
         credential = os.environ.get("ODA_BACKUP_PASSWORD", "")
         validate_credentials(username, credential)
@@ -2009,13 +2174,14 @@ def main() -> int:
         require_x64_ubuntu24(platform.machine(), release)
         runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
         initial_free = free_bytes(runner_temp)
-        if mode not in candidate_modes:
+        quiet_modes = candidate_modes | {HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN}
+        if mode not in quiet_modes:
             print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
         check_free_space(initial_free, 8 * GIB)
         password = __import__("secrets").token_urlsafe(32) + "Aa1!"
         run_sql_server_setup(password)
         after_install = free_bytes(runner_temp)
-        if mode not in candidate_modes:
+        if mode not in quiet_modes:
             print(f"sql_server_edition=Express 2025 free_disk_before_download_bytes={after_install}")
         opener = make_oda_opener(username, credential)
         content_length = request_content_length(opener)
@@ -2033,7 +2199,7 @@ def main() -> int:
         download = download_backup(opener, download_temp_path, content_length)
         print("progress=backup_download_complete")
         backup_size, backup_checksum, download_seconds = validate_download_metadata(download, content_length)
-        if mode not in candidate_modes:
+        if mode not in quiet_modes:
             print(f"backup_bytes={backup_size} sha256={backup_checksum} download_seconds={download_seconds}")
         print("progress=backup_staging_copy")
         run_checked(
@@ -2050,7 +2216,7 @@ def main() -> int:
         )
         restore_free = check_restore_disk_space(restore_parent, 1)
         validate_backup_readable_by_sql_server(backup_path, backup_size)
-        if mode not in candidate_modes:
+        if mode not in quiet_modes:
             print(f"free_disk_before_restore_bytes={restore_free}")
         print("progress=restore_header_check")
         header_output = sqlcmd(
@@ -2088,28 +2254,34 @@ def main() -> int:
         entities = validate_entities(password)
         if entities["missing"] or entities["no_primary_key"]:
             raise PocError("required_entity_validation_failed")
-        if mode in candidate_modes:
+        if mode == HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN:
+            if historical_context is None:
+                raise PocError("historical_manifest_context_missing")
+            print("progress=historical_baseline_schema_discovery")
+            restored_schema_fingerprint, provider_schemas = discover_candidate_provider_schema(
+                password, entities, error_category="historical_provider_schema_mismatch"
+            )
+            validate_candidate_backup_identity(
+                str(download["sha256"]),
+                str(header_info["backup_finish_date"]),
+                restored_schema_fingerprint,
+                historical_context,
+            )
+            provider = create_candidate_sql_provider(password, entities, provider_schemas)
+            print("progress=historical_baseline_start")
+            baseline_summary = run_historical_baseline_dry_run(
+                historical_context, provider, progress_callback=historical_baseline_progress_reporter()
+            )
+            write_historical_baseline_summary(baseline_summary)
+            if historical_baseline_exit_code(baseline_summary) != 0:
+                print("restore_validation=INCOMPLETE")
+                return 2
+            print("restore_validation=PASS")
+        elif mode in candidate_modes:
             if candidate_context is None:
                 raise PocError("candidate_manifest_context_missing")
             print("progress=candidate_schema_discovery")
-            try:
-                schemas: dict[str, dict[str, Any]] = {}
-                for entity in REQUIRED_ENTITIES:
-                    schema_name, object_type = entities["objects"][entity]
-                    if object_type != "USER_TABLE":
-                        raise PocError("candidate_schema_mismatch")
-                    schemas[entity] = manifest_schema(password, entity, schema_name)
-                restored_schema_fingerprint = snapshot_manifest.schema_fingerprint(schemas)
-                provider_schemas = {
-                    entity: snapshot_manifest.normalize_schema(entity, schemas[entity])
-                    for entity in REQUIRED_ENTITIES
-                }
-            except PocError:
-                raise
-            except snapshot_manifest.ManifestError:
-                raise PocError("candidate_schema_mismatch") from None
-            except Exception:
-                raise PocError("candidate_schema_mismatch") from None
+            restored_schema_fingerprint, provider_schemas = discover_candidate_provider_schema(password, entities)
             validate_candidate_backup_identity(
                 str(download["sha256"]),
                 str(header_info["backup_finish_date"]),
