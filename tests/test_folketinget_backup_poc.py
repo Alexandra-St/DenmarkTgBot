@@ -539,25 +539,27 @@ class BackupPocSafetyTests(unittest.TestCase):
 
         target = {"backup_sha256": "a" * 64, "backup_finish_date": "2026-10-18 02:00:00.000", "schema_fingerprint": "b" * 64}
         context = {"path": pathlib.Path("private-manifest.sqlite"), "report": {"new": target}}
-        record = ingestion_client.prepare_records(
-            {"cases": [{"external_id": "42", "title": "PRIVATE TITLE", "source_url": "https://oda.ft.dk/api/Sag(42)",
-                        "complete": True, "number": "L 42", "status": {}, "documents": [], "stages": [], "votes": []}]},
-            "folketinget", "historical",
-        )[0]
-        record.update({"relevance": "DIRECT", "historical": True})
+        records = ingestion_client.prepare_records(
+            {"cases": [
+                {"external_id": str(case_id), "title": "PRIVATE TITLE", "source_url": f"https://oda.ft.dk/api/Sag({case_id})",
+                 "complete": True, "number": f"L {case_id}", "status": {}, "documents": [], "stages": [], "votes": []}
+                for case_id in (42, 43)
+            ]}, "folketinget", "historical",
+        )
+        for record in records:
+            record.update({"relevance": "DIRECT", "historical": True})
         baseline = {"status": "PASS", "manifest_sag_count": 1, "target_backup_finish": target["backup_finish_date"],
-                    "selected_historical_ingestion_record_count": 1,
-                    "selected_historical_ingestion_batch_count": 1, "DIRECT": 1, "POTENTIAL": 0}
+                    "selected_historical_ingestion_record_count": 2,
+                    "selected_historical_ingestion_batch_count": 1, "DIRECT": 2, "POTENTIAL": 0}
         committed = {
             "status": "COMMITTED", "mode": "historical", "state_kind": "snapshot",
-            "run_id": POC.workflow_historical_run_id("39410000"), "records": 1,
-            "accepted_records": 1, "processed_records": 1, "batches": 1,
-            "relevance_counts": {"DIRECT": 1, "POTENTIAL": 0}, "base_snapshot": None,
+            "run_id": POC.workflow_historical_run_id("39410000"), "records": 2,
+            "accepted_records": 2, "processed_records": 1, "batches": 1,
+            "relevance_counts": {"DIRECT": 2, "POTENTIAL": 0}, "base_snapshot": None,
             "target_snapshot": target, "snapshot_generation": 1, "snapshot_advanced": True,
-            "start_idempotent": True,
+            "start_idempotent": True, "commit_resumed": True,
         }
-        committed["processed_records"] = 0
-        with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(baseline, [record])) as run, \
+        with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(baseline, records)) as run, \
                 mock.patch.object(snapshot_ingestion_client, "submit_prepared_historical_records", return_value=committed) as submit:
             result = POC.run_historical_baseline_live(
                 context, SimpleNamespace(), endpoint="https://example.test", token="NO_LOG_TOKEN",
@@ -568,7 +570,7 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertEqual(POC.historical_baseline_live_exit_code(result), 0)
         run.assert_called_once_with(context["path"], mock.ANY, progress_callback=mock.ANY)
         submitted_records = submit.call_args.args[0]
-        self.assertIs(submitted_records[0], record)
+        self.assertIs(submitted_records[0], records[0])
         self.assertEqual(submit.call_args.kwargs["base_snapshot"], None)
         self.assertEqual(submit.call_args.kwargs["target_snapshot"], target)
         self.assertEqual(submit.call_args.kwargs["activation_mode"], POC.HISTORICAL_SNAPSHOT_BASELINE_LIVE)

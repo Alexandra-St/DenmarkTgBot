@@ -1514,8 +1514,12 @@ def run_historical_baseline_live(
     client_counts = client_result.get("relevance_counts")
     processed_count = client_result.get("processed_records")
     processed_contract_ok = (
-        processed_count == selected_count
-        or (client_result.get("start_idempotent") is True and processed_count == 0)
+        (client_result.get("commit_resumed") is True
+         and client_result.get("start_idempotent") is True
+         and isinstance(processed_count, int) and not isinstance(processed_count, bool)
+         and isinstance(selected_count, int) and not isinstance(selected_count, bool)
+         and 0 <= processed_count <= selected_count)
+        or (client_result.get("commit_resumed") is False and processed_count == selected_count)
     )
     if (client_result.get("status") == "BLOCKED"
             and client_result.get("snapshot_advanced") is False

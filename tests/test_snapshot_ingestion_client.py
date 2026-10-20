@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from collectors import ingestion_client
 from collectors.snapshot_ingestion_client import (
-    HISTORICAL_LIVE_ACTIVATION_MODE, SnapshotIngestionError,
+    HISTORICAL_LIVE_ACTIVATION_MODE, MAX_HISTORICAL_COMMIT_ATTEMPTS, SnapshotIngestionError,
     dry_run_prepared_historical_records, submit_prepared_historical_records,
     ingest_snapshot_candidates, main, validate_snapshot_identity,
 )
@@ -182,10 +182,11 @@ class SnapshotIngestionClientTests(unittest.TestCase):
             historical_snapshot_start_allowed=False,
         )
 
-    def _prepared_history(self):
-        record = ingestion_client.prepare_records(bundle(), "folketinget", "historical")[0]
-        record.update({"historical": True, "relevance": "DIRECT"})
-        return [record]
+    def _prepared_history(self, count=1):
+        records = ingestion_client.prepare_records(bundle(count), "folketinget", "historical")
+        for record in records:
+            record.update({"historical": True, "relevance": "DIRECT"})
+        return records
 
     def _submit_history(self, records, opener, **kwargs):
         return submit_prepared_historical_records(
@@ -254,16 +255,18 @@ class SnapshotIngestionClientTests(unittest.TestCase):
         self.assertEqual([json.loads(request.data).get("run_id") for request in second.requests[1:]], [RUN_ID] * 3)
 
     def test_committing_resume_does_not_resend_batches_and_counts_prior_acceptance(self) -> None:
+        records = self._prepared_history(21)
+        batches = ingestion_client.chunks(records)
         opener = QueueOpener([
-            self._resume_ready(), start_response(status="COMMITTING", idempotent=True),
-            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 0, "remaining_records": 1,
+            self._resume_ready(), start_response(status="COMMITTING", expected_batches=len(batches), idempotent=True),
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 20, "remaining_records": 1,
              "checkpoints_advanced": False, "snapshot_advanced": False},
             commit_response(snapshot_generation=1, processed_records=1),
         ])
-        result = self._submit_history(self._prepared_history(), opener)
+        result = self._submit_history(records, opener)
         self.assertEqual(result["status"], "COMMITTED")
-        self.assertEqual(result["accepted_records"], 1)
-        self.assertEqual(result["processed_records"], 1)
+        self.assertEqual(result["accepted_records"], 21)
+        self.assertEqual(result["processed_records"], 21)
         self.assertTrue(result["start_idempotent"])
         self.assertEqual([json.loads(request.data).get("action") for request in opener.requests[1:]],
                          ["start", "commit", "commit"])
@@ -280,6 +283,113 @@ class SnapshotIngestionClientTests(unittest.TestCase):
         self.assertEqual(result["processed_records"], 0)
         self.assertTrue(result["start_idempotent"])
         self.assertEqual([request.get_method() for request in opener.requests], ["GET", "POST", "POST"])
+
+    def test_historical_commit_loop_exceeds_old_ten_request_ceiling(self) -> None:
+        records = self._prepared_history(221)
+        batches = ingestion_client.chunks(records)
+        responses = [self._ready(), start_response(expected_batches=len(batches), idempotent=False)]
+        responses.extend({"accepted": True, "run_id": RUN_ID, "batch_index": index,
+                          "accepted_records": len(batch)} for index, batch in enumerate(batches))
+        responses.extend(
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 20,
+             "remaining_records": 221 - 20 * (index + 1),
+             "checkpoints_advanced": False, "snapshot_advanced": False}
+            for index in range(11)
+        )
+        responses.append(commit_response(snapshot_generation=1, processed_records=1))
+        opener = QueueOpener(responses)
+        result = self._submit_history(records, opener)
+        commit_requests = [request for request in opener.requests
+                           if request.get_method() == "POST" and json.loads(request.data)["action"] == "commit"]
+        self.assertEqual(len(commit_requests), 12)
+        self.assertEqual(result["accepted_records"], 221)
+        self.assertEqual(result["processed_records"], 221)
+        self.assertFalse(result["commit_resumed"])
+
+    def test_1265_record_historical_commit_progression_fits_derived_bound(self) -> None:
+        records = self._prepared_history(1265)
+        batches = ingestion_client.chunks(records)
+        expected_attempts = (len(records) + 20 - 1) // 20
+        self.assertEqual(expected_attempts, 64)
+        self.assertEqual(expected_attempts, (1265 + 20 - 1) // 20)
+        responses = [self._ready(), start_response(expected_batches=len(batches), idempotent=False)]
+        responses.extend({"accepted": True, "run_id": RUN_ID, "batch_index": index,
+                          "accepted_records": len(batch)} for index, batch in enumerate(batches))
+        responses.extend(
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 20,
+             "remaining_records": 1265 - 20 * (index + 1),
+             "checkpoints_advanced": False, "snapshot_advanced": False}
+            for index in range(63)
+        )
+        responses.append(commit_response(snapshot_generation=1, processed_records=5))
+        opener = QueueOpener(responses)
+        result = self._submit_history(records, opener)
+        commit_requests = [request for request in opener.requests
+                           if request.get_method() == "POST" and json.loads(request.data)["action"] == "commit"]
+        self.assertEqual(len(commit_requests), 64)
+        self.assertEqual(result["processed_records"], 1265)
+        self.assertEqual(result["accepted_records"], 1265)
+        self.assertEqual(result["status"], "COMMITTED")
+
+    def test_resumed_committing_historical_run_accepts_partial_current_attempt_count(self) -> None:
+        records = self._prepared_history(1265)
+        batches = ingestion_client.chunks(records)
+        opener = QueueOpener([
+            self._resume_ready(), start_response(status="COMMITTING", expected_batches=len(batches), idempotent=True),
+            commit_response(snapshot_generation=1, processed_records=5),
+        ])
+        result = self._submit_history(records, opener)
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["records"], 1265)
+        self.assertEqual(result["accepted_records"], 1265)
+        self.assertEqual(result["processed_records"], 5)
+        self.assertTrue(result["commit_resumed"])
+        self.assertEqual([json.loads(request.data).get("action") for request in opener.requests[1:]],
+                         ["start", "commit"])
+
+    def test_historical_commit_no_progress_fails_closed(self) -> None:
+        opener = QueueOpener([
+            self._ready(), start_response(idempotent=False),
+            {"accepted": True, "run_id": RUN_ID, "batch_index": 0, "accepted_records": 1},
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 0, "remaining_records": 1,
+             "checkpoints_advanced": False, "snapshot_advanced": False},
+        ])
+        with self.assertRaisesRegex(SnapshotIngestionError, "commit_no_progress"):
+            self._submit_history(self._prepared_history(), opener)
+
+    def test_repeated_historical_committing_remaining_count_must_decrease(self) -> None:
+        records = self._prepared_history(21)
+        batches = ingestion_client.chunks(records)
+        responses = [self._ready(), start_response(expected_batches=len(batches), idempotent=False)]
+        responses.extend({"accepted": True, "run_id": RUN_ID, "batch_index": index,
+                          "accepted_records": len(batch)} for index, batch in enumerate(batches))
+        responses.extend([
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 20, "remaining_records": 1,
+             "checkpoints_advanced": False, "snapshot_advanced": False},
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 20, "remaining_records": 1,
+             "checkpoints_advanced": False, "snapshot_advanced": False},
+        ])
+        with self.assertRaisesRegex(SnapshotIngestionError, "commit_no_progress"):
+            self._submit_history(records, QueueOpener(responses))
+
+    def test_historical_commit_override_cannot_exceed_derived_finite_bound(self) -> None:
+        self.assertEqual(MAX_HISTORICAL_COMMIT_ATTEMPTS, 500)
+        records = self._prepared_history(221)
+        batches = ingestion_client.chunks(records)
+        responses = [self._ready(), start_response(expected_batches=len(batches), idempotent=False)]
+        responses.extend({"accepted": True, "run_id": RUN_ID, "batch_index": index,
+                          "accepted_records": len(batch)} for index, batch in enumerate(batches))
+        responses.extend(
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 20,
+             "remaining_records": 221 - 20 * (index + 1),
+             "checkpoints_advanced": False, "snapshot_advanced": False}
+            for index in range(2)
+        )
+        opener = QueueOpener(responses)
+        with self.assertRaisesRegex(SnapshotIngestionError, "commit_retry_limit"):
+            self._submit_history(records, opener, max_commit_attempts=2)
+        self.assertEqual(sum(1 for request in opener.requests if request.get_method() == "POST"
+                             and json.loads(request.data)["action"] == "commit"), 2)
 
     def test_resume_candidate_requires_worker_idempotency_and_never_changes_run_id(self) -> None:
         error = urllib.error.HTTPError("https://example.test", 409, "conflict", {},

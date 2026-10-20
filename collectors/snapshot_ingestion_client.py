@@ -28,6 +28,11 @@ _BACKUP_TIMESTAMP = re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}
 MAX_HISTORICAL_SELECTED_RECORDS = 10_000
 MAX_HISTORICAL_SELECTED_BYTES = 200 * ingestion_client.MAX_BATCH_BYTES
 MAX_HISTORICAL_BATCHES = 200
+# Mirrors Worker COMMIT_RECORDS. Used only to derive a finite historical bound.
+HISTORICAL_COMMIT_RECORDS_PER_REQUEST = 20
+MAX_HISTORICAL_COMMIT_ATTEMPTS = (
+    MAX_HISTORICAL_SELECTED_RECORDS + HISTORICAL_COMMIT_RECORDS_PER_REQUEST - 1
+) // HISTORICAL_COMMIT_RECORDS_PER_REQUEST
 HISTORICAL_LIVE_ACTIVATION_MODE = "HISTORICAL_SNAPSHOT_BASELINE_LIVE"
 Opener = Callable[..., Any]
 
@@ -447,6 +452,7 @@ def _submit_prepared_records(
     start_idempotent = started.get("idempotent") is True
     if require_idempotent_start and not start_idempotent:
         raise SnapshotIngestionError("historical_resume_not_confirmed", run_id, "start")
+    commit_resumed = mode == "historical" and state in {"COMMITTING", "COMMITTED"}
 
     # On an idempotent resume the Worker intentionally does not re-accept
     # batches. Count the exact previously accepted contract, not new requests.
@@ -465,9 +471,17 @@ def _submit_prepared_records(
                 raise SnapshotIngestionError("worker_response_invalid", run_id, "batch")
             accepted += batch_count
 
-    if isinstance(max_commit_attempts, bool) or not isinstance(max_commit_attempts, int) or not 1 <= max_commit_attempts <= MAX_COMMIT_ATTEMPTS:
+    max_allowed_attempts = (MAX_HISTORICAL_COMMIT_ATTEMPTS if mode == "historical"
+                            else MAX_COMMIT_ATTEMPTS)
+    derived_historical_limit = ((len(records) + HISTORICAL_COMMIT_RECORDS_PER_REQUEST - 1)
+                                // HISTORICAL_COMMIT_RECORDS_PER_REQUEST) if mode == "historical" else None
+    if (isinstance(max_commit_attempts, bool) or not isinstance(max_commit_attempts, int)
+            or not 1 <= max_commit_attempts <= max_allowed_attempts
+            or (derived_historical_limit is not None and max_commit_attempts > max(1, derived_historical_limit))):
         raise SnapshotIngestionError("commit_retry_limit_invalid", run_id, "commit")
     result: dict[str, Any] | None = None
+    processed_this_attempt = 0
+    previous_remaining: int | None = None
     for _ in range(max_commit_attempts):
         result = _post(ingest_url, token, {"action": "commit", "run_id": run_id}, run_id, "commit", opener)
         _require_run_response(result, run_id, "commit")
@@ -479,6 +493,17 @@ def _submit_prepared_records(
                     or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0
                     or isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0):
                 raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+            if mode == "historical":
+                if processed == 0 or remaining == 0:
+                    raise SnapshotIngestionError("commit_no_progress", run_id, "commit")
+                if (processed > HISTORICAL_COMMIT_RECORDS_PER_REQUEST
+                        or remaining >= len(records)
+                        or (previous_remaining is not None and remaining >= previous_remaining)):
+                    raise SnapshotIngestionError("commit_no_progress", run_id, "commit")
+                processed_this_attempt += processed
+                if processed_this_attempt > len(records):
+                    raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+                previous_remaining = remaining
             continue
         if status == "COMMITTED":
             generation = result.get("snapshot_generation")
@@ -487,16 +512,27 @@ def _submit_prepared_records(
                     or isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
                     or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0):
                 raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
-            summary.update({"status": status, "accepted_records": accepted, "processed_records": processed,
+            if mode == "historical":
+                if processed > HISTORICAL_COMMIT_RECORDS_PER_REQUEST:
+                    raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+                processed_this_attempt += processed
+                if processed_this_attempt > len(records):
+                    raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+                if not commit_resumed and processed_this_attempt != len(records):
+                    raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+            reported_processed = processed_this_attempt if mode == "historical" else processed
+            summary.update({"status": status, "accepted_records": accepted, "processed_records": reported_processed,
                             "snapshot_advanced": True, "snapshot_generation": generation,
-                            "start_idempotent": start_idempotent})
+                            "start_idempotent": start_idempotent, "commit_resumed": commit_resumed})
             return summary
         if status == "BLOCKED":
             if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not False
                     or ("error" in result and result.get("error") != "incomplete_publication")):
                 raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
-            summary.update({"status": status, "accepted_records": accepted, "processed_records": 0,
-                            "snapshot_advanced": False, "start_idempotent": start_idempotent})
+            summary.update({"status": status, "accepted_records": accepted,
+                            "processed_records": processed_this_attempt if mode == "historical" else 0,
+                            "snapshot_advanced": False, "start_idempotent": start_idempotent,
+                            "commit_resumed": commit_resumed})
             return summary
         raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
     if result and result.get("status") == "COMMITTING":
@@ -516,7 +552,7 @@ def submit_prepared_historical_records(
     token: str,
     run_id: str,
     opener: Opener = urllib.request.urlopen,
-    max_commit_attempts: int = MAX_COMMIT_ATTEMPTS,
+    max_commit_attempts: int | None = None,
 ) -> dict[str, Any]:
     """Submit only a validated historical handoff from its dedicated workflow mode."""
     if activation_mode != HISTORICAL_LIVE_ACTIVATION_MODE:
@@ -535,10 +571,14 @@ def submit_prepared_historical_records(
     readiness = verify_historical_snapshot_readiness(
         endpoint, token, opener=readiness_opener, allow_same_run_resume=True
     )
+    derived_attempt_limit = max(
+        1, (len(prepared) + HISTORICAL_COMMIT_RECORDS_PER_REQUEST - 1)
+        // HISTORICAL_COMMIT_RECORDS_PER_REQUEST,
+    )
     return _submit_prepared_records(
         prepared, batches, counts, mode="historical", base=None, target=target,
         endpoint=endpoint, token=token, run_id=run_id, opener=opener,
-        max_commit_attempts=max_commit_attempts,
+        max_commit_attempts=derived_attempt_limit if max_commit_attempts is None else max_commit_attempts,
         require_idempotent_start=readiness["same_run_resume_candidate"],
     )
 
