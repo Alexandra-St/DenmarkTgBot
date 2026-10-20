@@ -1966,12 +1966,21 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
 
     expected_integer_fields = (
         "manifest_sag_count", "hydrated_case_count", "prepared_record_count", "DIRECT", "POTENTIAL",
-        "IRRELEVANT", "notification_blocked_count", "ingestion_batch_count", "largest_batch_records",
-        "largest_batch_bytes", "incomplete_case_count", "provider_adaptive_splits",
+        "IRRELEVANT", "notification_blocked_count", "selected_historical_ingestion_record_count",
+        "selected_historical_ingestion_batch_count", "selected_largest_batch_records",
+        "selected_largest_batch_bytes", "incomplete_case_count", "provider_adaptive_splits",
         "provider_adaptive_split_successes", "provider_max_split_depth",
         "provider_terminal_singleton_failures",
     )
     if summary.get("status") not in {"PASS", "INCOMPLETE"}:
+        raise PocError("historical_baseline_summary_invalid")
+    if (not isinstance(summary.get("full_universe_complete"), bool)
+            or not isinstance(summary.get("selected_payload_fits_worker_limit"), bool)):
+        raise PocError("historical_baseline_summary_invalid")
+    if summary["status"] == "PASS" and (
+        summary["full_universe_complete"] is not True
+        or summary["selected_payload_fits_worker_limit"] is not True
+    ):
         raise PocError("historical_baseline_summary_invalid")
     clean: dict[str, int] = {}
     for field in expected_integer_fields:
@@ -2027,9 +2036,12 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
         f"- POTENTIAL: {clean['POTENTIAL']}",
         f"- IRRELEVANT: {clean['IRRELEVANT']}",
         f"- notification_blocked count: {clean['notification_blocked_count']}",
-        f"- ingestion batch count: {clean['ingestion_batch_count']}",
-        f"- largest ingestion batch records: {clean['largest_batch_records']}",
-        f"- largest ingestion batch bytes: {clean['largest_batch_bytes']}",
+        f"- full-universe completeness proof: {str(summary['full_universe_complete']).lower()}",
+        f"- selected historical ingestion records: {clean['selected_historical_ingestion_record_count']}",
+        f"- selected historical ingestion batches: {clean['selected_historical_ingestion_batch_count']}",
+        f"- selected largest batch records: {clean['selected_largest_batch_records']}",
+        f"- selected largest batch bytes: {clean['selected_largest_batch_bytes']}",
+        f"- selected payload fits Worker 200-batch limit: {str(summary['selected_payload_fits_worker_limit']).lower()}",
         f"- incomplete case count: {clean['incomplete_case_count']}",
         f"- provider adaptive splits: {clean['provider_adaptive_splits']}",
         f"- provider adaptive split successes: {clean['provider_adaptive_split_successes']}",

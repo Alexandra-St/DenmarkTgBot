@@ -526,8 +526,11 @@ class BackupPocSafetyTests(unittest.TestCase):
         summary = {
             "status": "INCOMPLETE", "manifest_sag_count": 3, "hydrated_case_count": 2,
             "prepared_record_count": 2, "DIRECT": 1, "POTENTIAL": 0, "IRRELEVANT": 1,
-            "notification_blocked_count": 1, "ingestion_batch_count": 1, "largest_batch_records": 2,
-            "largest_batch_bytes": 500, "incomplete_case_count": 1,
+            "notification_blocked_count": 1, "full_universe_complete": False,
+            "selected_historical_ingestion_record_count": 1,
+            "selected_historical_ingestion_batch_count": 1,
+            "selected_largest_batch_records": 1, "selected_largest_batch_bytes": 500,
+            "selected_payload_fits_worker_limit": True, "incomplete_case_count": 1,
             "provider_adaptive_splits": 4, "provider_adaptive_split_successes": 0,
             "provider_max_split_depth": 2, "provider_terminal_singleton_failures": 2,
             "provider_terminal_transport_row_shapes": {"null_token": 1, "missing_separator_ascii": 1},
@@ -545,6 +548,10 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("Historical snapshot baseline dry-run: INCOMPLETE", rendered)
         self.assertEqual(POC.historical_baseline_exit_code(summary), 2)
         self.assertIn("missing_status: 1", rendered)
+        self.assertIn("full-universe completeness proof: false", rendered)
+        self.assertIn("selected historical ingestion records: 1", rendered)
+        self.assertIn("selected historical ingestion batches: 1", rendered)
+        self.assertIn("selected payload fits Worker 200-batch limit: true", rendered)
         self.assertIn("provider terminal singleton failures: 2", rendered)
         self.assertIn("null_token: 1", rendered)
         self.assertIn("missing_separator_ascii: 1", rendered)
@@ -553,6 +560,8 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertNotIn("DO NOT PRINT", rendered)
         self.assertNotIn("987654", rendered)
         summary["status"] = "PASS"
+        summary["full_universe_complete"] = True
+        summary["selected_payload_fits_worker_limit"] = True
         output = StringIO()
         with redirect_stdout(output):
             POC.write_historical_baseline_summary(summary)

@@ -26,7 +26,28 @@ from folketinget_sql_transport import CHUNK_LINE_LENGTH_BUCKETS, CHUNK_ROW_SHAPE
 
 
 MAX_SAGS_PER_HYDRATION = 250
+MAX_HISTORICAL_INGESTION_BATCHES = 200
+MAX_SELECTED_RECORDS_IN_MEMORY = MAX_HISTORICAL_INGESTION_BATCHES * ingestion_client.MAX_BATCH_RECORDS
+MAX_SELECTED_RECORD_BYTES_IN_MEMORY = MAX_HISTORICAL_INGESTION_BATCHES * ingestion_client.MAX_BATCH_BYTES
 RELEVANCE_VALUES = frozenset({DIRECT, POTENTIAL, IRRELEVANT})
+SELECTED_RELEVANCE_VALUES = frozenset({DIRECT, POTENTIAL})
+
+
+def _selected_record_contract_valid(record: dict[str, object]) -> bool:
+    snapshot = record.get("normalized_snapshot")
+    external_id = record.get("external_id")
+    return (
+        record.get("source") == "folketinget"
+        and record.get("historical") is True
+        and record.get("complete") is True
+        and record.get("relevance") in SELECTED_RELEVANCE_VALUES
+        and record.get("ruleset_version") == RULESET_VERSION
+        and isinstance(external_id, str)
+        and external_id.isascii()
+        and external_id.isdigit()
+        and isinstance(snapshot, dict)
+        and all(isinstance(snapshot.get(name), list) for name in ("documents", "stages", "votes"))
+    )
 
 
 class HistoricalBaselineError(Exception):
@@ -157,9 +178,10 @@ def run_historical_baseline(
     hydrated_complete = 0
     prepared_count = 0
     incomplete_cases = 0
-    ingestion_batch_count = 0
-    largest_batch_records = 0
-    largest_batch_bytes = 0
+    selected_record_count = 0
+    selected_records: list[dict[str, object]] = []
+    selected_record_bytes = 0
+    selected_memory_limit_exceeded = False
     # The manifest v1 primary key plus strict canonical JSON decoding makes the
     # mapping from canonical Sag key to integer ID injective. Thus no global ID
     # set is needed; only each bounded hydration group's IDs are retained.
@@ -198,7 +220,6 @@ def run_historical_baseline(
                 source="folketinget",
                 mode="historical",
             )
-            batches = ingestion_client.chunks(records)
         except Exception:
             diagnostics["ingestion_preparation_failed"] += 1
             continue
@@ -208,22 +229,41 @@ def run_historical_baseline(
         if len(records) != len(cases):
             diagnostics["prepared_record_count_mismatch"] += 1
         for record in records:
+            prepared_count += 1
+            if not isinstance(record, dict):
+                diagnostics["prepared_record_contract_invalid"] += 1
+                continue
+            is_selected = record.get("relevance") in SELECTED_RELEVANCE_VALUES
+            if is_selected:
+                selected_record_count += 1
             if (record.get("source") != "folketinget" or record.get("historical") is not True
                     or not isinstance(record.get("complete"), bool)
                     or not isinstance(record.get("notification_blocked"), bool)
                     or record.get("relevance") not in RELEVANCE_VALUES
                     or record.get("ruleset_version") != RULESET_VERSION):
                 diagnostics["prepared_record_contract_invalid"] += 1
+                if is_selected:
+                    diagnostics["selected_record_contract_invalid"] += 1
                 continue
-            prepared_count += 1
             totals[str(record["relevance"])] += 1
             totals["notification_blocked"] += int(record.get("notification_blocked") is True)
-
-        ingestion_batch_count += len(batches)
-        for batch in batches:
-            encoded_bytes = len(json.dumps({"records": batch}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            largest_batch_records = max(largest_batch_records, len(batch))
-            largest_batch_bytes = max(largest_batch_bytes, encoded_bytes)
+            if is_selected:
+                if not _selected_record_contract_valid(record):
+                    diagnostics["selected_record_contract_invalid"] += 1
+                    continue
+                try:
+                    record_bytes = len(json.dumps(
+                        record, ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8"))
+                except (TypeError, ValueError, UnicodeEncodeError):
+                    diagnostics["selected_record_contract_invalid"] += 1
+                    continue
+                if (len(selected_records) >= MAX_SELECTED_RECORDS_IN_MEMORY
+                        or selected_record_bytes + record_bytes > MAX_SELECTED_RECORD_BYTES_IN_MEMORY):
+                    selected_memory_limit_exceeded = True
+                elif not selected_memory_limit_exceeded:
+                    selected_records.append(record)
+                    selected_record_bytes += record_bytes
         if progress_callback is not None:
             try:
                 progress_callback(processed_sags, manifest_count)
@@ -233,28 +273,62 @@ def run_historical_baseline(
     if processed_sags != manifest_count:
         raise HistoricalBaselineError("manifest_sag_count_mismatch")
 
-    complete = (
+    full_universe_complete = (
         not diagnostics
         and incomplete_cases == 0
         and hydrated_complete == processed_sags
         and prepared_count == hydrated_complete
+        and processed_sags == manifest_count
     )
+    selected_batch_count = 0
+    selected_largest_batch_records = 0
+    selected_largest_batch_bytes = 0
+    selected_fits_worker_limit = False
+    if full_universe_complete:
+        if selected_memory_limit_exceeded:
+            diagnostics["selected_payload_memory_limit_exceeded"] += 1
+        elif selected_record_count != len(selected_records):
+            diagnostics["selected_record_count_mismatch"] += 1
+        else:
+            try:
+                # The only list passed to chunks() contains DIRECT/POTENTIAL
+                # records and is strictly capped by count and serialized bytes.
+                selected_batches = ingestion_client.chunks(selected_records)
+                selected_batch_count = len(selected_batches)
+                for batch in selected_batches:
+                    encoded_bytes = len(json.dumps(
+                        {"records": batch}, ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8"))
+                    selected_largest_batch_records = max(selected_largest_batch_records, len(batch))
+                    selected_largest_batch_bytes = max(selected_largest_batch_bytes, encoded_bytes)
+            except Exception:
+                diagnostics["selected_ingestion_batching_failed"] += 1
+            if selected_batch_count > MAX_HISTORICAL_INGESTION_BATCHES:
+                diagnostics["selected_payload_exceeds_worker_batch_limit"] += 1
+            selected_fits_worker_limit = (
+                selected_batch_count <= MAX_HISTORICAL_INGESTION_BATCHES
+                and "selected_ingestion_batching_failed" not in diagnostics
+                and "selected_record_count_mismatch" not in diagnostics
+            )
     try:
         metadata = snapshot_diff.validate_manifest(Path(manifest_path))
     except snapshot_diff.DiffError as error:
         raise HistoricalBaselineError(error.category) from None
     return {
-        "status": "PASS" if complete else "INCOMPLETE",
+        "status": "PASS" if full_universe_complete and selected_fits_worker_limit and not diagnostics else "INCOMPLETE",
+        "full_universe_complete": full_universe_complete,
         "manifest_sag_count": manifest_count,
         "hydrated_case_count": hydrated_complete,
         "prepared_record_count": prepared_count,
+        "selected_historical_ingestion_record_count": selected_record_count,
+        "selected_historical_ingestion_batch_count": selected_batch_count,
+        "selected_largest_batch_records": selected_largest_batch_records,
+        "selected_largest_batch_bytes": selected_largest_batch_bytes,
+        "selected_payload_fits_worker_limit": selected_fits_worker_limit,
         "DIRECT": totals[DIRECT],
         "POTENTIAL": totals[POTENTIAL],
         "IRRELEVANT": totals[IRRELEVANT],
         "notification_blocked_count": totals["notification_blocked"],
-        "ingestion_batch_count": ingestion_batch_count,
-        "largest_batch_records": largest_batch_records,
-        "largest_batch_bytes": largest_batch_bytes,
         "incomplete_case_count": incomplete_cases,
         "diagnostics": dict(sorted(diagnostics.items())),
         "target_backup_finish": metadata["backup_finish_date"],

@@ -99,24 +99,45 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
         self.assertEqual(result["manifest_sag_count"], 5)
         self.assertEqual(result["hydrated_case_count"], 5)
         self.assertEqual(result["prepared_record_count"], 5)
+        self.assertEqual(result["selected_historical_ingestion_record_count"], 4)
+        self.assertEqual(result["selected_historical_ingestion_batch_count"], 1)
+        self.assertTrue(result["selected_payload_fits_worker_limit"])
         self.assertEqual(max(provider.lookup_sizes), 2)
-        self.assertLessEqual(result["largest_batch_records"], 50)
 
     def test_historical_records_and_relevance_aggregates(self):
-        result, _ = self.run_fixture([1, 2, 3])
-        self.assertEqual(result["DIRECT"], 1)
-        self.assertEqual(result["POTENTIAL"], 1)
-        self.assertEqual(result["IRRELEVANT"], 1)
+        create_manifest(self.manifest, [1, 2, 3])
         original = BASELINE.ingestion_client.prepare_records
         prepared = []
+        selected_chunk_inputs = []
+
         def capture(*args, **kwargs):
             records = original(*args, **kwargs)
             prepared.extend(records)
             return records
-        with mock.patch.object(BASELINE.ingestion_client, "prepare_records", wraps=BASELINE.ingestion_client.prepare_records) as prepare:
-            prepare.side_effect = capture
-            BASELINE.run_historical_baseline(self.manifest, TrackingProvider(source_rows([1, 2, 3])))
-            self.assertTrue(all(call.kwargs["mode"] == "historical" for call in prepare.call_args_list))
+
+        original_chunks = BASELINE.ingestion_client.chunks
+
+        def capture_chunks(records):
+            selected_chunk_inputs.extend(records)
+            return original_chunks(records)
+
+        with mock.patch.object(BASELINE.ingestion_client, "prepare_records", side_effect=capture) as prepare, \
+                mock.patch.object(BASELINE.ingestion_client, "chunks", side_effect=capture_chunks):
+            result = BASELINE.run_historical_baseline(self.manifest, TrackingProvider(source_rows([1, 2, 3])))
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["full_universe_complete"])
+        self.assertEqual(result["prepared_record_count"], 3)
+        self.assertEqual(result["DIRECT"], 1)
+        self.assertEqual(result["POTENTIAL"], 1)
+        self.assertEqual(result["IRRELEVANT"], 1)
+        self.assertEqual(result["selected_historical_ingestion_record_count"], 2)
+        self.assertEqual(result["selected_historical_ingestion_batch_count"], 1)
+        self.assertTrue(result["selected_payload_fits_worker_limit"])
+        self.assertEqual(len(selected_chunk_inputs), 2)
+        self.assertTrue(all(record["relevance"] in {DIRECT, POTENTIAL} for record in selected_chunk_inputs))
+        self.assertTrue(all(record["historical"] is True and record["complete"] is True for record in selected_chunk_inputs))
+        self.assertTrue(all("normalized_snapshot" in record for record in selected_chunk_inputs))
+        self.assertTrue(all(call.kwargs["mode"] == "historical" for call in prepare.call_args_list))
         self.assertTrue(all(record["historical"] is True for record in prepared))
 
     def test_existing_relation_hydration_assembles_full_case_graph(self):
@@ -150,8 +171,13 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
     def test_missing_sag_and_missing_required_relation_are_incomplete(self):
         create_manifest(self.manifest, [1, 2])
         provider = TrackingProvider(source_rows([1]))
-        result = BASELINE.run_historical_baseline(self.manifest, provider)
+        with mock.patch.object(BASELINE.ingestion_client, "chunks", wraps=BASELINE.ingestion_client.chunks) as chunks:
+            result = BASELINE.run_historical_baseline(self.manifest, provider)
+        chunks.assert_not_called()
         self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertFalse(result["full_universe_complete"])
+        self.assertFalse(result["selected_payload_fits_worker_limit"])
+        self.assertEqual(result["selected_historical_ingestion_batch_count"], 0)
         self.assertGreater(result["incomplete_case_count"], 0)
         self.assertGreater(result["diagnostics"].get("hydrated_sag_mismatch", 0), 0)
 
@@ -194,6 +220,52 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["manifest_sag_count"], 0)
         self.assertEqual(result["prepared_record_count"], 0)
+        self.assertEqual(result["selected_historical_ingestion_record_count"], 0)
+        self.assertEqual(result["selected_historical_ingestion_batch_count"], 1)
+        self.assertTrue(result["selected_payload_fits_worker_limit"])
+
+    def test_selected_payload_over_worker_batch_limit_is_incomplete(self):
+        create_manifest(self.manifest, [1, 2, 3])
+        with mock.patch.object(BASELINE, "MAX_HISTORICAL_INGESTION_BATCHES", 1), \
+                mock.patch.object(BASELINE.ingestion_client, "MAX_BATCH_RECORDS", 1):
+            result = BASELINE.run_historical_baseline(self.manifest, TrackingProvider(source_rows([1, 2, 3])))
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertTrue(result["full_universe_complete"])
+        self.assertEqual(result["selected_historical_ingestion_record_count"], 2)
+        self.assertEqual(result["selected_historical_ingestion_batch_count"], 2)
+        self.assertFalse(result["selected_payload_fits_worker_limit"])
+        self.assertEqual(result["diagnostics"].get("selected_payload_exceeds_worker_batch_limit"), 1)
+
+    def test_selected_payload_memory_bound_fails_closed_without_dropping_counts(self):
+        create_manifest(self.manifest, [1, 2, 3])
+        for bound_name in ("MAX_SELECTED_RECORDS_IN_MEMORY", "MAX_SELECTED_RECORD_BYTES_IN_MEMORY"):
+            with self.subTest(bound=bound_name), mock.patch.object(BASELINE, bound_name, 1):
+                result = BASELINE.run_historical_baseline(
+                    self.manifest, TrackingProvider(source_rows([1, 2, 3]))
+                )
+                self.assertEqual(result["status"], "INCOMPLETE")
+                self.assertTrue(result["full_universe_complete"])
+                self.assertEqual(result["selected_historical_ingestion_record_count"], 2)
+                self.assertEqual(result["selected_historical_ingestion_batch_count"], 0)
+                self.assertFalse(result["selected_payload_fits_worker_limit"])
+                self.assertEqual(result["diagnostics"].get("selected_payload_memory_limit_exceeded"), 1)
+
+    def test_invalid_selected_record_contract_fails_closed(self):
+        create_manifest(self.manifest, [1])
+        original = BASELINE.ingestion_client.prepare_records
+
+        def invalid_complete(*args, **kwargs):
+            records = original(*args, **kwargs)
+            records[0]["complete"] = False
+            return records
+
+        with mock.patch.object(BASELINE.ingestion_client, "prepare_records", side_effect=invalid_complete), \
+                mock.patch.object(BASELINE.ingestion_client, "chunks", wraps=BASELINE.ingestion_client.chunks) as chunks:
+            result = BASELINE.run_historical_baseline(self.manifest, TrackingProvider(source_rows([1])))
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertFalse(result["selected_payload_fits_worker_limit"])
+        self.assertEqual(result["diagnostics"].get("selected_record_contract_invalid"), 1)
+        chunks.assert_not_called()
 
     def test_progress_callback_receives_only_aggregate_counts(self):
         create_manifest(self.manifest, [1, 2])
