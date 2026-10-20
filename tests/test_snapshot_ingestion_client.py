@@ -118,6 +118,37 @@ class SnapshotIngestionClientTests(unittest.TestCase):
                                             mode="incremental", base_snapshot=BASE, target_snapshot=TARGET)
         self.assertEqual((result["records"], result["batches"]), (0, 1))
 
+    def test_incremental_snapshot_tombstone_is_counted_and_batched_without_classification(self) -> None:
+        data = {"source": "folketinget", "complete": True, "cases": [],
+                "tombstones": [{"operation": "SOURCE_DELETE", "source": "folketinget", "external_id": "42"}]}
+        result = ingest_snapshot_candidates(data, mode="incremental", base_snapshot=BASE,
+                                            target_snapshot=TARGET, dry_run=True)
+        self.assertEqual((result["records"], result["batches"]), (1, 1))
+        self.assertEqual(result["relevance_counts"], {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0})
+        self.assertTrue(result["submission_eligible"])
+
+        mixed = {**bundle(), "tombstones": [{"operation": "SOURCE_DELETE", "source": "folketinget", "external_id": "42"}]}
+        mixed_result = ingest_snapshot_candidates(mixed, mode="incremental", base_snapshot=BASE,
+                                                  target_snapshot=TARGET, dry_run=True)
+        self.assertEqual((mixed_result["records"], mixed_result["batches"]), (2, 1))
+        self.assertEqual(sum(mixed_result["relevance_counts"].values()), 1)
+
+    def test_tombstones_are_strict_and_incremental_folketinget_only(self) -> None:
+        invalid = [
+            {"operation": "SOURCE_DELETE", "source": "hoeringsportalen", "external_id": "42"},
+            {"operation": "SOURCE_DELETE", "source": "folketinget", "external_id": "not-an-id"},
+            {"operation": "SOURCE_DELETE", "source": "folketinget", "external_id": "42", "title": "invented"},
+        ]
+        for tombstone in invalid:
+            with self.assertRaisesRegex(SnapshotIngestionError, "tombstone_invalid"):
+                ingest_snapshot_candidates({"source": "folketinget", "complete": True, "cases": [],
+                                            "tombstones": [tombstone]}, mode="incremental",
+                                           base_snapshot=BASE, target_snapshot=TARGET)
+        with self.assertRaisesRegex(SnapshotIngestionError, "tombstone_mode_unsupported"):
+            ingest_snapshot_candidates({"source": "folketinget", "complete": True, "cases": [],
+                                        "tombstones": [{"operation": "SOURCE_DELETE", "source": "folketinget", "external_id": "42"}]},
+                                       mode="historical", base_snapshot=None, target_snapshot=TARGET)
+
     def test_historical_dry_run_allowed_but_ineligible(self) -> None:
         result = ingest_snapshot_candidates(bundle(), mode="historical", base_snapshot=None,
                                             target_snapshot=TARGET, dry_run=True)

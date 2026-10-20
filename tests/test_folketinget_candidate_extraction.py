@@ -213,11 +213,13 @@ class CandidateExtractionTests(unittest.TestCase):
         summary = CANDIDATES.candidate_summary(bundle)
         self.assertEqual(summary["diff"]["totals"]["removed"], 1)
 
-    def test_removed_sag_resolves_its_own_case_id_but_cannot_hydrate_deleted_case(self) -> None:
+    def test_removed_sag_becomes_tombstone_without_hydration(self) -> None:
         bundle = self.build([("Sag", "removed", 10)], {})
-        self.assertFalse(bundle["complete"])
+        self.assertTrue(bundle["complete"])
         self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
-        self.assertIn("affected_case_missing", {item["code"] for item in bundle["diagnostics"]})
+        self.assertEqual(bundle["cases"], [])
+        self.assertEqual(bundle["tombstones"], [{"operation": "SOURCE_DELETE", "source": "folketinget", "external_id": "10"}])
+        self.assertNotIn("affected_case_missing", {item["code"] for item in bundle["diagnostics"]})
 
     def test_removed_sagstrin_and_sagdokument_use_old_sagid(self) -> None:
         for entity, source in (("Sagstrin", {"Sag": [sag(10)], "Sagstrin": [stage(99, 10)]}),
@@ -259,6 +261,15 @@ class CandidateExtractionTests(unittest.TestCase):
                             {"Sag": [sag(10)], "Sagstrin": [stage(22, 10)]},
                             old_routing={("Sagstrin", 33): {"sagid": 10}})
         self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
+        confirmed_delete = self.build([("Sag", "removed", 10), ("Sagstrin", "removed", 33)], {},
+                                      old_routing={("Sagstrin", 33): {"sagid": 10}})
+        self.assertTrue(confirmed_delete["complete"])
+        self.assertEqual(confirmed_delete["cases"], [])
+        self.assertEqual(confirmed_delete["_summary"]["tombstone_count"], 1)
+        unexpected_missing = self.build([("Sagstrin", "removed", 34)], {},
+                                        old_routing={("Sagstrin", 34): {"sagid": 11}})
+        self.assertFalse(unexpected_missing["complete"])
+        self.assertIn("affected_case_missing", {item["code"] for item in unexpected_missing["diagnostics"]})
         with self.assertRaises(CANDIDATES.CandidateExtractionError) as raised:
             self.build([("Sagstrin", "removed", 31), ("Sagstrin", "removed", 32), ("Sagstrin", "removed", 33)],
                        {"Sag": [sag(10), sag(11), sag(12)]},

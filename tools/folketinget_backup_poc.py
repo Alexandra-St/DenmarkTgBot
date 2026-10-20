@@ -1485,6 +1485,7 @@ def run_snapshot_incremental_dry_run(
             "status": "PASS", "snapshot_change": "SAME_SNAPSHOT",
             "base_finish": context["old_finish"], "target_finish": context["new_finish"],
             "diff_totals": dict(diff_totals), "affected_case_count": 0, "hydrated_case_count": 0,
+            "tombstone_count": 0,
             "DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0, "prepared_record_count": 0,
             "batch_count": 0, "snapshot_client_dry_run": "PASS", "submission_eligible": False,
         }
@@ -1511,6 +1512,7 @@ def run_snapshot_incremental_dry_run(
         "diff_totals": dict(result["diff_totals"]),
         "affected_case_count": result["affected_case_count"],
         "hydrated_case_count": result["hydrated_case_count"],
+        "tombstone_count": result["tombstone_count"],
         "DIRECT": counts.get("DIRECT", 0), "POTENTIAL": counts.get("POTENTIAL", 0),
         "IRRELEVANT": counts.get("IRRELEVANT", 0),
         "prepared_record_count": client.get("prepared_record_count", 0) if isinstance(client, dict) else 0,
@@ -2048,12 +2050,17 @@ def run_candidate_extraction(
         candidate_count = persisted_bundle.get("candidate_case_count")
         if isinstance(candidate_count, bool) or not isinstance(candidate_count, int) or candidate_count < 0:
             raise PocError("candidate_summary_invalid")
+        tombstones = persisted_bundle.get("tombstones", [])
+        if not isinstance(tombstones, list):
+            raise PocError("candidate_summary_invalid")
+        tombstone_count = len(tombstones)
         result = {
             "complete": summary.get("complete") is True,
             "diff_totals": clean_totals,
             "diff_entities": clean_entity_counts,
             **counts,
             "candidate_case_count": candidate_count,
+            "tombstone_count": tombstone_count,
             "diagnostics": clean_diagnostics,
             "old_finish": old_finish,
             "new_finish": new_finish,
@@ -2071,6 +2078,7 @@ def run_candidate_extraction(
                 result["snapshot_ingestion"] = {
                     "complete": False,
                     "candidate_case_count": result["candidate_case_count"],
+                    "tombstone_count": result["tombstone_count"],
                     "prepared_record_count": 0,
                     "batch_count": 0,
                     "relevance_counts": {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0},
@@ -2111,7 +2119,7 @@ def run_candidate_extraction(
                     or client_result.get("submission_eligible") is not True
                     or isinstance(prepared_count, bool)
                     or not isinstance(prepared_count, int)
-                    or prepared_count != result["candidate_case_count"]
+                    or prepared_count != result["candidate_case_count"] + result["tombstone_count"]
                     or isinstance(batch_count, bool)
                     or not isinstance(batch_count, int)
                     or batch_count < 1
@@ -2126,6 +2134,7 @@ def run_candidate_extraction(
                 result["snapshot_ingestion"] = {
                     "complete": True,
                     "candidate_case_count": result["candidate_case_count"],
+                    "tombstone_count": result["tombstone_count"],
                     "prepared_record_count": prepared_count,
                     "batch_count": batch_count,
                     "relevance_counts": counts,
@@ -2446,6 +2455,7 @@ def write_snapshot_ingestion_client_summary(summary: dict[str, Any]) -> None:
         f"Snapshot ingestion client dry-run: {state}",
         "",
         f"- candidate cases: {ingestion['candidate_case_count']}",
+        f"- source deletion operations: {ingestion.get('tombstone_count', 0)}",
         f"- prepared records: {ingestion['prepared_record_count']}",
         f"- batches: {ingestion['batch_count']}",
         f"- DIRECT: {counts['DIRECT']}",
@@ -2487,6 +2497,7 @@ def write_snapshot_incremental_summary(summary: dict[str, Any]) -> None:
         f"- changed: {diff['changed']}",
         f"- technical_only: {diff['technical_only']}",
         f"- affected Sag count: {summary['affected_case_count']}",
+        f"- source deletion operations: {summary.get('tombstone_count', 0)}",
         f"- hydrated Sag count: {summary['hydrated_case_count']}",
         f"- DIRECT: {summary['DIRECT']}",
         f"- POTENTIAL: {summary['POTENTIAL']}",

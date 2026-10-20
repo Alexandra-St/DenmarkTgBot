@@ -20,6 +20,11 @@ interface PublicationInput {
   historical: boolean; notification_blocked: boolean; complete: boolean;
   diagnostics: unknown[]; source_metadata: JsonObject; normalized_snapshot: JsonObject;
 }
+interface SourceDeleteInput { operation: "SOURCE_DELETE"; source: "folketinget"; external_id: string }
+type StagedInput = PublicationInput | SourceDeleteInput;
+function isSourceDelete(value: StagedInput): value is SourceDeleteInput {
+  return "operation" in value && value.operation === "SOURCE_DELETE";
+}
 
 const ODA_STREAMS = ["Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus"] as const;
 const HEARING_FEEDS = ["immigration_ministry", "immigration_category"] as const;
@@ -31,6 +36,7 @@ const MAX_CLEANUP_RUNS = 20;
 const DEFAULT_INGESTION_RETENTION_DAYS = 90;
 
 const READINESS_TABLE_COLUMNS: Record<string, readonly string[]> = {
+  publications: ["source_deleted"],
   sources: ["id", "code"],
   ingestion_runs: [
     "run_id", "source_id", "status", "mode", "state_kind", "proposed_checkpoints_json",
@@ -213,6 +219,21 @@ function validatePublication(raw: unknown, source: SourceCode, mode: "historical
   };
 }
 
+function validateSourceDelete(raw: unknown, source: SourceCode, mode: "historical" | "incremental", stateKind: "checkpoint" | "snapshot"): SourceDeleteInput {
+  if (!object(raw) || Object.keys(raw).sort().join(",") !== "external_id,operation,source"
+      || raw.operation !== "SOURCE_DELETE" || source !== "folketinget" || mode !== "incremental" || stateKind !== "snapshot"
+      || raw.source !== "folketinget" || typeof raw.external_id !== "string"
+      || !/^\d{1,20}$/.test(raw.external_id)) {
+    throw new RequestError(400, "invalid_source_deletion");
+  }
+  return { operation: "SOURCE_DELETE", source: "folketinget", external_id: raw.external_id };
+}
+
+function validateStagedInput(raw: unknown, source: SourceCode, mode: "historical" | "incremental", stateKind: "checkpoint" | "snapshot"): StagedInput {
+  if (object(raw) && Object.hasOwn(raw, "operation")) return validateSourceDelete(raw, source, mode, stateKind);
+  return validatePublication(raw, source, mode);
+}
+
 function failure(error: unknown): Response {
   if (error instanceof RequestError) return json({ error: error.code }, error.status);
   return json({ error: "internal_error" }, 500);
@@ -382,12 +403,12 @@ async function startSnapshotRun(body: JsonObject, db: D1Database): Promise<Respo
 
 async function submitBatch(body: JsonObject, db: D1Database): Promise<Response> {
   if (typeof body.run_id !== "string" || !Array.isArray(body.records) || body.records.length > MAX_BATCH_RECORDS || !integer(body.batch_index)) throw new RequestError(400, "invalid_batch");
-  const run = await db.prepare("SELECT r.source_id, r.mode, r.status, r.expected_batches, s.code AS source FROM ingestion_runs r JOIN sources s ON s.id = r.source_id WHERE r.run_id = ?").bind(body.run_id)
-    .first<{ source_id: number; mode: "historical" | "incremental"; status: string; expected_batches: number; source: SourceCode }>();
+  const run = await db.prepare("SELECT r.source_id, r.mode, r.state_kind, r.status, r.expected_batches, s.code AS source FROM ingestion_runs r JOIN sources s ON s.id = r.source_id WHERE r.run_id = ?").bind(body.run_id)
+    .first<{ source_id: number; mode: "historical" | "incremental"; state_kind: "checkpoint" | "snapshot"; status: string; expected_batches: number; source: SourceCode }>();
   if (!run) throw new RequestError(404, "run_not_found");
   if (run.status !== "OPEN") throw new RequestError(409, "run_not_open");
   if (body.batch_index >= run.expected_batches) throw new RequestError(400, "invalid_batch_index");
-  const pubs = body.records.map((item) => validatePublication(item, run.source, run.mode));
+  const pubs = body.records.map((item) => validateStagedInput(item, run.source, run.mode, run.state_kind));
   const inBatch = new Set<string>();
   for (const pub of pubs) { if (inBatch.has(pub.external_id)) throw new RequestError(400, "duplicate_publication_in_batch"); inBatch.add(pub.external_id); }
   const payloadHash = await sha256(canonical(pubs));
@@ -410,7 +431,7 @@ async function submitBatch(body: JsonObject, db: D1Database): Promise<Response> 
     if (!prior) {
       newlyStaged += 1;
       statements.push(db.prepare("INSERT INTO ingestion_staging (run_id, source_id, external_id, publication_json, payload_hash, source_complete) VALUES (?, ?, ?, ?, ?, ?)")
-        .bind(body.run_id, run.source_id, pub.external_id, encoded, recordHash, pub.complete ? 1 : 0));
+        .bind(body.run_id, run.source_id, pub.external_id, encoded, recordHash, "operation" in pub || pub.complete ? 1 : 0));
     }
   }
   statements.push(db.prepare("UPDATE ingestion_runs SET accepted_count = accepted_count + ?, updated_at = ? WHERE run_id = ? AND status = 'OPEN'")
@@ -450,7 +471,17 @@ function eventChanges(previous: JsonObject | null, incoming: PublicationInput): 
 }
 
 async function processStaged(db: D1Database, runId: string, sourceId: number, mode: "historical" | "incremental", staged: { external_id: string; publication_json: string }): Promise<void> {
-  const incoming = JSON.parse(staged.publication_json) as PublicationInput;
+  const incoming = JSON.parse(staged.publication_json) as StagedInput;
+  if (isSourceDelete(incoming)) {
+    const now = new Date().toISOString();
+    await db.batch([
+      db.prepare("UPDATE publications SET source_deleted = 1, updated_at = ? WHERE source_id = ? AND external_id = ? AND source_deleted = 0 AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
+        .bind(now, sourceId, incoming.external_id, runId, sourceId, incoming.external_id),
+      db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0")
+        .bind(runId, sourceId, incoming.external_id),
+    ]);
+    return;
+  }
   const old = await db.prepare("SELECT id, normalized_snapshot_json, source_complete FROM publications WHERE source_id = ? AND external_id = ?")
     .bind(sourceId, incoming.external_id).first<{ id: number; normalized_snapshot_json: string; source_complete: number }>();
   const now = new Date().toISOString();
@@ -482,7 +513,7 @@ async function processStaged(db: D1Database, runId: string, sourceId: number, mo
     votes: incoming.normalized_snapshot.votes,
   });
   const writePublication = old
-    ? db.prepare("UPDATE publications SET external_url = ?, original_title = ?, publication_type = ?, relevance = ?, relevance_reason = ?, current_status = ?, published_at = ?, source_updated_at = ?, updated_at = CASE WHEN ? = 1 THEN ? ELSE updated_at END, source_metadata_json = ?, normalized_snapshot_json = ?, relationship_snapshot_json = ?, ruleset_version = ?, source_complete = 1, historical = ?, diagnostics_json = ? WHERE id = ? AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
+    ? db.prepare("UPDATE publications SET external_url = ?, original_title = ?, publication_type = ?, relevance = ?, relevance_reason = ?, current_status = ?, published_at = ?, source_updated_at = ?, updated_at = CASE WHEN ? = 1 THEN ? ELSE updated_at END, source_metadata_json = ?, normalized_snapshot_json = ?, relationship_snapshot_json = ?, ruleset_version = ?, source_complete = 1, historical = ?, diagnostics_json = ?, source_deleted = 0 WHERE id = ? AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
       .bind(incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, meaningful ? 1 : 0, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), old.id, runId, sourceId, incoming.external_id)
     : db.prepare("INSERT INTO publications (source_id, external_id, external_url, original_title, publication_type, relevance, relevance_reason, current_status, published_at, source_updated_at, discovered_at, updated_at, source_metadata_json, normalized_snapshot_json, relationship_snapshot_json, ruleset_version, source_complete, historical, diagnostics_json) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ? WHERE EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
       .bind(sourceId, incoming.external_id, incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, now, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), runId, sourceId, incoming.external_id);
@@ -697,7 +728,7 @@ async function inspectSnapshotReadiness(db: D1Database): Promise<SnapshotReadine
   try {
     const requiredTables = Object.keys(READINESS_TABLE_COLUMNS);
     const tablesResult = await db.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sources', 'ingestion_runs', 'source_states', 'source_snapshot_states')",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('publications', 'sources', 'ingestion_runs', 'source_states', 'source_snapshot_states')",
     ).all<{ name: string }>();
     const existingTables = new Set((tablesResult.results ?? []).map((row) => row.name));
     if (requiredTables.some((table) => !existingTables.has(table))) return snapshotReadiness(false);

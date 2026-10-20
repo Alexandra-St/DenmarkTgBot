@@ -130,6 +130,30 @@ def _candidate_cases(bundle: object) -> tuple[list[dict[str, Any]], bool]:
     return [dict(case) for case in cases], bundle["complete"]
 
 
+def _candidate_tombstones(bundle: object, *, mode: str) -> list[dict[str, Any]]:
+    if not isinstance(bundle, Mapping):
+        raise SnapshotIngestionError("candidate_bundle_invalid")
+    values = bundle.get("tombstones", [])
+    if not isinstance(values, list):
+        raise SnapshotIngestionError("candidate_bundle_invalid")
+    if values and mode != "incremental":
+        raise SnapshotIngestionError("tombstone_mode_unsupported")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        if (not isinstance(value, Mapping)
+                or set(value) != {"operation", "source", "external_id"}
+                or value.get("operation") != "SOURCE_DELETE"
+                or value.get("source") != "folketinget"):
+            raise SnapshotIngestionError("tombstone_invalid")
+        external_id = value.get("external_id")
+        if not isinstance(external_id, str) or not re.fullmatch(r"\d{1,20}", external_id) or external_id in seen:
+            raise SnapshotIngestionError("tombstone_invalid")
+        seen.add(external_id)
+        result.append({"operation": "SOURCE_DELETE", "source": "folketinget", "external_id": external_id})
+    return result
+
+
 def _relevance_counts(records: list[dict[str, Any]]) -> dict[str, int]:
     counts = {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0}
     for record in records:
@@ -603,12 +627,17 @@ def ingest_snapshot_candidates(
         raise SnapshotIngestionError("historical_snapshot_submission_not_enabled", run_id)
     base, target = _validate_pair(mode, base_snapshot, target_snapshot)
     cases, complete = _candidate_cases(candidate_bundle)
+    tombstones = _candidate_tombstones(candidate_bundle, mode=mode)
     if mode == "incremental" and not dry_run and not complete:
         raise SnapshotIngestionError("incomplete_candidates", run_id)
     try:
         records = ingestion_client.prepare_records({"cases": cases}, source="folketinget", mode=mode)
+        case_ids = {record["external_id"] for record in records}
+        if case_ids.intersection(item["external_id"] for item in tombstones):
+            raise SnapshotIngestionError("tombstone_conflicts_with_publication")
+        records.extend(tombstones)
         batches = ingestion_client.chunks(records)
-        counts = _relevance_counts(records)
+        counts = _relevance_counts([record for record in records if record.get("operation") is None])
     except SnapshotIngestionError:
         raise
     except Exception:

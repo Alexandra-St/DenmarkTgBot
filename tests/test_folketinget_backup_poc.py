@@ -1008,9 +1008,8 @@ class BackupPocSafetyTests(unittest.TestCase):
             self.assertEqual(result["snapshot_client_dry_run"], "FAIL")
             self.assertFalse(result["submission_eligible"])
 
-    def test_snapshot_incremental_removed_sag_remains_fail_closed(self) -> None:
+    def test_snapshot_incremental_removed_sag_uses_tombstone_contract(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider
-        from collectors import snapshot_ingestion_client
 
         old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
         with tempfile.TemporaryDirectory() as temp:
@@ -1024,13 +1023,13 @@ class BackupPocSafetyTests(unittest.TestCase):
             create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=old_rows)
             create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
             context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
-            with mock.patch.object(snapshot_ingestion_client, "ingest_snapshot_candidates") as client:
-                result = POC.run_snapshot_incremental_dry_run(
-                    context, target, InMemoryFolketingetProvider({}), root
-                )
-            client.assert_not_called()
-            self.assertEqual(result["status"], "INCOMPLETE")
-            self.assertFalse(result["submission_eligible"])
+            result = POC.run_snapshot_incremental_dry_run(
+                context, target, InMemoryFolketingetProvider({}), root
+            )
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["tombstone_count"], 1)
+            self.assertEqual(result["prepared_record_count"], 1)
+            self.assertTrue(result["submission_eligible"])
 
     def test_snapshot_incremental_rejects_v1_base_and_over_limit_batches(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider

@@ -4,6 +4,7 @@ import app from "../src/index.ts";
 
 const TOKEN = "snapshot-readiness-test-token";
 const TABLE_COLUMNS: Record<string, string[]> = {
+  publications: ["source_deleted"],
   sources: ["id", "code"],
   ingestion_runs: [
     "run_id", "source_id", "status", "mode", "state_kind", "proposed_checkpoints_json",
@@ -86,12 +87,13 @@ test("snapshot readiness is read-only and allows an uninitialized idle Folketing
     snapshot_generation: null, active_ingestion_run: false,
     worker_supports_snapshot_ingestion: true, historical_snapshot_start_allowed: true,
   });
-  assert.equal(calls.length, 9);
+  assert.equal(calls.length, 10);
 });
 
 test("missing migration table, required column, or trigger fails closed before state queries", async () => {
   for (const scenario of [
     { missingTable: "source_snapshot_states" },
+    { missingColumn: ["publications", "source_deleted"] as [string, string] },
     { missingColumn: ["ingestion_runs", "target_snapshot_json"] as [string, string] },
     { missingColumn: ["ingestion_runs", "proposed_checkpoints_json"] as [string, string] },
     { missingTrigger: "source_snapshot_states_guard_insert" },

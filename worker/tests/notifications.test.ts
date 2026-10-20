@@ -73,7 +73,7 @@ const cutoff = "2026-10-15T00:00:00.000Z";
 
 async function fixture(): Promise<LocalD1Fixture> {
   const db = new LocalD1Fixture();
-  for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql"]) {
+  for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql", "0008_source_deletions.sql"]) {
     db.exec(await readFile(new URL("../migrations/" + migration, import.meta.url), "utf8"));
   }
   await db.prepare("INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at, completed_at) SELECT '00000000-0000-4000-8000-000000000001', id, 'incremental', 1, 1, 'COMMITTED', '{}', '{}', 'fixture', ?, ?, ? FROM sources WHERE code = 'hoeringsportalen'")
@@ -186,6 +186,31 @@ test("queue requires its own enable flag and a committed incremental run", async
     assert.deepEqual(await prepareNotificationQueue(enabled, runId, now), { eligible: false, queued: 0 });
     const count = await db.prepare("SELECT COUNT(*) AS count FROM notifications").first<{ count: number }>();
     assert.equal(count?.count, 0);
+  } finally { db.close(); }
+});
+
+test("confirmed source deletion creates no queue item and suppresses pending delivery", async () => {
+  const db = await fixture();
+  try {
+    const eventId = await addEvent(db, { id: "deleted-pending", source: "folketinget", url: "https://oda.ft.dk/api/Sag(123)" });
+    await db.prepare("UPDATE publications SET source_deleted=1 WHERE external_id='deleted-pending'").run();
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, attempts, created_at) VALUES (1, ?, 'PENDING', 0, ?)")
+      .bind(eventId, now.toISOString()).run();
+    const queue = await prepareNotificationQueue(
+      { DB: db as never, NOTIFICATION_QUEUE_ENABLED: "true", NOTIFICATION_ACTIVATION_CUTOFF: cutoff },
+      "00000000-0000-4000-8000-000000000001", now,
+    );
+    assert.deepEqual(queue, { eligible: true, queued: 0 });
+    const preview = await previewNotifications({ DB: db as never, NOTIFICATION_ACTIVATION_CUTOFF: cutoff }, now);
+    assert.equal(preview.eligible_events, 0);
+    let sends = 0;
+    const delivery = await deliverPendingNotifications(
+      { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff },
+      { async sendMessage() { sends += 1; } }, now,
+    );
+    assert.deepEqual(delivery, { enabled: true, sent: 0, failed: 0 });
+    assert.equal(sends, 0);
+    assert.equal((await db.prepare("SELECT status FROM notifications WHERE event_id=?").bind(eventId).first<{ status: string }>())?.status, "PENDING");
   } finally { db.close(); }
 });
 
@@ -601,7 +626,7 @@ test("local end-to-end: historical baseline, incremental changes, preference que
   };
 
   try {
-    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql", "0007_snapshot_ingestion_state.sql"]) {
+    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql", "0007_snapshot_ingestion_state.sql", "0008_source_deletions.sql"]) {
       db.exec(await readFile(new URL("../migrations/" + migration, import.meta.url), "utf8"));
     }
     const timestamp = new Date().toISOString();

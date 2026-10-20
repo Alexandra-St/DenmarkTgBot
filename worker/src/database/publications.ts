@@ -59,7 +59,7 @@ export class D1PublicationRepository implements PublicationRepository {
     validatePage(page);
     const offset = page * PUBLICATIONS_PER_PAGE;
     const result = await this.db.prepare(`${SELECT_PUBLICATION}
-      WHERE p.source_complete = 1 AND p.relevance IN ('DIRECT', 'POTENTIAL')
+      WHERE p.source_complete = 1 AND p.source_deleted = 0 AND p.relevance IN ('DIRECT', 'POTENTIAL')
       ORDER BY CASE WHEN p.source_updated_at IS NULL OR p.source_updated_at = '' THEN 1 ELSE 0 END,
                p.source_updated_at DESC, CASE p.relevance WHEN 'DIRECT' THEN 0 ELSE 1 END,
                s.code ASC, p.external_id ASC, p.id ASC
@@ -77,7 +77,7 @@ export class D1PublicationRepository implements PublicationRepository {
     const params: unknown[] = filter === "all" ? [] : [filter.toUpperCase()];
     params.push(FETCH_LIMIT, page * PUBLICATIONS_PER_PAGE);
     const result = await this.db.prepare(`${SELECT_PUBLICATION}
-      WHERE p.source_complete = 1 AND ${relevanceClause}
+      WHERE p.source_complete = 1 AND p.source_deleted = 0 AND ${relevanceClause}
       ORDER BY CASE WHEN p.source_updated_at IS NULL OR p.source_updated_at = '' THEN 1 ELSE 0 END,
                p.source_updated_at DESC, s.code ASC, p.external_id ASC, p.id ASC
       LIMIT ? OFFSET ?`)
@@ -89,7 +89,7 @@ export class D1PublicationRepository implements PublicationRepository {
 
   async findById(id: number): Promise<PublicationRecord | null> {
     if (!Number.isSafeInteger(id) || id < 1) throw new RangeError("invalid publication id");
-    return this.db.prepare(`${SELECT_PUBLICATION} WHERE p.id = ? AND p.source_complete = 1 AND p.relevance IN ('DIRECT', 'POTENTIAL') LIMIT 1`)
+    return this.db.prepare(`${SELECT_PUBLICATION} WHERE p.id = ? AND p.source_complete = 1 AND p.source_deleted = 0 AND p.relevance IN ('DIRECT', 'POTENTIAL') LIMIT 1`)
       .bind(id)
       .first<PublicationRecord>();
   }

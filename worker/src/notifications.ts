@@ -62,6 +62,7 @@ export async function prepareNotificationQueue(
       AND e.notify_eligible = 1
       AND p.historical = 0
       AND p.source_complete = 1
+      AND p.source_deleted = 0
       AND p.relevance IN ('DIRECT', 'POTENTIAL')
       AND e.detected_at > ?
       AND e.detected_at >= ?
@@ -95,7 +96,7 @@ export async function previewNotifications(env: NotificationEnv, now = new Date(
   const cutoffValue = cutoff?.toISOString() ?? "";
   const row = await env.DB.prepare(`
     WITH candidates AS (
-      SELECT p.relevance, p.historical, p.source_complete, e.notify_eligible,
+      SELECT p.relevance, p.historical, p.source_complete, p.source_deleted, e.notify_eligible,
         e.detected_at, e.event_type, s.code AS source_code,
         (SELECT COUNT(*) FROM users u WHERE
           (p.relevance = 'DIRECT' AND u.notify_direct = 1) OR
@@ -106,24 +107,24 @@ export async function previewNotifications(env: NotificationEnv, now = new Date(
     )
     SELECT
       COALESCE(SUM(CASE WHEN historical = 1 THEN 1 ELSE 0 END), 0) AS suppressed_historical_events,
-      COALESCE(SUM(CASE WHEN historical = 0 AND notify_eligible = 1 AND source_complete = 1
+      COALESCE(SUM(CASE WHEN historical = 0 AND notify_eligible = 1 AND source_complete = 1 AND source_deleted = 0
         AND relevance IN ('DIRECT', 'POTENTIAL') AND detected_at < ? THEN 1 ELSE 0 END), 0) AS suppressed_stale_events,
-      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1 AND source_deleted = 0
         AND relevance IN ('DIRECT', 'POTENTIAL') AND detected_at > ? AND detected_at >= ?
         AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN 1 ELSE 0 END), 0) AS eligible_events,
-      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1 AND source_deleted = 0
         AND relevance IN ('DIRECT', 'POTENTIAL') AND detected_at > ? AND detected_at >= ?
         AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN recipient_count ELSE 0 END), 0) AS estimated_recipients,
-      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1 AND source_deleted = 0
         AND relevance = 'DIRECT' AND detected_at > ? AND detected_at >= ?
         AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN 1 ELSE 0 END), 0) AS direct_events,
-      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1 AND source_deleted = 0
         AND relevance = 'POTENTIAL' AND detected_at > ? AND detected_at >= ?
         AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN 1 ELSE 0 END), 0) AS potential_events,
-      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1 AND source_deleted = 0
         AND relevance = 'DIRECT' AND detected_at > ? AND detected_at >= ?
         AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN recipient_count ELSE 0 END), 0) AS direct_recipients,
-      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1
+      COALESCE(SUM(CASE WHEN ? = 1 AND notify_eligible = 1 AND historical = 0 AND source_complete = 1 AND source_deleted = 0
         AND relevance = 'POTENTIAL' AND detected_at > ? AND detected_at >= ?
         AND NOT (source_code = 'hoeringsportalen' AND event_type = 'FIRST_SEEN') THEN recipient_count ELSE 0 END), 0) AS potential_recipients
     FROM candidates
@@ -287,6 +288,7 @@ export async function deliverPendingNotifications(
       AND e.notify_eligible = 1
       AND p.historical = 0
       AND p.source_complete = 1
+      AND p.source_deleted = 0
       AND p.relevance IN ('DIRECT', 'POTENTIAL')
       AND ((p.relevance = 'DIRECT' AND u.notify_direct = 1)
         OR (p.relevance = 'POTENTIAL' AND u.notify_potential = 1))

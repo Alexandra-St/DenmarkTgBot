@@ -342,6 +342,7 @@ def extract_candidates(
     diff_counts = _aggregate_diff(diff_report)
     diagnostics: Counter[str] = Counter()
     affected_ids: set[int] = set()
+    tombstone_ids: set[int] = set()
     routing: snapshot_diff.ManifestRoutingReader | None = None
     routing_unavailable = False
     try:
@@ -365,23 +366,33 @@ def extract_candidates(
                     continue
                 record_id = decode_canonical_key(entity, canonical_key)
                 try:
-                    affected_ids.update(_resolve_removed_sag_ids(entity, record_id, routing))
+                    removed_ids = _resolve_removed_sag_ids(entity, record_id, routing)
+                    # A removed Sag is an explicit source deletion, not a case to hydrate
+                    # from the new snapshot. Relationship removals still hydrate normally.
+                    if entity == "Sag":
+                        tombstone_ids.update(removed_ids)
+                    else:
+                        affected_ids.update(removed_ids)
                 except snapshot_diff.DiffError:
                     diagnostics["removed_relationship_unresolved"] += 1
-                if len(affected_ids) > max_affected_cases:
+                if len(affected_ids | tombstone_ids) > max_affected_cases:
                     raise CandidateExtractionError("affected_case_limit_exceeded")
                 continue
             if category not in {"added", "changed"}:
                 continue
             record_id = decode_canonical_key(entity, canonical_key)
             affected_ids.update(_resolve_affected_sag_ids(entity, record_id, provider, diagnostics))
-            if len(affected_ids) > max_affected_cases:
+            if len(affected_ids | tombstone_ids) > max_affected_cases:
                 raise CandidateExtractionError("affected_case_limit_exceeded")
     except snapshot_diff.DiffError as error:
         raise CandidateExtractionError(error.category) from None
     finally:
         if routing is not None:
             routing.close()
+    affected_case_count = len(affected_ids | tombstone_ids)
+    # A deleted case may also be referenced by changed child rows in this diff.
+    # The explicit Sag removal wins: emit only its tombstone, never a fake upsert.
+    affected_ids.difference_update(tombstone_ids)
     cases, hydrated_count = _hydrate_cases(affected_ids, provider, diagnostics)
     payloads: list[dict[str, object]] = []
     for case in cases:
@@ -389,6 +400,10 @@ def extract_candidates(
         payload.update({"historical": False, "notify_eligible": None})
         payloads.append(payload)
     payloads.sort(key=lambda item: str(item.get("external_id", "")))
+    tombstones = [
+        {"operation": "SOURCE_DELETE", "source": SOURCE, "external_id": str(identifier)}
+        for identifier in sorted(tombstone_ids)
+    ]
     complete = not diagnostics and all(case.complete for case in cases)
     return {
         "format_version": FORMAT_VERSION,
@@ -396,11 +411,13 @@ def extract_candidates(
         "diff": diff_counts,
         "candidate_case_count": len(payloads),
         "cases": payloads,
+        "tombstones": tombstones,
         "diagnostics": [{"code": code, "count": count} for code, count in sorted(diagnostics.items())],
         "complete": complete,
         "_summary": {
-            "affected_case_count": len(affected_ids),
+            "affected_case_count": affected_case_count,
             "hydrated_case_count": hydrated_count,
+            "tombstone_count": len(tombstones),
         },
     }
 
@@ -415,6 +432,7 @@ def candidate_summary(bundle: Mapping[str, object]) -> dict[str, object]:
         "diff": dict(diff),
         "affected_case_count": int(summary.get("affected_case_count", 0)),
         "hydrated_case_count": int(summary.get("hydrated_case_count", 0)),
+        "tombstone_count": int(summary.get("tombstone_count", 0)),
         "diagnostics": list(bundle.get("diagnostics", ())),
         "complete": bundle.get("complete") is True,
     }

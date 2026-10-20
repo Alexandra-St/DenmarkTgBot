@@ -761,6 +761,39 @@ test("snapshot ingestion API initializes, progresses, retries, and never advance
   assert.equal((await commit(concurrentRun)).body.snapshot_generation, 3);
   assert.equal((await query("SELECT COUNT(*) AS count FROM source_states WHERE source_id=3"))[0]?.count, 0);
 
+  const deletionTarget = testSnapshot("4".repeat(64), "2026-10-22 02:01:05.000");
+  const deletionRun = "00000000-0000-4000-8000-000000000157";
+  const eventsBeforeDeletion = (await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43'"))[0]?.count;
+  const notificationsBeforeDeletion = (await query("SELECT COUNT(*) AS count FROM notifications"))[0]?.count;
+  assert.equal((await snapshotStart(deletionRun, "incremental", third, deletionTarget)).status, 201);
+  const tombstone = (external_id: string) => ({ operation: "SOURCE_DELETE", source: "folketinget", external_id });
+  assert.equal((await batch(deletionRun, [tombstone("43"), tombstone("404")])).status, 201);
+  assert.equal((await commit(deletionRun)).body.status, "COMMITTED");
+  assert.deepEqual((await query("SELECT source_deleted FROM publications WHERE source_id=3 AND external_id='43'"))[0], { source_deleted: 1 });
+  assert.equal((await query("SELECT COUNT(*) AS count FROM publications WHERE source_id=3 AND external_id='404'"))[0]?.count, 0);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43'"))[0]?.count, eventsBeforeDeletion);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM notifications"))[0]?.count, notificationsBeforeDeletion);
+  assert.equal((await query(`SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id=${sqlText(deletionRun)} AND processed=1`))[0]?.count, 2);
+  assert.equal((await commit(deletionRun)).body.snapshot_generation, 4);
+
+  const repeatedTarget = testSnapshot("5".repeat(64), "2026-10-23 02:01:05.000");
+  const repeatedRun = "00000000-0000-4000-8000-000000000158";
+  assert.equal((await snapshotStart(repeatedRun, "incremental", deletionTarget, repeatedTarget)).status, 201);
+  assert.equal((await batch(repeatedRun, [tombstone("43")])).status, 201);
+  assert.equal((await commit(repeatedRun)).body.status, "COMMITTED");
+  assert.equal((await query("SELECT source_deleted FROM publications WHERE source_id=3 AND external_id='43'"))[0]?.source_deleted, 1);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43'"))[0]?.count, eventsBeforeDeletion);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM notifications"))[0]?.count, notificationsBeforeDeletion);
+
+  const restoredTarget = testSnapshot("6".repeat(64), "2026-10-24 02:01:05.000");
+  const restoreRun = "00000000-0000-4000-8000-000000000159";
+  assert.equal((await snapshotStart(restoreRun, "incremental", repeatedTarget, restoredTarget)).status, 201);
+  assert.equal((await batch(restoreRun, [publication({ external_id: "43" })])).status, 201);
+  assert.equal((await commit(restoreRun)).body.status, "COMMITTED");
+  assert.equal((await query("SELECT source_deleted FROM publications WHERE source_id=3 AND external_id='43'"))[0]?.source_deleted, 0);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43'"))[0]?.count, eventsBeforeDeletion);
+  assert.equal((await query("SELECT COUNT(*) AS count FROM notifications"))[0]?.count, notificationsBeforeDeletion);
+
   // A separate source proves a historical snapshot containing records follows the same publication contract.
   await query(
     `UPDATE sources SET code='folketinget-test-3' WHERE id=3;` +
@@ -774,10 +807,22 @@ test("snapshot ingestion API initializes, progresses, retries, and never advance
   const recordHistoryRun = "00000000-0000-4000-8000-000000000155";
   const recordSnapshot = testSnapshot("5".repeat(64), "2026-10-19 02:01:05.000");
   assert.equal((await snapshotStart(recordHistoryRun, "historical", null, recordSnapshot)).status, 201);
+  assert.equal((await batch(recordHistoryRun, [tombstone("44")])).body.error, "invalid_source_deletion");
   assert.equal((await batch(recordHistoryRun, [publication({ historical: false, external_id: "44" })])).body.error, "invalid_historical_flag");
   assert.equal((await batch(recordHistoryRun, [publication({ historical: true, external_id: "44" })])).status, 201);
   assert.equal((await commit(recordHistoryRun)).body.snapshot_generation, 1);
   assert.equal((await query("SELECT historical FROM publications WHERE source_id=4 AND external_id='44'"))[0]?.historical, 1);
   assert.equal((await query("SELECT baseline_run_id FROM source_ingestion_baselines WHERE source_id=4"))[0]?.baseline_run_id, existingBaselineRun);
+
+  const checkpointRun = "00000000-0000-4000-8000-000000000160";
+  await query(`INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at) VALUES (${sqlText(checkpointRun)}, 3, 'incremental', 1, 1, 'OPEN', '{}', '{}', 'test-tombstone-checkpoint', ${sqlText(now)}, ${sqlText(now)});`);
+  assert.equal((await batch(checkpointRun, [tombstone("44")])).body.error, "invalid_source_deletion");
+  const hearingCheckpointRun = "00000000-0000-4000-8000-000000000161";
+  await query(
+    `UPDATE sources SET code='hoeringsportalen-test' WHERE id=2;` +
+    `INSERT INTO sources (id, code, name, base_url, created_at, updated_at) VALUES (5, 'hoeringsportalen', 'Local hearing source', 'https://hoeringsportalen.dk/', ${sqlText(now)}, ${sqlText(now)});` +
+    `INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at) VALUES (${sqlText(hearingCheckpointRun)}, 5, 'incremental', 1, 1, 'OPEN', '{}', '{}', 'test-hearing-tombstone', ${sqlText(now)}, ${sqlText(now)});`,
+  );
+  assert.equal((await batch(hearingCheckpointRun, [tombstone("44")])).body.error, "invalid_source_deletion");
 });
 

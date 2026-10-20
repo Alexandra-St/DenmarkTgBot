@@ -53,7 +53,7 @@ const callback = (data: string, userId = 9001) => ({
 test("News and Archive read only complete relevant records from local D1", async () => {
   const db = new LocalD1Fixture();
   try {
-    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql"]) {
+    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql", "0008_source_deletions.sql"]) {
       db.exec(await readFile(new URL(`../migrations/${migration}`, import.meta.url), "utf8"));
     }
     await new D1UserRepository(db).create(9001, "uk");
@@ -69,16 +69,22 @@ test("News and Archive read only complete relevant records from local D1", async
         .bind(source.id, `hp-${n}`, url, `Danish title ${n}`, relevance, "Open", `2026-09-${String(n).padStart(2, "0")}T10:00:00Z`, "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", n === 10 ? 0 : 1)
         .run();
     }
+    await db.prepare("UPDATE publications SET source_deleted=1 WHERE external_id='hp-2'").run();
 
     const repo = new D1PublicationRepository(db);
     const news = await repo.listNews(0);
     assert.equal(news.items.length, 5);
     assert.equal(news.hasNext, true);
     assert.ok(news.items.every((item) => item.relevance === "DIRECT" || item.relevance === "POTENTIAL"));
+    assert.ok(news.items.every((item) => item.external_id !== "hp-2"), "confirmed source deletions must be hidden from News");
     const archiveDirect = await repo.listArchive("direct", 0);
     assert.ok(archiveDirect.items.every((item) => item.relevance === "DIRECT"));
+    assert.ok(archiveDirect.items.every((item) => item.external_id !== "hp-2"), "confirmed source deletions must be hidden from Archive");
     assert.equal(await repo.findById(10), null, "incomplete source record must not be exposed");
     assert.equal(await repo.findById(12), null, "IRRELEVANT record must not be exposed");
+    const deleted = await db.prepare("SELECT id FROM publications WHERE external_id='hp-2'").first<{ id: number }>();
+    assert.ok(deleted);
+    assert.equal(await repo.findById(deleted.id), null, "source-deleted detail must not be exposed");
 
     assert.equal(validatedOfficialUrl("hoeringsportalen", "https://hoeringsportalen.dk/hearing/1"), "https://hoeringsportalen.dk/hearing/1");
     assert.equal(validatedOfficialUrl("hoeringsportalen", "http://hoeringsportalen.dk/hearing/1"), null);
