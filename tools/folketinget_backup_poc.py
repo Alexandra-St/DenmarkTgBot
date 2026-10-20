@@ -56,6 +56,7 @@ SQLCMD = "/opt/mssql-tools18/bin/sqlcmd"
 DATABASE = "DenmarkBotFolketingetBackupPoc"
 BACKUP_ROOT = Path("/var/opt/mssql/backup")
 MANIFEST_DIRECTORY_NAME = "denmarkbot-folketinget-manifest"
+INCREMENTAL_MANIFEST_DIRECTORY_NAME = "denmarkbot-folketinget-manifest-incremental"
 MANIFEST_FILENAME = "manifest.sqlite"
 RESTORE_VALIDATE = "RESTORE_VALIDATE"
 CREATE_MANIFEST_BASELINE = "CREATE_MANIFEST_BASELINE"
@@ -64,6 +65,7 @@ EXTRACT_SNAPSHOT_CANDIDATES = "EXTRACT_SNAPSHOT_CANDIDATES"
 CLASSIFY_SNAPSHOT_CANDIDATES = "CLASSIFY_SNAPSHOT_CANDIDATES"
 PREPARE_SNAPSHOT_INGESTION = "PREPARE_SNAPSHOT_INGESTION"
 SNAPSHOT_INGESTION_DRY_RUN = "SNAPSHOT_INGESTION_DRY_RUN"
+SNAPSHOT_INCREMENTAL_DRY_RUN = "SNAPSHOT_INCREMENTAL_DRY_RUN"
 HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN = "HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN"
 HISTORICAL_SNAPSHOT_BASELINE_LIVE = "HISTORICAL_SNAPSHOT_BASELINE_LIVE"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
@@ -105,6 +107,7 @@ def validate_mode(value: str) -> str:
         CLASSIFY_SNAPSHOT_CANDIDATES,
         PREPARE_SNAPSHOT_INGESTION,
         SNAPSHOT_INGESTION_DRY_RUN,
+        SNAPSHOT_INCREMENTAL_DRY_RUN,
         HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
         HISTORICAL_SNAPSHOT_BASELINE_LIVE,
     }:
@@ -781,6 +784,78 @@ def manifest_schema(password: str, entity: str, schema_name: str) -> dict[str, A
         raise PocError("manifest_schema_invalid") from None
 
 
+def build_current_snapshot_manifest(
+    password: str, download: dict[str, Any], header_info: dict[str, Any],
+    entities: dict[str, Any], runner_temp: Path,
+) -> tuple[Path, dict[str, Any]]:
+    """Build and validate one private v2 manifest from the restored official backup."""
+    compatibility_level = database_compatibility_level(password)
+    report_manifest_compatibility(compatibility_level)
+    validate_manifest_compatibility_level(compatibility_level)
+    schemas: dict[str, dict[str, Any]] = {}
+    for entity in REQUIRED_ENTITIES:
+        schema_name, object_type = entities["objects"][entity]
+        if object_type != "USER_TABLE":
+            raise PocError("manifest_required_entity_not_table")
+        schemas[entity] = manifest_schema(password, entity, schema_name)
+    directory = runner_temp / INCREMENTAL_MANIFEST_DIRECTORY_NAME
+    if directory.exists() or directory.is_symlink():
+        raise PocError("manifest_path_exists")
+    try:
+        directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+    except OSError:
+        raise PocError("manifest_directory_setup_failed") from None
+    path = directory / MANIFEST_FILENAME
+    try:
+        started_entities: set[str] = set()
+
+        def fetch_page(entity: str, schema_name: str, schema: dict[str, Any], offset: int, limit: int) -> str:
+            if entity not in started_entities:
+                report_manifest_entity(entity)
+                started_entities.add(entity)
+            return manifest_page_json(password, entity, schema_name, schema, offset, limit)
+
+        info = snapshot_manifest.build_manifest(
+            path,
+            backup_sha256=str(download["sha256"]),
+            backup_finish_date=str(header_info["backup_finish_date"]),
+            source_sql_major=int(header_info["source_sql_major"]),
+            schemas=schemas,
+            expected_counts={entity: entities["counts"][entity] for entity in REQUIRED_ENTITIES},
+            fetch_page=fetch_page,
+        )
+        metadata = snapshot_diff.validate_manifest(path)
+        if metadata["manifest_format_version"] != 2 or metadata["routing_available"] is not True:
+            raise PocError("manifest_routing_invalid")
+        info["sha256"] = snapshot_manifest.sha256_file(path)
+        info["metadata"] = metadata
+        return path, info
+    except PocError:
+        cleanup_incremental_manifest(directory, runner_temp)
+        raise
+    except snapshot_manifest.ManifestError as error:
+        cleanup_incremental_manifest(directory, runner_temp)
+        raise PocError(error.category) from None
+    except snapshot_diff.DiffError as error:
+        cleanup_incremental_manifest(directory, runner_temp)
+        raise PocError(error.category) from None
+    except Exception:
+        cleanup_incremental_manifest(directory, runner_temp)
+        raise PocError("manifest_generation_failed") from None
+
+
+def cleanup_incremental_manifest(directory: Path | None, runner_temp: Path) -> None:
+    if directory is None or not (directory.exists() or directory.is_symlink()):
+        return
+    if (directory.parent != runner_temp or directory.name != INCREMENTAL_MANIFEST_DIRECTORY_NAME
+            or directory.is_symlink()):
+        raise PocError("manifest_cleanup_failed")
+    try:
+        shutil.rmtree(directory)
+    except OSError:
+        raise PocError("manifest_cleanup_failed") from None
+
+
 def manifest_page_json(
     password: str, entity: str, schema_name: str, schema: dict[str, Any], offset: int, limit: int
 ) -> str:
@@ -1312,6 +1387,136 @@ def validate_historical_manifest_input(value: Path, manifest_run_id: str) -> dic
     return {
         "path": manifest_path,
         "report": {"new": metadata, "schema_fingerprint": metadata["schema_fingerprint"]},
+    }
+
+
+def validate_snapshot_incremental_base_input(value: Path, manifest_run_id: str) -> dict[str, Any]:
+    """Require one validated v2 manifest artifact with old-side routing data."""
+    if not re.fullmatch(r"[0-9]+", manifest_run_id or ""):
+        raise PocError("workflow_run_id_invalid")
+    try:
+        if value.is_symlink():
+            raise PocError("manifest_artifact_invalid")
+        directory = value.resolve(strict=True)
+        expected_directory = f"folketinget-base-manifest-{manifest_run_id}"
+        if directory.name != expected_directory or not directory.is_dir() or directory.is_symlink():
+            raise PocError("manifest_artifact_invalid")
+        path = snapshot_diff._manifest_file(directory)
+        metadata = snapshot_diff.validate_manifest(path)
+    except PocError:
+        raise
+    except snapshot_diff.DiffError as error:
+        raise PocError(error.category) from None
+    except Exception:
+        raise PocError("manifest_artifact_invalid") from None
+    if metadata["manifest_format_version"] != 2 or metadata["routing_available"] is not True:
+        raise PocError("snapshot_incremental_base_routing_required")
+    try:
+        from collectors.snapshot_ingestion_client import validate_snapshot_identity
+        identity = {
+            "backup_sha256": metadata["backup_sha256"],
+            "backup_finish_date": metadata["backup_finish_date"],
+            "schema_fingerprint": metadata["schema_fingerprint"],
+        }
+        validate_snapshot_identity(identity)
+    except Exception:
+        raise PocError("snapshot_incremental_base_identity_invalid") from None
+    return {"path": path, "metadata": metadata, "identity": identity, "run_id": manifest_run_id}
+
+
+def validate_snapshot_incremental_pair(
+    base_context: dict[str, Any], target_manifest: Path
+) -> dict[str, Any]:
+    """Compare exact source identities and return validated aggregate diff data."""
+    try:
+        target_path = snapshot_diff._manifest_file(target_manifest)
+        target_metadata = snapshot_diff.validate_manifest(target_path)
+        report = snapshot_diff.compare_manifests(base_context["path"], target_path)
+    except snapshot_diff.DiffError as error:
+        if error.category == "manifest_schema_mismatch":
+            raise PocError("snapshot_incremental_schema_changed") from None
+        raise PocError(error.category) from None
+    except Exception:
+        raise PocError("snapshot_incremental_manifest_invalid") from None
+    if target_metadata["manifest_format_version"] != 2 or target_metadata["routing_available"] is not True:
+        raise PocError("snapshot_incremental_target_routing_invalid")
+    base_identity = dict(base_context["identity"])
+    target_identity = {
+        "backup_sha256": target_metadata["backup_sha256"],
+        "backup_finish_date": target_metadata["backup_finish_date"],
+        "schema_fingerprint": target_metadata["schema_fingerprint"],
+    }
+    try:
+        from collectors.snapshot_ingestion_client import validate_snapshot_identity
+        validate_snapshot_identity(base_identity)
+        validate_snapshot_identity(target_identity)
+        base_finish = datetime.fromisoformat(base_identity["backup_finish_date"].replace("Z", "+00:00"))
+        target_finish = datetime.fromisoformat(target_identity["backup_finish_date"].replace("Z", "+00:00"))
+        if (base_finish.tzinfo is None) != (target_finish.tzinfo is None):
+            raise ValueError
+    except Exception:
+        raise PocError("snapshot_incremental_identity_invalid") from None
+    same_snapshot = base_identity == target_identity
+    if same_snapshot:
+        if any(report["totals"][category] for category in snapshot_diff.CATEGORIES if category != "unchanged"):
+            raise PocError("snapshot_incremental_identity_content_conflict")
+    elif target_finish <= base_finish:
+        raise PocError("snapshot_incremental_target_not_newer")
+    return {
+        "old_path": base_context["path"],
+        "new_path": target_path,
+        "report": report,
+        "old_finish": base_identity["backup_finish_date"],
+        "new_finish": target_identity["backup_finish_date"],
+        "base_snapshot": base_identity,
+        "target_snapshot": target_identity,
+        "same_snapshot": same_snapshot,
+    }
+
+
+def run_snapshot_incremental_dry_run(
+    base_context: dict[str, Any], target_manifest: Path, provider: Any, runner_temp: Path
+) -> dict[str, Any]:
+    """Run extraction, classification and snapshot-client validation without HTTP."""
+    context = validate_snapshot_incremental_pair(base_context, target_manifest)
+    diff_totals = context["report"]["totals"]
+    if context["same_snapshot"]:
+        return {
+            "status": "PASS", "snapshot_change": "SAME_SNAPSHOT",
+            "base_finish": context["old_finish"], "target_finish": context["new_finish"],
+            "diff_totals": dict(diff_totals), "affected_case_count": 0, "hydrated_case_count": 0,
+            "DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0, "prepared_record_count": 0,
+            "batch_count": 0, "snapshot_client_dry_run": "PASS", "submission_eligible": False,
+        }
+    result = run_candidate_extraction(
+        context["old_path"], context["new_path"], provider, runner_temp,
+        context["old_finish"], context["new_finish"],
+        snapshot_ingestion_dry_run=True,
+        base_snapshot=context["base_snapshot"], target_snapshot=context["target_snapshot"],
+    )
+    if result.get("diff_totals") != diff_totals:
+        raise PocError("snapshot_incremental_diff_contract_mismatch")
+    client = result.get("snapshot_ingestion")
+    status = "PASS"
+    if result.get("complete") is not True or not isinstance(client, dict) or client.get("complete") is not True:
+        status = "INCOMPLETE"
+    if status == "PASS":
+        batch_count = client.get("batch_count")
+        if isinstance(batch_count, bool) or not isinstance(batch_count, int) or batch_count > 200:
+            raise PocError("snapshot_incremental_batch_limit_exceeded")
+    counts = client.get("relevance_counts", {}) if isinstance(client, dict) else {}
+    return {
+        "status": status, "snapshot_change": "CHANGED",
+        "base_finish": context["old_finish"], "target_finish": context["new_finish"],
+        "diff_totals": dict(result["diff_totals"]),
+        "affected_case_count": result["affected_case_count"],
+        "hydrated_case_count": result["hydrated_case_count"],
+        "DIRECT": counts.get("DIRECT", 0), "POTENTIAL": counts.get("POTENTIAL", 0),
+        "IRRELEVANT": counts.get("IRRELEVANT", 0),
+        "prepared_record_count": client.get("prepared_record_count", 0) if isinstance(client, dict) else 0,
+        "batch_count": client.get("batch_count", 0) if isinstance(client, dict) else 0,
+        "snapshot_client_dry_run": "PASS" if status == "PASS" else "FAIL",
+        "submission_eligible": client.get("submission_eligible") is True if isinstance(client, dict) else False,
     }
 
 
@@ -2268,6 +2473,40 @@ def write_snapshot_ingestion_client_summary(summary: dict[str, Any]) -> None:
     print(text, end="")
 
 
+def write_snapshot_incremental_summary(summary: dict[str, Any]) -> None:
+    """Emit only aggregate snapshot-diff and dry-run contract fields."""
+    diff = summary["diff_totals"]
+    lines = [
+        f"Snapshot incremental dry-run: {summary['status']}",
+        "",
+        f"- base backup finish: {summary['base_finish']}",
+        f"- target backup finish: {summary['target_finish']}",
+        f"- snapshot comparison: {summary['snapshot_change']}",
+        f"- added: {diff['added']}",
+        f"- removed: {diff['removed']}",
+        f"- changed: {diff['changed']}",
+        f"- technical_only: {diff['technical_only']}",
+        f"- affected Sag count: {summary['affected_case_count']}",
+        f"- hydrated Sag count: {summary['hydrated_case_count']}",
+        f"- DIRECT: {summary['DIRECT']}",
+        f"- POTENTIAL: {summary['POTENTIAL']}",
+        f"- IRRELEVANT: {summary['IRRELEVANT']}",
+        f"- prepared record count: {summary['prepared_record_count']}",
+        f"- batch count: {summary['batch_count']}",
+        f"- snapshot client dry-run: {summary['snapshot_client_dry_run']}",
+        f"- submission eligible: {str(summary['submission_eligible']).lower()}",
+    ]
+    text = "\n".join(lines) + "\n"
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as output:
+                output.write(text)
+        except OSError:
+            raise PocError("snapshot_incremental_summary_write_failed") from None
+    print(text, end="")
+
+
 def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
     """Write only the documented aggregate fields for historical baseline dry-run."""
     import folketinget_candidate_extraction as candidate_extraction
@@ -2548,8 +2787,11 @@ def main() -> int:
     backup_dir: Path | None = None
     data_dir: Path | None = None
     download_dir: Path | None = None
+    incremental_manifest_dir: Path | None = None
+    runner_temp: Path | None = None
     candidate_context: dict[str, Any] | None = None
     historical_context: dict[str, Any] | None = None
+    incremental_base_context: dict[str, Any] | None = None
     mode: str | None = None
     historical_live_summary_written = False
     try:
@@ -2561,6 +2803,7 @@ def main() -> int:
             PREPARE_SNAPSHOT_INGESTION,
             SNAPSHOT_INGESTION_DRY_RUN,
         }
+        incremental_mode = mode == SNAPSHOT_INCREMENTAL_DRY_RUN
         historical_mode = mode in {
             HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
             HISTORICAL_SNAPSHOT_BASELINE_LIVE,
@@ -2578,6 +2821,11 @@ def main() -> int:
                 Path(os.environ.get("HISTORICAL_MANIFEST_PATH", "")),
                 os.environ.get("INPUT_MANIFEST_RUN_ID", ""),
             )
+        elif incremental_mode:
+            incremental_base_context = validate_snapshot_incremental_base_input(
+                Path(os.environ.get("BASE_MANIFEST_PATH", "")),
+                os.environ.get("INPUT_BASE_MANIFEST_RUN_ID", ""),
+            )
         username = os.environ.get("ODA_BACKUP_USERNAME", "")
         credential = os.environ.get("ODA_BACKUP_PASSWORD", "")
         validate_credentials(username, credential)
@@ -2588,6 +2836,7 @@ def main() -> int:
         quiet_modes = candidate_modes | {
             HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
             HISTORICAL_SNAPSHOT_BASELINE_LIVE,
+            SNAPSHOT_INCREMENTAL_DRY_RUN,
         }
         if mode not in quiet_modes:
             print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
@@ -2705,6 +2954,36 @@ def main() -> int:
                 if historical_baseline_live_exit_code(baseline_summary) != 0:
                     print("restore_validation=FAIL")
                     return 2
+            print("restore_validation=PASS")
+        elif mode == SNAPSHOT_INCREMENTAL_DRY_RUN:
+            if incremental_base_context is None:
+                raise PocError("snapshot_incremental_base_context_missing")
+            print("progress=snapshot_incremental_schema_discovery")
+            restored_schema_fingerprint, _provider_schemas = discover_candidate_provider_schema(password, entities)
+            if restored_schema_fingerprint != incremental_base_context["identity"]["schema_fingerprint"]:
+                raise PocError("snapshot_incremental_schema_changed")
+            incremental_manifest_dir = runner_temp / INCREMENTAL_MANIFEST_DIRECTORY_NAME
+            current_manifest, current_manifest_info = build_current_snapshot_manifest(
+                password, download, header_info, entities, runner_temp,
+            )
+            target_metadata = current_manifest_info["metadata"]
+            validate_candidate_backup_identity(
+                str(download["sha256"]),
+                str(header_info["backup_finish_date"]),
+                restored_schema_fingerprint,
+                {"report": {"new": target_metadata, "schema_fingerprint": target_metadata["schema_fingerprint"]}},
+            )
+            if restored_schema_fingerprint != target_metadata["schema_fingerprint"]:
+                raise PocError("snapshot_incremental_schema_changed")
+            provider = create_candidate_sql_provider(password, entities, _provider_schemas)
+            print("progress=snapshot_incremental_diff")
+            incremental_summary = run_snapshot_incremental_dry_run(
+                incremental_base_context, current_manifest, provider, runner_temp
+            )
+            write_snapshot_incremental_summary(incremental_summary)
+            if incremental_summary["status"] != "PASS":
+                print("restore_validation=INCOMPLETE")
+                return 2
             print("restore_validation=PASS")
         elif mode in candidate_modes:
             if candidate_context is None:
@@ -2843,6 +3122,12 @@ def main() -> int:
         os.environ.pop("ODA_BACKUP_USERNAME", None)
         os.environ.pop("ODA_BACKUP_PASSWORD", None)
         os.environ.pop("INGEST_API_TOKEN", None)
+        try:
+            if incremental_manifest_dir is not None and runner_temp is not None:
+                cleanup_incremental_manifest(incremental_manifest_dir, runner_temp)
+        except PocError as exc:
+            print(f"cleanup=FAIL category={exc.category}", file=sys.stderr)
+            return_code = 2
         try:
             cleanup(password, backup_dir, data_dir, download_dir)
         except PocError as exc:

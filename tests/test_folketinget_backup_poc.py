@@ -62,6 +62,47 @@ def create_candidate_manifest(
                            ((entity, key, full, semantic) for key, full, semantic in records[entity]))
 
 
+def create_v2_candidate_manifest(
+    path: pathlib.Path, *, backup: str, finish: str,
+    rows: dict[str, list[tuple[int, bytes, bytes, dict[str, int | None]]]],
+    schema_fingerprint: str = "a" * 64,
+) -> None:
+    """Create a structurally valid synthetic v2 manifest with routing metadata."""
+    path.unlink(missing_ok=True)
+    total = sum(len(rows.get(entity, ())) for entity in POC.REQUIRED_ENTITIES)
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            "CREATE TABLE snapshot_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), backup_sha256 TEXT NOT NULL, "
+            "backup_finish_date TEXT NOT NULL, source_sql_major INTEGER NOT NULL, schema_fingerprint TEXT NOT NULL, "
+            "generated_at TEXT NOT NULL, total_rows INTEGER NOT NULL, manifest_format_version INTEGER NOT NULL, "
+            "routing_row_count INTEGER NOT NULL);"
+            "CREATE TABLE entity_counts (entity TEXT PRIMARY KEY, row_count INTEGER NOT NULL) WITHOUT ROWID;"
+            'CREATE TABLE "rows" (entity TEXT NOT NULL, canonical_key TEXT NOT NULL, full_hash BLOB NOT NULL CHECK(length(full_hash)=32), '
+            "semantic_hash BLOB NOT NULL CHECK(length(semantic_hash)=32), PRIMARY KEY(entity, canonical_key)) WITHOUT ROWID;"
+            "CREATE TABLE routing (entity TEXT NOT NULL, row_id INTEGER NOT NULL, sagid INTEGER, dokumentid INTEGER, "
+            "sagstrinid INTEGER, statusid INTEGER, PRIMARY KEY(entity,row_id)) WITHOUT ROWID;"
+            "CREATE INDEX routing_sagid_idx ON routing(sagid) WHERE sagid IS NOT NULL;"
+            "CREATE INDEX routing_dokumentid_idx ON routing(dokumentid) WHERE entity='SagDokument' AND dokumentid IS NOT NULL;"
+            "CREATE INDEX routing_sagstrinid_idx ON routing(sagstrinid) WHERE entity='Afstemning' AND sagstrinid IS NOT NULL;"
+            "CREATE INDEX routing_statusid_idx ON routing(statusid) WHERE entity='Sag' AND statusid IS NOT NULL;"
+        )
+        db.execute(
+            "INSERT INTO snapshot_metadata VALUES (1, ?, ?, 17, ?, ?, ?, 2, ?)",
+            (backup * 64, finish, schema_fingerprint, "2026-10-19T00:00:00Z", total, total),
+        )
+        for entity in POC.REQUIRED_ENTITIES:
+            items = rows.get(entity, [])
+            db.execute("INSERT INTO entity_counts VALUES (?, ?)", (entity, len(items)))
+            for row_id, full_hash, semantic_hash, routing in items:
+                key = json.dumps({"entity": entity, "key": [["id", "int", row_id]]}, sort_keys=True, separators=(",", ":"))
+                db.execute('INSERT INTO "rows" VALUES (?, ?, ?, ?)', (entity, key, full_hash, semantic_hash))
+                db.execute(
+                    "INSERT INTO routing VALUES (?, ?, ?, ?, ?, ?)",
+                    (entity, row_id, routing.get("sagid"), routing.get("dokumentid"),
+                     routing.get("sagstrinid"), routing.get("statusid")),
+                )
+
+
 class BackupPocSafetyTests(unittest.TestCase):
     @staticmethod
     def _candidate_bundle(cases, *, complete=True, diagnostics=None, candidate_count=None):
@@ -460,6 +501,7 @@ class BackupPocSafetyTests(unittest.TestCase):
 
     def test_snapshot_client_mode_and_existing_manual_modes_remain(self) -> None:
         self.assertEqual(POC.validate_mode("SNAPSHOT_INGESTION_DRY_RUN"), "SNAPSHOT_INGESTION_DRY_RUN")
+        self.assertEqual(POC.validate_mode("SNAPSHOT_INCREMENTAL_DRY_RUN"), "SNAPSHOT_INCREMENTAL_DRY_RUN")
         for mode in ("RESTORE_VALIDATE", "VALIDATE_SQL_PROVIDER", "CREATE_MANIFEST_BASELINE",
                      "EXTRACT_SNAPSHOT_CANDIDATES", "CLASSIFY_SNAPSHOT_CANDIDATES",
                      "PREPARE_SNAPSHOT_INGESTION", "HISTORICAL_SNAPSHOT_BASELINE_LIVE"):
@@ -469,7 +511,7 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("- SNAPSHOT_INGESTION_DRY_RUN", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertNotIn("schedule:", workflow)
-        self.assertEqual(workflow.count("uses: actions/download-artifact@v8"), 3)
+        self.assertEqual(workflow.count("uses: actions/download-artifact@v8"), 4)
         self.assertNotIn("actions/download-artifact@v4", workflow)
 
     def test_historical_baseline_mode_validates_one_exact_manifest_artifact(self) -> None:
@@ -839,6 +881,257 @@ class BackupPocSafetyTests(unittest.TestCase):
             )
             self.assertTrue(child["complete"])
             self.assertEqual(child["candidate_case_count"], 1)
+
+    def test_snapshot_incremental_same_identity_is_noop(self) -> None:
+        stamp = "2026-10-20 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base = base_dir / "manifest.sqlite"
+            target = root / "current.sqlite"
+            rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            rows["Sag"] = [(42, b"f" * 32, b"s" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(base, backup="a", finish=stamp, rows=rows)
+            create_v2_candidate_manifest(target, backup="a", finish=stamp, rows=rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            with mock.patch.object(POC, "run_candidate_extraction") as extract:
+                result = POC.run_snapshot_incremental_dry_run(context, target, SimpleNamespace(), root)
+            extract.assert_not_called()
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["snapshot_change"], "SAME_SNAPSHOT")
+            self.assertEqual(result["diff_totals"]["unchanged"], 1)
+            self.assertEqual(result["prepared_record_count"], 0)
+            self.assertEqual(result["snapshot_client_dry_run"], "PASS")
+            self.assertFalse(result["submission_eligible"])
+
+    def test_snapshot_incremental_changed_snapshot_uses_exact_identities_and_dry_run_only(self) -> None:
+        from folketinget_candidate_extraction import InMemoryFolketingetProvider
+        from collectors import snapshot_ingestion_client
+
+        old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
+        sag = {
+            "id": 42, "nummer": "L 42", "titel": "Private test title", "typeid": None,
+            "kategoriid": None, "statusid": None, "opdateringsdato": "2026-10-21T02:00:40Z",
+            "retsinformationsurl": None,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            old_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            new_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            old_rows["Sag"] = [(42, b"f" * 32, b"s" * 32, {"statusid": None})]
+            new_rows["Sag"] = [(42, b"g" * 32, b"t" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=old_rows)
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            original = snapshot_ingestion_client.ingest_snapshot_candidates
+            with mock.patch.object(snapshot_ingestion_client, "_submit_prepared_records", side_effect=AssertionError("live path reached")):
+                with mock.patch.object(snapshot_ingestion_client, "ingest_snapshot_candidates", wraps=original) as client:
+                    result = POC.run_snapshot_incremental_dry_run(
+                        context, target, InMemoryFolketingetProvider({"Sag": [sag]}), root
+                    )
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["snapshot_change"], "CHANGED")
+            self.assertEqual(result["diff_totals"]["changed"], 1)
+            self.assertEqual(result["affected_case_count"], 1)
+            self.assertEqual(result["hydrated_case_count"], 1)
+            kwargs = client.call_args.kwargs
+            self.assertIs(kwargs["dry_run"], True)
+            self.assertEqual(kwargs["base_snapshot"], context["identity"])
+            self.assertEqual(kwargs["target_snapshot"], {
+                "backup_sha256": "b" * 64, "backup_finish_date": new_finish,
+                "schema_fingerprint": "a" * 64,
+            })
+            self.assertTrue(result["submission_eligible"])
+
+    def test_snapshot_incremental_removed_v2_relation_routes_through_full_dry_run(self) -> None:
+        from folketinget_candidate_extraction import InMemoryFolketingetProvider
+
+        old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
+        sag = {
+            "id": 42, "nummer": "L 42", "titel": "Private test title", "typeid": None,
+            "kategoriid": None, "statusid": None, "opdateringsdato": "2026-10-21T02:00:40Z",
+            "retsinformationsurl": None,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            old_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            new_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            sag_row = (42, b"f" * 32, b"s" * 32, {"statusid": None})
+            old_rows["Sag"] = [sag_row]
+            new_rows["Sag"] = [sag_row]
+            old_rows["SagDokument"] = [(9, b"l" * 32, b"m" * 32, {"sagid": 42, "dokumentid": 100})]
+            create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=old_rows)
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            result = POC.run_snapshot_incremental_dry_run(
+                context, target, InMemoryFolketingetProvider({"Sag": [sag]}), root
+            )
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["diff_totals"]["removed"], 1)
+            self.assertEqual((result["affected_case_count"], result["hydrated_case_count"]), (1, 1))
+            self.assertEqual(result["snapshot_client_dry_run"], "PASS")
+
+    def test_snapshot_incremental_incomplete_extraction_blocks_client(self) -> None:
+        from folketinget_candidate_extraction import InMemoryFolketingetProvider
+        from collectors import snapshot_ingestion_client
+
+        old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            old_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            new_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            old_rows["Sag"] = [(42, b"f" * 32, b"s" * 32, {"statusid": None})]
+            new_rows["Sag"] = [(42, b"g" * 32, b"t" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=old_rows)
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            incomplete = self._candidate_bundle([], complete=False, diagnostics=[{"code": "affected_case_missing", "count": 1}])
+            incomplete["diff"]["totals"]["changed"] = 1
+            incomplete["diff"]["entities"]["Sag"]["changed"] = 1
+            with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=incomplete):
+                with mock.patch.object(snapshot_ingestion_client, "ingest_snapshot_candidates") as client:
+                    result = POC.run_snapshot_incremental_dry_run(
+                        context, target, InMemoryFolketingetProvider({}), root
+                    )
+            client.assert_not_called()
+            self.assertEqual(result["status"], "INCOMPLETE")
+            self.assertEqual(result["snapshot_client_dry_run"], "FAIL")
+            self.assertFalse(result["submission_eligible"])
+
+    def test_snapshot_incremental_removed_sag_remains_fail_closed(self) -> None:
+        from folketinget_candidate_extraction import InMemoryFolketingetProvider
+        from collectors import snapshot_ingestion_client
+
+        old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            old_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            new_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            old_rows["Sag"] = [(42, b"f" * 32, b"s" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=old_rows)
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            with mock.patch.object(snapshot_ingestion_client, "ingest_snapshot_candidates") as client:
+                result = POC.run_snapshot_incremental_dry_run(
+                    context, target, InMemoryFolketingetProvider({}), root
+                )
+            client.assert_not_called()
+            self.assertEqual(result["status"], "INCOMPLETE")
+            self.assertFalse(result["submission_eligible"])
+
+    def test_snapshot_incremental_rejects_v1_base_and_over_limit_batches(self) -> None:
+        from folketinget_candidate_extraction import InMemoryFolketingetProvider
+
+        old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            create_candidate_manifest(base_dir / "manifest.sqlite", backup="a", finish=old_finish, include_sag=False)
+            with self.assertRaises(POC.PocError) as v1:
+                POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            self.assertEqual(v1.exception.category, "snapshot_incremental_base_routing_required")
+
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            old_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            new_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            old_rows["Sag"] = [(42, b"f" * 32, b"s" * 32, {"statusid": None})]
+            new_rows["Sag"] = [(42, b"g" * 32, b"t" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=old_rows)
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            oversized = {
+                "complete": True, "diff_totals": {"added": 0, "removed": 0, "changed": 1,
+                                                     "technical_only": 0, "unchanged": 0},
+                "affected_case_count": 1, "hydrated_case_count": 1,
+                "snapshot_ingestion": {
+                    "complete": True, "batch_count": 201, "relevance_counts": {},
+                    "prepared_record_count": 1, "submission_eligible": True,
+                },
+            }
+            with mock.patch.object(POC, "run_candidate_extraction", return_value=oversized):
+                with self.assertRaises(POC.PocError) as limit:
+                    POC.run_snapshot_incremental_dry_run(context, target, SimpleNamespace(), root)
+            self.assertEqual(limit.exception.category, "snapshot_incremental_batch_limit_exceeded")
+
+    def test_snapshot_incremental_summary_contains_only_aggregate_fields(self) -> None:
+        summary = {
+            "status": "PASS", "base_finish": "base-finish", "target_finish": "target-finish",
+            "snapshot_change": "CHANGED", "diff_totals": {"added": 1, "removed": 2, "changed": 3,
+                "technical_only": 4, "unchanged": 5}, "affected_case_count": 1, "hydrated_case_count": 1,
+            "DIRECT": 1, "POTENTIAL": 0, "IRRELEVANT": 0, "prepared_record_count": 1,
+            "batch_count": 1, "snapshot_client_dry_run": "PASS", "submission_eligible": True,
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            POC.write_snapshot_incremental_summary(summary)
+        self.assertIn("Snapshot incremental dry-run: PASS", output.getvalue())
+        self.assertIn("removed: 2", output.getvalue())
+        self.assertNotIn("external_id", output.getvalue())
+        self.assertNotIn("title", output.getvalue())
+
+    def test_snapshot_incremental_base_artifact_validation_and_cleanup(self) -> None:
+        stamp = "2026-10-20 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            directory = root / "folketinget-base-manifest-39433055408"
+            directory.mkdir()
+            path = directory / "manifest.sqlite"
+            create_v2_candidate_manifest(path, backup="a", finish=stamp,
+                                        rows={entity: [] for entity in POC.REQUIRED_ENTITIES})
+            context = POC.validate_snapshot_incremental_base_input(directory, "39433055408")
+            self.assertEqual(context["run_id"], "39433055408")
+            self.assertEqual(context["identity"], {
+                "backup_sha256": "a" * 64,
+                "backup_finish_date": stamp,
+                "schema_fingerprint": "a" * 64,
+            })
+            with self.assertRaises(POC.PocError) as bad_id:
+                POC.validate_snapshot_incremental_base_input(directory, "39433055408x")
+            self.assertEqual(bad_id.exception.category, "workflow_run_id_invalid")
+            (directory / "unexpected.txt").write_text("unexpected")
+            with self.assertRaises(POC.PocError) as extra:
+                POC.validate_snapshot_incremental_base_input(directory, "39433055408")
+            self.assertEqual(extra.exception.category, "manifest_artifact_invalid")
+            current = root / POC.INCREMENTAL_MANIFEST_DIRECTORY_NAME
+            current.mkdir(mode=0o700)
+            (current / "manifest.sqlite").write_bytes(b"temporary")
+            POC.cleanup_incremental_manifest(current, root)
+            self.assertFalse(current.exists())
+
+    def test_snapshot_incremental_workflow_is_manual_and_never_has_live_credentials(self) -> None:
+        workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
+        script = (ROOT / "tools/folketinget_backup_poc.py").read_text()
+        self.assertIn("on:\n  workflow_dispatch:", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertIn("- SNAPSHOT_INCREMENTAL_DRY_RUN", workflow)
+        self.assertIn("base_manifest_run_id:", workflow)
+        self.assertIn('default: "39433055408"', workflow)
+        self.assertIn("name: Validate snapshot incremental base manifest artifact", workflow)
+        self.assertIn("name: Download snapshot incremental base manifest", workflow)
+        self.assertIn("actions/download-artifact@v8", workflow)
+        self.assertIn("INPUT_BASE_MANIFEST_RUN_ID:", workflow)
+        self.assertIn("BASE_MANIFEST_PATH:", workflow)
+        self.assertIn("name: Remove snapshot incremental temporary manifests", workflow)
+        self.assertIn("inputs.mode == 'SNAPSHOT_INCREMENTAL_DRY_RUN'", workflow)
+        self.assertIn("SNAPSHOT_INCREMENTAL_DRY_RUN =", script)
+        self.assertIn("snapshot_ingestion_dry_run=True", script)
+        incremental_body = script[script.index("def run_snapshot_incremental_dry_run"):script.index("def discover_candidate_provider_schema")]
+        self.assertNotIn("submit_prepared_historical_records", incremental_body)
+        self.assertIn("INGEST_API_TOKEN: ${{ inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE' && secrets.INGEST_API_TOKEN || '' }}", workflow)
 
     def test_candidate_extractor_and_provider_failures_remain_safe(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider

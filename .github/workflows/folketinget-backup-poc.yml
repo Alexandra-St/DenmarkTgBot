@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
       mode:
-        description: "Choose a manual restore, validation, manifest, diff, extraction, dry-run, historical live baseline, or readiness preflight"
+        description: "Choose a manual restore, validation, manifest, diff, extraction, dry-run, or readiness preflight"
         required: true
         type: choice
         options:
@@ -21,6 +21,7 @@ on:
           - CLASSIFY_SNAPSHOT_CANDIDATES
           - PREPARE_SNAPSHOT_INGESTION
           - SNAPSHOT_INGESTION_DRY_RUN
+          - SNAPSHOT_INCREMENTAL_DRY_RUN
           - HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN
           - HISTORICAL_SNAPSHOT_BASELINE_LIVE
           - HISTORICAL_SNAPSHOT_PRODUCTION_PREFLIGHT
@@ -37,6 +38,11 @@ on:
         description: "Successful CREATE_MANIFEST_BASELINE run ID for historical baseline dry-run/live modes"
         required: false
         type: string
+      base_manifest_run_id:
+        description: "Successful CREATE_MANIFEST_BASELINE run ID for snapshot incremental dry-run"
+        required: false
+        type: string
+        default: "39433055408"
 
 permissions:
   contents: read
@@ -264,6 +270,48 @@ jobs:
             echo "historical_baseline=FAIL category=manifest_artifact_missing_or_ambiguous"
             exit 2
           fi
+      - name: Validate snapshot incremental base manifest artifact
+        if: inputs.mode == 'SNAPSHOT_INCREMENTAL_DRY_RUN'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          BASE_RUN_ID: ${{ inputs.base_manifest_run_id }}
+          CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRM_RESTORE" != "true" ]]; then
+            echo "snapshot_incremental=FAIL category=manual_confirmation_required"
+            exit 2
+          fi
+          if [[ ! "$BASE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "snapshot_incremental=FAIL category=workflow_run_id_invalid"
+            exit 2
+          fi
+          workflow_id=$(gh api "repos/$GH_REPOSITORY/actions/workflows/folketinget-backup-poc.yml" --jq '.id') || {
+            echo "snapshot_incremental=FAIL category=manifest_run_not_successful"
+            exit 2
+          }
+          if [[ ! "$workflow_id" =~ ^[0-9]+$ ]]; then
+            echo "snapshot_incremental=FAIL category=manifest_run_not_successful"
+            exit 2
+          fi
+          run_fields=$(gh api "repos/$GH_REPOSITORY/actions/runs/$BASE_RUN_ID" --jq '[.id, .status, .conclusion, .event, .workflow_id] | @tsv') || {
+            echo "snapshot_incremental=FAIL category=manifest_run_not_successful"
+            exit 2
+          }
+          IFS=$'\t' read -r actual_id status conclusion event actual_workflow_id <<< "$run_fields"
+          if [[ "$actual_id" != "$BASE_RUN_ID" || "$status" != "completed" || "$conclusion" != "success" || "$event" != "workflow_dispatch" || "$actual_workflow_id" != "$workflow_id" ]]; then
+            echo "snapshot_incremental=FAIL category=manifest_run_not_successful"
+            exit 2
+          fi
+          artifact_count=$(gh api "repos/$GH_REPOSITORY/actions/runs/$BASE_RUN_ID/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"folketinget-snapshot-manifest-$BASE_RUN_ID\" and .expired == false and .size_in_bytes > 0)] | length") || {
+            echo "snapshot_incremental=FAIL category=manifest_artifact_missing_or_ambiguous"
+            exit 2
+          }
+          if [[ "$artifact_count" != "1" ]]; then
+            echo "snapshot_incremental=FAIL category=manifest_artifact_missing_or_ambiguous"
+            exit 2
+          fi
       - name: Download historical manifest artifact
         if: inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN' || inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE'
         uses: actions/download-artifact@v8
@@ -271,6 +319,15 @@ jobs:
           name: folketinget-snapshot-manifest-${{ inputs.manifest_run_id }}
           path: ${{ runner.temp }}/folketinget-manifest-${{ inputs.manifest_run_id }}
           run-id: ${{ inputs.manifest_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+      - name: Download snapshot incremental base manifest
+        if: inputs.mode == 'SNAPSHOT_INCREMENTAL_DRY_RUN'
+        uses: actions/download-artifact@v8
+        with:
+          name: folketinget-snapshot-manifest-${{ inputs.base_manifest_run_id }}
+          path: ${{ runner.temp }}/folketinget-base-manifest-${{ inputs.base_manifest_run_id }}
+          run-id: ${{ inputs.base_manifest_run_id }}
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
       - name: Download older manifest artifact
@@ -310,9 +367,11 @@ jobs:
           INPUT_OLD_RUN_ID: ${{ inputs.old_run_id }}
           INPUT_NEW_RUN_ID: ${{ inputs.new_run_id }}
           INPUT_MANIFEST_RUN_ID: ${{ inputs.manifest_run_id }}
+          INPUT_BASE_MANIFEST_RUN_ID: ${{ inputs.base_manifest_run_id }}
           OLD_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-old
           NEW_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-new
           HISTORICAL_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-${{ inputs.manifest_run_id }}
+          BASE_MANIFEST_PATH: ${{ runner.temp }}/folketinget-base-manifest-${{ inputs.base_manifest_run_id }}
           ODA_BACKUP_USERNAME: ${{ secrets.ODA_BACKUP_USERNAME }}
           ODA_BACKUP_PASSWORD: ${{ secrets.ODA_BACKUP_PASSWORD }}
           INGEST_API_URL: ${{ inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE' && vars.INGEST_API_URL || '' }}
@@ -360,4 +419,21 @@ jobs:
             if [ "$(dirname "$target")" = "$RUNNER_TEMP" ] && [ -d "$target" ] && [ ! -L "$target" ]; then
               rm -rf -- "$target"
             fi
+          fi
+      - name: Remove snapshot incremental temporary manifests
+        if: always() && inputs.mode == 'SNAPSHOT_INCREMENTAL_DRY_RUN'
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          BASE_RUN_ID: ${{ inputs.base_manifest_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$BASE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            base="$RUNNER_TEMP/folketinget-base-manifest-$BASE_RUN_ID"
+            if [ "$(dirname "$base")" = "$RUNNER_TEMP" ] && [ -d "$base" ] && [ ! -L "$base" ]; then
+              rm -rf -- "$base"
+            fi
+          fi
+          current="$RUNNER_TEMP/denmarkbot-folketinget-manifest-incremental"
+          if [ "$(dirname "$current")" = "$RUNNER_TEMP" ] && [ -d "$current" ] && [ ! -L "$current" ]; then
+            rm -rf -- "$current"
           fi
