@@ -477,6 +477,8 @@ async function processStaged(db: D1Database, runId: string, sourceId: number, mo
     await db.batch([
       db.prepare("UPDATE publications SET source_deleted = 1, updated_at = ? WHERE source_id = ? AND external_id = ? AND source_deleted = 0 AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
         .bind(now, sourceId, incoming.external_id, runId, sourceId, incoming.external_id),
+      db.prepare("UPDATE notifications SET status = 'FAILED', last_error = 'source_deleted' WHERE status = 'PENDING' AND event_id IN (SELECT e.id FROM publication_events e JOIN publications p ON p.id = e.publication_id WHERE p.source_id = ? AND p.external_id = ?) AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
+        .bind(sourceId, incoming.external_id, runId, sourceId, incoming.external_id),
       db.prepare("UPDATE ingestion_staging SET processed = 1 WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0")
         .bind(runId, sourceId, incoming.external_id),
     ]);

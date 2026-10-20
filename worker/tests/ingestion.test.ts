@@ -764,6 +764,11 @@ test("snapshot ingestion API initializes, progresses, retries, and never advance
   const deletionTarget = testSnapshot("4".repeat(64), "2026-10-22 02:01:05.000");
   const deletionRun = "00000000-0000-4000-8000-000000000157";
   const eventsBeforeDeletion = (await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43'"))[0]?.count;
+  await query(
+    `INSERT INTO users (telegram_id, created_at, updated_at) VALUES (90001, ${sqlText(now)}, ${sqlText(now)}), (90002, ${sqlText(now)}, ${sqlText(now)});` +
+    `INSERT INTO notifications (telegram_id, event_id, status, attempts, created_at) SELECT 90001, e.id, 'PENDING', 0, ${sqlText(now)} FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43' ORDER BY e.id LIMIT 1;` +
+    `INSERT INTO notifications (telegram_id, event_id, status, attempts, created_at, sent_at) SELECT 90002, e.id, 'SENT', 1, ${sqlText(now)}, ${sqlText(now)} FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43' ORDER BY e.id LIMIT 1;`,
+  );
   const notificationsBeforeDeletion = (await query("SELECT COUNT(*) AS count FROM notifications"))[0]?.count;
   assert.equal((await snapshotStart(deletionRun, "incremental", third, deletionTarget)).status, 201);
   const tombstone = (external_id: string) => ({ operation: "SOURCE_DELETE", source: "folketinget", external_id });
@@ -773,6 +778,10 @@ test("snapshot ingestion API initializes, progresses, retries, and never advance
   assert.equal((await query("SELECT COUNT(*) AS count FROM publications WHERE source_id=3 AND external_id='404'"))[0]?.count, 0);
   assert.equal((await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43'"))[0]?.count, eventsBeforeDeletion);
   assert.equal((await query("SELECT COUNT(*) AS count FROM notifications"))[0]?.count, notificationsBeforeDeletion);
+  assert.deepEqual(await query("SELECT telegram_id, status, last_error FROM notifications WHERE telegram_id IN (90001, 90002) ORDER BY telegram_id"), [
+    { telegram_id: 90001, status: "FAILED", last_error: "source_deleted" },
+    { telegram_id: 90002, status: "SENT", last_error: null },
+  ]);
   assert.equal((await query(`SELECT COUNT(*) AS count FROM ingestion_staging WHERE run_id=${sqlText(deletionRun)} AND processed=1`))[0]?.count, 2);
   assert.equal((await commit(deletionRun)).body.snapshot_generation, 4);
 
@@ -784,6 +793,10 @@ test("snapshot ingestion API initializes, progresses, retries, and never advance
   assert.equal((await query("SELECT source_deleted FROM publications WHERE source_id=3 AND external_id='43'"))[0]?.source_deleted, 1);
   assert.equal((await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43'"))[0]?.count, eventsBeforeDeletion);
   assert.equal((await query("SELECT COUNT(*) AS count FROM notifications"))[0]?.count, notificationsBeforeDeletion);
+  assert.deepEqual(await query("SELECT telegram_id, status, last_error FROM notifications WHERE telegram_id IN (90001, 90002) ORDER BY telegram_id"), [
+    { telegram_id: 90001, status: "FAILED", last_error: "source_deleted" },
+    { telegram_id: 90002, status: "SENT", last_error: null },
+  ]);
 
   const restoredTarget = testSnapshot("6".repeat(64), "2026-10-24 02:01:05.000");
   const restoreRun = "00000000-0000-4000-8000-000000000159";
@@ -793,6 +806,10 @@ test("snapshot ingestion API initializes, progresses, retries, and never advance
   assert.equal((await query("SELECT source_deleted FROM publications WHERE source_id=3 AND external_id='43'"))[0]?.source_deleted, 0);
   assert.equal((await query("SELECT COUNT(*) AS count FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=3 AND p.external_id='43'"))[0]?.count, eventsBeforeDeletion);
   assert.equal((await query("SELECT COUNT(*) AS count FROM notifications"))[0]?.count, notificationsBeforeDeletion);
+  assert.deepEqual(await query("SELECT telegram_id, status, last_error FROM notifications WHERE telegram_id IN (90001, 90002) ORDER BY telegram_id"), [
+    { telegram_id: 90001, status: "FAILED", last_error: "source_deleted" },
+    { telegram_id: 90002, status: "SENT", last_error: null },
+  ]);
 
   // A separate source proves a historical snapshot containing records follows the same publication contract.
   await query(

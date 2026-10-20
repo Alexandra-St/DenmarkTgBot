@@ -538,15 +538,70 @@ class SnapshotIngestionClientTests(unittest.TestCase):
         self.assertEqual(len(opener.requests), len(expected_batches) + 2)
         self.assertTrue(all("source-states" not in r.full_url for r in opener.requests))
 
+    def test_incremental_commit_limit_is_derived_from_record_count(self) -> None:
+        data = bundle(221)
+        records = ingestion_client.prepare_records({"cases": data["cases"]}, "folketinget", "incremental")
+        batches = ingestion_client.chunks(records)
+        responses = [start_response(expected_batches=len(batches))]
+        responses.extend({"accepted": True, "run_id": RUN_ID, "batch_index": index,
+                          "accepted_records": len(batch)} for index, batch in enumerate(batches))
+        responses.extend({"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 20,
+                          "remaining_records": 221 - 20 * (index + 1),
+                          "checkpoints_advanced": False, "snapshot_advanced": False}
+                         for index in range(11))
+        responses.append(commit_response(processed_records=1))
+        opener = QueueOpener(responses)
+        result = self.live(data, opener)
+        commit_requests = [request for request in opener.requests
+                           if json.loads(request.data).get("action") == "commit"]
+        self.assertEqual(len(commit_requests), 12)
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["records"], 221)
+
+    def test_incremental_commit_no_progress_fails_closed(self) -> None:
+        opener = QueueOpener([
+            start_response(),
+            {"accepted": True, "run_id": RUN_ID, "batch_index": 0, "accepted_records": 2},
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 0, "remaining_records": 2,
+             "checkpoints_advanced": False, "snapshot_advanced": False},
+        ])
+        with self.assertRaisesRegex(SnapshotIngestionError, "commit_no_progress"):
+            self.live(bundle(2), opener)
+
+    def test_incremental_commit_bound_is_finite_and_checked_before_network(self) -> None:
+        opener = QueueOpener([])
+        with patch("collectors.snapshot_ingestion_client.MAX_INCREMENTAL_COMMIT_ATTEMPTS", 1):
+            with self.assertRaisesRegex(SnapshotIngestionError, "prepared_batch_limit_exceeded"):
+                self.live(bundle(21), opener)
+        self.assertEqual(opener.requests, [])
+
+    def test_incremental_retry_resumes_same_run_without_resending_batches(self) -> None:
+        first = QueueOpener([
+            start_response(),
+            {"accepted": True, "run_id": RUN_ID, "batch_index": 0, "accepted_records": 21},
+            TimeoutError("ambiguous commit response"),
+        ])
+        with self.assertRaisesRegex(SnapshotIngestionError, "ingestion_transport_failed"):
+            self.live(bundle(21), first)
+        resumed = QueueOpener([
+            start_response(status="COMMITTING", expected_batches=1, idempotent=True),
+            commit_response(processed_records=1),
+        ])
+        result = self.live(bundle(21), resumed)
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual([json.loads(request.data)["action"] for request in resumed.requests], ["start", "commit"])
+        self.assertEqual([json.loads(request.data)["run_id"] for request in first.requests + resumed.requests],
+                         [RUN_ID] * 5)
+
     def test_committing_retries_same_run_id(self) -> None:
         opener = QueueOpener([
             start_response(),
-            {"accepted": True, "run_id": RUN_ID, "batch_index": 0, "accepted_records": 1},
-            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 1, "remaining_records": 0,
+            {"accepted": True, "run_id": RUN_ID, "batch_index": 0, "accepted_records": 21},
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 20, "remaining_records": 1,
              "checkpoints_advanced": False, "snapshot_advanced": False},
-            commit_response(),
+            commit_response(processed_records=1),
         ])
-        self.assertEqual(self.live(opener=opener)["status"], "COMMITTED")
+        self.assertEqual(self.live(bundle(21), opener)["status"], "COMMITTED")
         self.assertEqual([json.loads(r.data)["run_id"] for r in opener.requests], [RUN_ID] * 4)
 
     def test_blocked_response_does_not_claim_advance(self) -> None:

@@ -21,7 +21,6 @@ from collectors import ingestion_client
 from collectors.relevance import DIRECT, POTENTIAL, RULESET_VERSION
 
 USER_AGENT = "DenmarkTgBot-SnapshotIngestionClient/1.0"
-MAX_COMMIT_ATTEMPTS = 10
 REQUEST_TIMEOUT_SECONDS = 15
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _BACKUP_TIMESTAMP = re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})$")
@@ -30,6 +29,13 @@ MAX_HISTORICAL_SELECTED_BYTES = 200 * ingestion_client.MAX_BATCH_BYTES
 MAX_HISTORICAL_BATCHES = 200
 # Mirrors Worker COMMIT_RECORDS. Used only to derive a finite historical bound.
 HISTORICAL_COMMIT_RECORDS_PER_REQUEST = 20
+INCREMENTAL_COMMIT_RECORDS_PER_REQUEST = 20
+MAX_INCREMENTAL_BATCHES = 200
+MAX_INCREMENTAL_RECORDS = MAX_INCREMENTAL_BATCHES * ingestion_client.MAX_BATCH_RECORDS
+MAX_INCREMENTAL_COMMIT_ATTEMPTS = (
+    MAX_INCREMENTAL_RECORDS + INCREMENTAL_COMMIT_RECORDS_PER_REQUEST - 1
+) // INCREMENTAL_COMMIT_RECORDS_PER_REQUEST
+MAX_COMMIT_ATTEMPTS = MAX_INCREMENTAL_COMMIT_ATTEMPTS
 MAX_HISTORICAL_COMMIT_ATTEMPTS = (
     MAX_HISTORICAL_SELECTED_RECORDS + HISTORICAL_COMMIT_RECORDS_PER_REQUEST - 1
 ) // HISTORICAL_COMMIT_RECORDS_PER_REQUEST
@@ -499,9 +505,16 @@ def _submit_prepared_records(
                             else MAX_COMMIT_ATTEMPTS)
     derived_historical_limit = ((len(records) + HISTORICAL_COMMIT_RECORDS_PER_REQUEST - 1)
                                 // HISTORICAL_COMMIT_RECORDS_PER_REQUEST) if mode == "historical" else None
+    derived_incremental_limit = ((len(records) + INCREMENTAL_COMMIT_RECORDS_PER_REQUEST - 1)
+                                 // INCREMENTAL_COMMIT_RECORDS_PER_REQUEST) if mode == "incremental" else None
+    if derived_incremental_limit is not None:
+        derived_incremental_limit = max(1, derived_incremental_limit)
+        if derived_incremental_limit > MAX_INCREMENTAL_COMMIT_ATTEMPTS:
+            raise SnapshotIngestionError("commit_retry_limit_invalid", run_id, "commit")
     if (isinstance(max_commit_attempts, bool) or not isinstance(max_commit_attempts, int)
             or not 1 <= max_commit_attempts <= max_allowed_attempts
-            or (derived_historical_limit is not None and max_commit_attempts > max(1, derived_historical_limit))):
+            or (derived_historical_limit is not None and max_commit_attempts > max(1, derived_historical_limit))
+            or (derived_incremental_limit is not None and max_commit_attempts > derived_incremental_limit)):
         raise SnapshotIngestionError("commit_retry_limit_invalid", run_id, "commit")
     result: dict[str, Any] | None = None
     processed_this_attempt = 0
@@ -528,13 +541,20 @@ def _submit_prepared_records(
                 if processed_this_attempt > len(records):
                     raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
                 previous_remaining = remaining
+            else:
+                if (processed == 0 or remaining == 0 or remaining >= len(records)
+                        or (previous_remaining is not None and remaining >= previous_remaining)
+                        or processed > INCREMENTAL_COMMIT_RECORDS_PER_REQUEST):
+                    raise SnapshotIngestionError("commit_no_progress", run_id, "commit")
+                previous_remaining = remaining
             continue
         if status == "COMMITTED":
             generation = result.get("snapshot_generation")
             processed = result.get("processed_records")
             if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not True
                     or isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
-                    or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0):
+                    or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0
+                    or (mode == "incremental" and processed > INCREMENTAL_COMMIT_RECORDS_PER_REQUEST)):
                 raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
             if mode == "historical":
                 if processed > HISTORICAL_COMMIT_RECORDS_PER_REQUEST:
@@ -618,7 +638,7 @@ def ingest_snapshot_candidates(
     run_id: str | None = None,
     dry_run: bool = True,
     opener: Opener = urllib.request.urlopen,
-    max_commit_attempts: int = MAX_COMMIT_ATTEMPTS,
+    max_commit_attempts: int | None = None,
 ) -> dict[str, Any]:
     """Prepare or submit an incremental snapshot run; never uses OData state."""
     if not isinstance(dry_run, bool):
@@ -642,6 +662,13 @@ def ingest_snapshot_candidates(
         raise
     except Exception:
         raise SnapshotIngestionError("candidate_records_invalid", run_id) from None
+
+    if mode == "incremental" and (
+        len(batches) > MAX_INCREMENTAL_BATCHES
+        or max(1, (len(records) + INCREMENTAL_COMMIT_RECORDS_PER_REQUEST - 1)
+               // INCREMENTAL_COMMIT_RECORDS_PER_REQUEST) > MAX_INCREMENTAL_COMMIT_ATTEMPTS
+    ):
+        raise SnapshotIngestionError("prepared_batch_limit_exceeded", stage="prepare")
 
     if run_id is not None and not isinstance(run_id, str):
         raise SnapshotIngestionError("invalid_run_id")
@@ -667,7 +694,11 @@ def ingest_snapshot_candidates(
     return _submit_prepared_records(
         records, batches, counts, mode=mode, base=base, target=target,
         endpoint=endpoint, token=token, run_id=run_id, opener=opener,
-        max_commit_attempts=max_commit_attempts,
+        max_commit_attempts=(
+            max_commit_attempts if max_commit_attempts is not None
+            else max(1, (len(records) + INCREMENTAL_COMMIT_RECORDS_PER_REQUEST - 1)
+                     // INCREMENTAL_COMMIT_RECORDS_PER_REQUEST)
+        ),
     )
 
 
