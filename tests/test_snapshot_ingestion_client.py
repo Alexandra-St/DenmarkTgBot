@@ -13,7 +13,8 @@ from unittest.mock import patch
 
 from collectors import ingestion_client
 from collectors.snapshot_ingestion_client import (
-    SnapshotIngestionError, dry_run_prepared_historical_records,
+    HISTORICAL_LIVE_ACTIVATION_MODE, SnapshotIngestionError,
+    dry_run_prepared_historical_records, submit_prepared_historical_records,
     ingest_snapshot_candidates, main, validate_snapshot_identity,
 )
 from tests.test_ingestion_client import oda_output
@@ -39,7 +40,7 @@ class Response:
     def __exit__(self, *_):
         return None
 
-    def read(self) -> bytes:
+    def read(self, _size: int = -1) -> bytes:
         return self.raw
 
 
@@ -164,6 +165,114 @@ class SnapshotIngestionClientTests(unittest.TestCase):
             ingest_snapshot_candidates(bundle(), mode="historical", base_snapshot=None, target_snapshot=TARGET,
                                        dry_run=False, endpoint="https://example.test", token="token",
                                        opener=lambda *_a, **_k: self.fail("network called"))
+
+    def _ready(self, **overrides):
+        return {
+            "source": "folketinget", "schema_ready": True,
+            "snapshot_state_initialized": False, "snapshot_generation": None,
+            "active_ingestion_run": False, "worker_supports_snapshot_ingestion": True,
+            "historical_snapshot_start_allowed": True, **overrides,
+        }
+
+    def _prepared_history(self):
+        record = ingestion_client.prepare_records(bundle(), "folketinget", "historical")[0]
+        record.update({"historical": True, "relevance": "DIRECT"})
+        return [record]
+
+    def _submit_history(self, records, opener, **kwargs):
+        return submit_prepared_historical_records(
+            records, activation_mode=HISTORICAL_LIVE_ACTIVATION_MODE,
+            mode="historical", state_kind="snapshot", base_snapshot=None,
+            target_snapshot=TARGET, endpoint="https://example.test",
+            token="DO_NOT_LOG_TOKEN", run_id=RUN_ID, opener=opener, **kwargs,
+        )
+
+    def test_prepared_historical_live_happy_path_uses_readiness_then_snapshot_protocol(self) -> None:
+        responses = [
+            self._ready(), start_response(expected_batches=1),
+            {"accepted": True, "run_id": RUN_ID, "batch_index": 0, "accepted_records": 1},
+            commit_response(snapshot_generation=1, processed_records=1),
+        ]
+        opener = QueueOpener(responses)
+        records = self._prepared_history()
+        with patch.object(ingestion_client, "prepare_records", side_effect=AssertionError("must not reprepare")), \
+             patch.object(ingestion_client, "upload", side_effect=AssertionError("old uploader forbidden")), \
+             patch.object(ingestion_client, "proposed_checkpoints", side_effect=AssertionError("OData state forbidden")):
+            result = self._submit_history(records, opener)
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["processed_records"], 1)
+        self.assertEqual(result["snapshot_generation"], 1)
+        self.assertEqual(len(opener.requests), 4)
+        readiness, start, batch, commit = opener.requests
+        self.assertEqual(readiness.get_method(), "GET")
+        self.assertTrue(readiness.full_url.endswith("/internal/snapshot-readiness?source=folketinget"))
+        self.assertEqual(start.get_method(), "POST")
+        start_payload = json.loads(start.data)
+        self.assertEqual(start_payload["mode"], "historical")
+        self.assertEqual(start_payload["state_kind"], "snapshot")
+        self.assertIsNone(start_payload["base_snapshot"])
+        self.assertEqual(start_payload["target_snapshot"], TARGET)
+        self.assertEqual(start_payload["run_id"], RUN_ID)
+        self.assertEqual(batch.get_method(), "POST")
+        self.assertEqual(json.loads(commit.data), {"action": "commit", "run_id": RUN_ID})
+        self.assertTrue(all("notification" not in request.full_url for request in opener.requests))
+
+    def test_readiness_blocks_before_any_ingestion_write(self) -> None:
+        opener = QueueOpener([self._ready(snapshot_state_initialized=True)])
+        with self.assertRaisesRegex(SnapshotIngestionError, "snapshot_readiness_blocked") as raised:
+            self._submit_history(self._prepared_history(), opener)
+        self.assertEqual(raised.exception.stage, "readiness")
+        self.assertEqual(len(opener.requests), 1)
+        self.assertEqual(opener.requests[0].get_method(), "GET")
+
+    def test_invalid_activation_and_base_snapshot_block_before_network(self) -> None:
+        records = self._prepared_history()
+        opener = QueueOpener([])
+        with self.assertRaisesRegex(SnapshotIngestionError, "historical_snapshot_submission_not_enabled"):
+            submit_prepared_historical_records(
+                records, activation_mode="", mode="historical", state_kind="snapshot",
+                base_snapshot=None, target_snapshot=TARGET, endpoint="https://example.test",
+                token="token", run_id=RUN_ID, opener=opener,
+            )
+        with self.assertRaisesRegex(SnapshotIngestionError, "snapshot_base_must_be_null"):
+            submit_prepared_historical_records(
+                records, activation_mode=HISTORICAL_LIVE_ACTIVATION_MODE, mode="historical",
+                state_kind="snapshot", base_snapshot=BASE, target_snapshot=TARGET,
+                endpoint="https://example.test", token="token", run_id=RUN_ID, opener=opener,
+            )
+        self.assertEqual(opener.requests, [])
+
+    def test_ambiguous_live_transport_keeps_same_run_id_and_does_not_retry_write(self) -> None:
+        opener = QueueOpener([self._ready(), TimeoutError("secret or request details")])
+        with self.assertRaisesRegex(SnapshotIngestionError, "ingestion_transport_failed") as raised:
+            self._submit_history(self._prepared_history(), opener)
+        self.assertEqual(raised.exception.run_id, RUN_ID)
+        self.assertEqual(raised.exception.stage, "start")
+        self.assertEqual([request.get_method() for request in opener.requests], ["GET", "POST"])
+        self.assertEqual(len(opener.requests), 2)
+
+    def test_readiness_response_shape_and_disabled_snapshot_state_fail_closed(self) -> None:
+        for payload in (
+            self._ready(active_ingestion_run=True),
+            self._ready(worker_supports_snapshot_ingestion=False),
+            {**self._ready(), "unexpected": True},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(SnapshotIngestionError):
+                self._submit_history(self._prepared_history(), QueueOpener([payload]))
+
+    def test_prepared_historical_live_enforces_record_batch_and_byte_limits_before_readiness(self) -> None:
+        records = self._prepared_history()
+        for patch_target, patch_value, category in (
+            ("MAX_HISTORICAL_SELECTED_RECORDS", 0, "prepared_record_limit_exceeded"),
+            ("MAX_HISTORICAL_BATCHES", 0, "prepared_batch_limit_exceeded"),
+            ("MAX_HISTORICAL_SELECTED_BYTES", 1, "prepared_record_limit_exceeded"),
+        ):
+            opener = QueueOpener([])
+            with self.subTest(category=category), patch(
+                f"collectors.snapshot_ingestion_client.{patch_target}", patch_value
+            ), self.assertRaisesRegex(SnapshotIngestionError, category):
+                self._submit_history(records, opener)
+            self.assertEqual(opener.requests, [])
 
     def test_incomplete_incremental_live_rejected_before_network(self) -> None:
         with self.assertRaisesRegex(SnapshotIngestionError, "incomplete_candidates"):

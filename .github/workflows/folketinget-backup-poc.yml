@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
       mode:
-        description: "Choose a manual restore, validation, manifest, diff, extraction, relevance, snapshot-client dry-run, or production readiness preflight"
+        description: "Choose a manual restore, validation, manifest, diff, extraction, dry-run, historical live baseline, or readiness preflight"
         required: true
         type: choice
         options:
@@ -22,6 +22,7 @@ on:
           - PREPARE_SNAPSHOT_INGESTION
           - SNAPSHOT_INGESTION_DRY_RUN
           - HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN
+          - HISTORICAL_SNAPSHOT_BASELINE_LIVE
           - HISTORICAL_SNAPSHOT_PRODUCTION_PREFLIGHT
         default: RESTORE_VALIDATE
       old_run_id:
@@ -33,7 +34,7 @@ on:
         required: false
         type: string
       manifest_run_id:
-        description: "Successful CREATE_MANIFEST_BASELINE run ID for the historical baseline dry-run"
+        description: "Successful CREATE_MANIFEST_BASELINE run ID for historical baseline dry-run/live modes"
         required: false
         type: string
 
@@ -222,13 +223,18 @@ jobs:
             fi
           done
       - name: Validate historical manifest run and artifact
-        if: inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'
+        if: inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN' || inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
           MANIFEST_RUN_ID: ${{ inputs.manifest_run_id }}
+          CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
         run: |
           set -euo pipefail
+          if [[ "$CONFIRM_RESTORE" != "true" ]]; then
+            echo "historical_baseline=FAIL category=manual_confirmation_required"
+            exit 2
+          fi
           if [[ ! "$MANIFEST_RUN_ID" =~ ^[0-9]+$ ]]; then
             echo "historical_baseline=FAIL category=workflow_run_id_invalid"
             exit 2
@@ -259,7 +265,7 @@ jobs:
             exit 2
           fi
       - name: Download historical manifest artifact
-        if: inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'
+        if: inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN' || inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE'
         uses: actions/download-artifact@v8
         with:
           name: folketinget-snapshot-manifest-${{ inputs.manifest_run_id }}
@@ -309,6 +315,8 @@ jobs:
           HISTORICAL_MANIFEST_PATH: ${{ runner.temp }}/folketinget-manifest-${{ inputs.manifest_run_id }}
           ODA_BACKUP_USERNAME: ${{ secrets.ODA_BACKUP_USERNAME }}
           ODA_BACKUP_PASSWORD: ${{ secrets.ODA_BACKUP_PASSWORD }}
+          INGEST_API_URL: ${{ inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE' && vars.INGEST_API_URL || '' }}
+          INGEST_API_TOKEN: ${{ inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE' && secrets.INGEST_API_TOKEN || '' }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 tools/folketinget_backup_poc.py
       - name: Upload validated manifest only
@@ -341,7 +349,7 @@ jobs:
             fi
           done
       - name: Remove historical manifest artifact
-        if: always() && inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'
+        if: always() && (inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN' || inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE')
         env:
           RUNNER_TEMP: ${{ runner.temp }}
           MANIFEST_RUN_ID: ${{ inputs.manifest_run_id }}

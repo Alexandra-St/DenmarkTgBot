@@ -462,7 +462,7 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertEqual(POC.validate_mode("SNAPSHOT_INGESTION_DRY_RUN"), "SNAPSHOT_INGESTION_DRY_RUN")
         for mode in ("RESTORE_VALIDATE", "VALIDATE_SQL_PROVIDER", "CREATE_MANIFEST_BASELINE",
                      "EXTRACT_SNAPSHOT_CANDIDATES", "CLASSIFY_SNAPSHOT_CANDIDATES",
-                     "PREPARE_SNAPSHOT_INGESTION"):
+                     "PREPARE_SNAPSHOT_INGESTION", "HISTORICAL_SNAPSHOT_BASELINE_LIVE"):
             self.assertEqual(POC.validate_mode(mode), mode)
         workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
         self.assertIn("- DIFF_MANIFESTS", workflow)
@@ -532,6 +532,99 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertEqual(result["snapshot_client_dry_run"]["status"], "PASS")
         self.assertTrue(result["snapshot_client_dry_run"]["submission_eligible"])
         run.assert_called_once_with(context["path"], mock.ANY, progress_callback=mock.ANY)
+
+    def test_historical_live_reuses_full_proof_and_exact_prepared_records(self) -> None:
+        from collectors import ingestion_client, snapshot_ingestion_client
+        import folketinget_historical_baseline as historical_baseline
+
+        target = {"backup_sha256": "a" * 64, "backup_finish_date": "2026-10-18 02:00:00.000", "schema_fingerprint": "b" * 64}
+        context = {"path": pathlib.Path("private-manifest.sqlite"), "report": {"new": target}}
+        record = ingestion_client.prepare_records(
+            {"cases": [{"external_id": "42", "title": "PRIVATE TITLE", "source_url": "https://oda.ft.dk/api/Sag(42)",
+                        "complete": True, "number": "L 42", "status": {}, "documents": [], "stages": [], "votes": []}]},
+            "folketinget", "historical",
+        )[0]
+        record.update({"relevance": "DIRECT", "historical": True})
+        baseline = {"status": "PASS", "manifest_sag_count": 1, "target_backup_finish": target["backup_finish_date"],
+                    "selected_historical_ingestion_record_count": 1,
+                    "selected_historical_ingestion_batch_count": 1, "DIRECT": 1, "POTENTIAL": 0}
+        committed = {
+            "status": "COMMITTED", "mode": "historical", "state_kind": "snapshot",
+            "run_id": POC.workflow_historical_run_id("39410000"), "records": 1,
+            "accepted_records": 1, "processed_records": 1, "batches": 1,
+            "relevance_counts": {"DIRECT": 1, "POTENTIAL": 0}, "base_snapshot": None,
+            "target_snapshot": target, "snapshot_generation": 1, "snapshot_advanced": True,
+        }
+        with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(baseline, [record])) as run, \
+                mock.patch.object(snapshot_ingestion_client, "submit_prepared_historical_records", return_value=committed) as submit:
+            result = POC.run_historical_baseline_live(
+                context, SimpleNamespace(), endpoint="https://example.test", token="NO_LOG_TOKEN",
+                workflow_run_id="39410000", progress_callback=lambda *_: None,
+            )
+        self.assertEqual(result["snapshot_client_live"]["status"], "PASS")
+        self.assertEqual(result["snapshot_client_live"]["final_ingestion_status"], "COMMITTED")
+        self.assertEqual(POC.historical_baseline_live_exit_code(result), 0)
+        run.assert_called_once_with(context["path"], mock.ANY, progress_callback=mock.ANY)
+        submitted_records = submit.call_args.args[0]
+        self.assertIs(submitted_records[0], record)
+        self.assertEqual(submit.call_args.kwargs["base_snapshot"], None)
+        self.assertEqual(submit.call_args.kwargs["target_snapshot"], target)
+        self.assertEqual(submit.call_args.kwargs["activation_mode"], POC.HISTORICAL_SNAPSHOT_BASELINE_LIVE)
+        self.assertEqual(submit.call_args.kwargs["run_id"], committed["run_id"])
+
+    def test_historical_live_incomplete_or_manifest_mismatch_never_submits(self) -> None:
+        from collectors import snapshot_ingestion_client
+        import folketinget_historical_baseline as historical_baseline
+
+        target = {"backup_sha256": "a" * 64, "backup_finish_date": "2026-10-18 02:00:00.000", "schema_fingerprint": "b" * 64}
+        context = {"path": pathlib.Path("private-manifest.sqlite"), "report": {"new": target}}
+        incomplete = {"status": "INCOMPLETE", "diagnostics": {}, "target_backup_finish": target["backup_finish_date"]}
+        with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(incomplete, [])), \
+                mock.patch.object(snapshot_ingestion_client, "submit_prepared_historical_records", side_effect=AssertionError("must not submit")) as submit:
+            result = POC.run_historical_baseline_live(
+                context, SimpleNamespace(), endpoint="https://example.test", token="token", workflow_run_id="39410001"
+            )
+        submit.assert_not_called()
+        self.assertEqual(result["snapshot_client_live"]["final_ingestion_status"], "NOT_STARTED")
+        self.assertEqual(POC.historical_baseline_live_exit_code(result), 2)
+
+        mismatch = {"status": "PASS", "target_backup_finish": "2026-10-17 02:00:00.000",
+                    "selected_historical_ingestion_record_count": 0,
+                    "selected_historical_ingestion_batch_count": 1, "DIRECT": 0, "POTENTIAL": 0}
+        with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(mismatch, [])), \
+                mock.patch.object(snapshot_ingestion_client, "submit_prepared_historical_records", side_effect=AssertionError("must not submit")) as submit:
+            with self.assertRaises(POC.PocError) as raised:
+                POC.run_historical_baseline_live(
+                    context, SimpleNamespace(), endpoint="https://example.test", token="token", workflow_run_id="39410002"
+                )
+        self.assertEqual(raised.exception.category, "historical_handoff_snapshot_mismatch")
+        submit.assert_not_called()
+
+    def test_historical_live_summary_is_aggregate_only_and_run_id_is_stable(self) -> None:
+        first = POC.workflow_historical_run_id("39410003")
+        self.assertEqual(first, POC.workflow_historical_run_id("39410003"))
+        summary = {
+            "status": "PASS", "manifest_sag_count": 99682,
+            "selected_historical_ingestion_record_count": 1265,
+            "selected_historical_ingestion_batch_count": 26,
+            "DIRECT": 45, "POTENTIAL": 1220,
+            "target_backup_finish": "2026-10-18 02:00:00.000",
+            "snapshot_client_live": {"status": "PASS", "run_id": first,
+                "final_ingestion_status": "COMMITTED", "snapshot_generation": 1,
+                "snapshot_advanced": True},
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            POC.write_historical_baseline_live_summary(summary)
+        rendered = output.getvalue()
+        self.assertIn("Historical snapshot baseline live submission: PASS", rendered)
+        self.assertIn("full Sag count: 99682", rendered)
+        self.assertIn("selected record count: 1265", rendered)
+        self.assertIn("batch count: 26", rendered)
+        self.assertIn("final ingestion status: COMMITTED", rendered)
+        self.assertNotIn("PRIVATE TITLE", rendered)
+        self.assertNotIn("https://", rendered)
+        self.assertNotIn("records", rendered.lower().split("run_id:")[0])
 
     def test_historical_handoff_requires_full_pass_and_exact_client_counts_and_identity(self) -> None:
         from collectors import ingestion_client, snapshot_ingestion_client
@@ -646,7 +739,7 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("folketinget-snapshot-manifest-$MANIFEST_RUN_ID", workflow)
         self.assertIn("name: Download historical manifest artifact", workflow)
         self.assertIn("uses: actions/download-artifact@v8", workflow)
-        self.assertIn("if: always() && inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN'", workflow)
+        self.assertIn("if: always() && (inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN' || inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE')", workflow)
         self.assertIn("INPUT_MANIFEST_RUN_ID:", workflow)
         self.assertIn("HISTORICAL_MANIFEST_PATH:", workflow)
         self.assertIn("- HISTORICAL_SNAPSHOT_PRODUCTION_PREFLIGHT", workflow)
@@ -655,6 +748,12 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("INGEST_API_URL: ${{ vars.INGEST_API_URL }}", workflow)
         self.assertIn("INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}", workflow)
         self.assertIn("/internal/snapshot-readiness?source=folketinget", workflow)
+        self.assertIn("- HISTORICAL_SNAPSHOT_BASELINE_LIVE", workflow)
+        self.assertIn("INGEST_API_URL: ${{ inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE' && vars.INGEST_API_URL || '' }}", workflow)
+        self.assertIn("INGEST_API_TOKEN: ${{ inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE' && secrets.INGEST_API_TOKEN || '' }}", workflow)
+        self.assertIn("if: inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN' || inputs.mode == 'HISTORICAL_SNAPSHOT_BASELINE_LIVE'", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertNotIn("notification-queue", workflow)
         preflight = workflow.split("name: Production snapshot readiness preflight", 1)[1].split("name: Validate manifest run IDs", 1)[0]
         self.assertIn('"User-Agent": "DenmarkTgBot-SnapshotReadinessPreflight/1.0"', preflight)
         self.assertIn('"Authorization": "Bearer " + token', preflight)

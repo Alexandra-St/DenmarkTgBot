@@ -1,9 +1,4 @@
-"""Snapshot-native Folketinget ingestion, separate from OData checkpoints.
-
-This client accepts extracted snapshot candidates only. Historical live
-submission is intentionally disabled because candidate extraction is a diff,
-not a complete initial Folketinget dataset.
-"""
+"""Snapshot-native Folketinget ingestion, separate from OData checkpoints."""
 
 from __future__ import annotations
 
@@ -33,6 +28,7 @@ _BACKUP_TIMESTAMP = re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}
 MAX_HISTORICAL_SELECTED_RECORDS = 10_000
 MAX_HISTORICAL_SELECTED_BYTES = 200 * ingestion_client.MAX_BATCH_BYTES
 MAX_HISTORICAL_BATCHES = 200
+HISTORICAL_LIVE_ACTIVATION_MODE = "HISTORICAL_SNAPSHOT_BASELINE_LIVE"
 Opener = Callable[..., Any]
 
 WORKER_ERRORS = frozenset({
@@ -195,12 +191,38 @@ def dry_run_prepared_historical_records(
     target_snapshot: object,
 ) -> dict[str, Any]:
     """Validate already-prepared historical records and batch them, with no network path."""
+    if dry_run is not True:
+        raise SnapshotIngestionError("historical_snapshot_submission_not_enabled")
+    prepared, batches, counts, target = _prepare_historical_records(
+        records, mode=mode, state_kind=state_kind, base_snapshot=base_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    return {
+        "dry_run": True,
+        "mode": "historical",
+        "state_kind": "snapshot",
+        "records": len(prepared),
+        "batches": len(batches),
+        "relevance_counts": counts,
+        "collection_complete": True,
+        "submission_eligible": True,
+        "base_snapshot": None,
+        "target_snapshot": target.to_dict(),
+    }
+
+
+def _prepare_historical_records(
+    records: object,
+    *,
+    mode: str,
+    state_kind: str,
+    base_snapshot: object,
+    target_snapshot: object,
+) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]], dict[str, int], SnapshotIdentity]:
     if mode != "historical":
         raise SnapshotIngestionError("invalid_mode")
     if state_kind != "snapshot":
         raise SnapshotIngestionError("snapshot_state_kind_invalid")
-    if dry_run is not True:
-        raise SnapshotIngestionError("historical_snapshot_submission_not_enabled")
     if base_snapshot is not None:
         raise SnapshotIngestionError("snapshot_base_must_be_null")
     _, target = _validate_pair("historical", base_snapshot, target_snapshot)
@@ -219,18 +241,7 @@ def dry_run_prepared_historical_records(
         raise SnapshotIngestionError("prepared_record_invalid") from None
     if len(batches) > MAX_HISTORICAL_BATCHES:
         raise SnapshotIngestionError("prepared_batch_limit_exceeded")
-    return {
-        "dry_run": True,
-        "mode": "historical",
-        "state_kind": "snapshot",
-        "records": len(prepared),
-        "batches": len(batches),
-        "relevance_counts": counts,
-        "collection_complete": True,
-        "submission_eligible": True,
-        "base_snapshot": None,
-        "target_snapshot": target.to_dict(),
-    }
+    return prepared, batches, counts, target
 
 
 def _ingest_url(endpoint: str) -> str:
@@ -296,6 +307,209 @@ def _require_run_response(value: Mapping[str, Any], run_id: str, stage: str) -> 
         raise SnapshotIngestionError("worker_response_invalid", run_id, stage)
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):  # type: ignore[no-untyped-def]
+        return None
+
+
+def verify_historical_snapshot_readiness(
+    endpoint: str,
+    token: str,
+    *,
+    opener: Opener | None = None,
+) -> dict[str, Any]:
+    """Read the production gate immediately before a historical snapshot write."""
+    if not isinstance(token, str) or not token:
+        raise SnapshotIngestionError("ingestion_configuration_missing", stage="readiness")
+    ingest_url = _ingest_url(endpoint)
+    readiness_url = ingest_url.removesuffix("/internal/ingest") + "/internal/snapshot-readiness?source=folketinget"
+    request = urllib.request.Request(
+        readiness_url,
+        method="GET",
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": USER_AGENT},
+    )
+    try:
+        if opener is None:
+            with urllib.request.build_opener(_NoRedirectHandler()).open(
+                request, timeout=REQUEST_TIMEOUT_SECONDS
+            ) as response:
+                raw = response.read(4097)
+        else:
+            with opener(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                raw = response.read(4097)
+    except urllib.error.HTTPError as error:
+        status = error.code
+        error.close()
+        category = {
+            401: "snapshot_readiness_unauthorized",
+            403: "snapshot_readiness_forbidden",
+            404: "snapshot_readiness_endpoint_not_found",
+            405: "snapshot_readiness_method_not_allowed",
+        }.get(status, "snapshot_readiness_http_error")
+        raise SnapshotIngestionError(category, stage="readiness") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        raise SnapshotIngestionError("snapshot_readiness_request_failed", stage="readiness") from None
+    except Exception:
+        raise SnapshotIngestionError("snapshot_readiness_request_failed", stage="readiness") from None
+    if len(raw) > 4096:
+        raise SnapshotIngestionError("snapshot_readiness_response_invalid", stage="readiness")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SnapshotIngestionError("snapshot_readiness_response_invalid", stage="readiness") from None
+    keys = {
+        "source", "schema_ready", "snapshot_state_initialized", "snapshot_generation",
+        "active_ingestion_run", "worker_supports_snapshot_ingestion", "historical_snapshot_start_allowed",
+    }
+    if (not isinstance(result, dict) or set(result) != keys or result.get("source") != "folketinget"
+            or any(not isinstance(result.get(name), bool) for name in (
+                "schema_ready", "worker_supports_snapshot_ingestion", "historical_snapshot_start_allowed"))
+            or any(result.get(name) is not None and not isinstance(result.get(name), bool)
+                   for name in ("snapshot_state_initialized", "active_ingestion_run"))
+            or (result.get("snapshot_generation") is not None and (
+                isinstance(result.get("snapshot_generation"), bool)
+                or not isinstance(result.get("snapshot_generation"), int)
+                or result["snapshot_generation"] < 1
+            ))):
+        raise SnapshotIngestionError("snapshot_readiness_response_invalid", stage="readiness")
+    if (result["schema_ready"] is not True or result["snapshot_state_initialized"] is not False
+            or result["snapshot_generation"] is not None or result["active_ingestion_run"] is not False
+            or result["worker_supports_snapshot_ingestion"] is not True
+            or result["historical_snapshot_start_allowed"] is not True):
+        raise SnapshotIngestionError("snapshot_readiness_blocked", stage="readiness")
+    return result
+
+
+def _submit_prepared_records(
+    records: list[dict[str, Any]],
+    batches: list[list[dict[str, Any]]],
+    counts: dict[str, int],
+    *,
+    mode: str,
+    base: SnapshotIdentity | None,
+    target: SnapshotIdentity,
+    endpoint: str,
+    token: str,
+    run_id: str,
+    opener: Opener,
+    max_commit_attempts: int,
+) -> dict[str, Any]:
+    if not isinstance(token, str) or not token:
+        raise SnapshotIngestionError("ingestion_configuration_missing", run_id, "start")
+    ingest_url = _ingest_url(endpoint)
+    summary: dict[str, Any] = {
+        "dry_run": False, "mode": mode, "state_kind": "snapshot", "run_id": run_id,
+        "records": len(records), "batches": len(batches), "relevance_counts": counts,
+        "collection_complete": True, "submission_eligible": True,
+        "base_snapshot": base.to_dict() if base else None, "target_snapshot": target.to_dict(),
+    }
+    common = {"action": "start", "run_id": run_id, "source": "folketinget", "mode": mode, "state_kind": "snapshot"}
+    started = _post(ingest_url, token, {
+        **common,
+        "expected_batches": len(batches),
+        "collection_complete": True,
+        "base_snapshot": base.to_dict() if base else None,
+        "target_snapshot": target.to_dict(),
+    }, run_id, "start", opener)
+    _require_run_response(started, run_id, "start")
+    state = started.get("status")
+    expected_batches = started.get("expected_batches")
+    if (started.get("accepted") is not True or started.get("state_kind") != "snapshot"
+            or state not in {"OPEN", "COMMITTING", "COMMITTED", "BLOCKED"}
+            or isinstance(expected_batches, bool) or not isinstance(expected_batches, int)
+            or expected_batches != len(batches)):
+        raise SnapshotIngestionError("worker_response_invalid", run_id, "start")
+    if state != "OPEN" and started.get("idempotent") is not True:
+        raise SnapshotIngestionError("worker_response_invalid", run_id, "start")
+
+    accepted = 0
+    if state == "OPEN":
+        for index, batch in enumerate(batches):
+            result = _post(ingest_url, token, {
+                "action": "batch", "run_id": run_id, "batch_index": index, "records": batch,
+            }, run_id, "batch", opener)
+            _require_run_response(result, run_id, "batch")
+            batch_count = result.get("accepted_records")
+            if (result.get("accepted") is not True or result.get("batch_index") != index
+                    or isinstance(batch_count, bool) or not isinstance(batch_count, int)
+                    or batch_count != len(batch)):
+                raise SnapshotIngestionError("worker_response_invalid", run_id, "batch")
+            accepted += batch_count
+
+    if isinstance(max_commit_attempts, bool) or not isinstance(max_commit_attempts, int) or not 1 <= max_commit_attempts <= MAX_COMMIT_ATTEMPTS:
+        raise SnapshotIngestionError("commit_retry_limit_invalid", run_id, "commit")
+    result: dict[str, Any] | None = None
+    for _ in range(max_commit_attempts):
+        result = _post(ingest_url, token, {"action": "commit", "run_id": run_id}, run_id, "commit", opener)
+        _require_run_response(result, run_id, "commit")
+        status = result.get("status")
+        if status == "COMMITTING":
+            processed = result.get("processed_records")
+            remaining = result.get("remaining_records")
+            if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not False
+                    or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0
+                    or isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0):
+                raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+            continue
+        if status == "COMMITTED":
+            generation = result.get("snapshot_generation")
+            processed = result.get("processed_records")
+            if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not True
+                    or isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+                    or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0):
+                raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+            summary.update({"status": status, "accepted_records": accepted, "processed_records": processed,
+                            "snapshot_advanced": True, "snapshot_generation": generation})
+            return summary
+        if status == "BLOCKED":
+            if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not False
+                    or ("error" in result and result.get("error") != "incomplete_publication")):
+                raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+            summary.update({"status": status, "accepted_records": accepted, "processed_records": 0,
+                            "snapshot_advanced": False})
+            return summary
+        raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+    if result and result.get("status") == "COMMITTING":
+        raise SnapshotIngestionError("commit_retry_limit", run_id, "commit")
+    raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+
+
+def submit_prepared_historical_records(
+    records: object,
+    *,
+    activation_mode: str,
+    mode: str,
+    state_kind: str,
+    base_snapshot: object,
+    target_snapshot: object,
+    endpoint: str,
+    token: str,
+    run_id: str,
+    opener: Opener = urllib.request.urlopen,
+    max_commit_attempts: int = MAX_COMMIT_ATTEMPTS,
+) -> dict[str, Any]:
+    """Submit only a validated historical handoff from its dedicated workflow mode."""
+    if activation_mode != HISTORICAL_LIVE_ACTIVATION_MODE:
+        raise SnapshotIngestionError("historical_snapshot_submission_not_enabled", run_id)
+    if not isinstance(run_id, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", run_id, re.IGNORECASE
+    ):
+        raise SnapshotIngestionError("invalid_run_id")
+    prepared, batches, counts, target = _prepare_historical_records(
+        records, mode=mode, state_kind=state_kind, base_snapshot=base_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    # Use one stable identifier across manual workflow retries. A readiness failure
+    # must never cause the caller to mint a different run after an ambiguous write.
+    readiness_opener = None if opener is urllib.request.urlopen else opener
+    verify_historical_snapshot_readiness(endpoint, token, opener=readiness_opener)
+    return _submit_prepared_records(
+        prepared, batches, counts, mode="historical", base=None, target=target,
+        endpoint=endpoint, token=token, run_id=run_id, opener=opener,
+        max_commit_attempts=max_commit_attempts,
+    )
+
+
 def ingest_snapshot_candidates(
     candidate_bundle: object,
     *,
@@ -348,76 +562,11 @@ def ingest_snapshot_candidates(
     }
     if dry_run:
         return summary
-
-    if not isinstance(token, str) or not token:
-        raise SnapshotIngestionError("ingestion_configuration_missing", run_id, "start")
-    ingest_url = _ingest_url(endpoint)
-    common = {"action": "start", "run_id": run_id, "source": "folketinget", "mode": mode, "state_kind": "snapshot"}
-    started = _post(ingest_url, token, {
-        **common,
-        "expected_batches": len(batches),
-        "collection_complete": True,
-        "base_snapshot": base.to_dict() if base else None,
-        "target_snapshot": target.to_dict(),
-    }, run_id, "start", opener)
-    _require_run_response(started, run_id, "start")
-    state = started.get("status")
-    expected_batches = started.get("expected_batches")
-    if (started.get("accepted") is not True or started.get("state_kind") != "snapshot"
-            or state not in {"OPEN", "COMMITTING", "COMMITTED", "BLOCKED"}
-            or isinstance(expected_batches, bool) or not isinstance(expected_batches, int)
-            or expected_batches != len(batches)):
-        raise SnapshotIngestionError("worker_response_invalid", run_id, "start")
-    if state != "OPEN" and started.get("idempotent") is not True:
-        raise SnapshotIngestionError("worker_response_invalid", run_id, "start")
-
-    accepted = 0
-    if state == "OPEN":
-        for index, batch in enumerate(batches):
-            result = _post(ingest_url, token, {"action": "batch", "run_id": run_id, "batch_index": index, "records": batch}, run_id, "batch", opener)
-            _require_run_response(result, run_id, "batch")
-            batch_count = result.get("accepted_records")
-            if (result.get("accepted") is not True or result.get("batch_index") != index
-                    or isinstance(batch_count, bool) or not isinstance(batch_count, int)
-                    or batch_count != len(batch)):
-                raise SnapshotIngestionError("worker_response_invalid", run_id, "batch")
-            accepted += batch_count
-
-    attempts = max_commit_attempts
-    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1 or attempts > MAX_COMMIT_ATTEMPTS:
-        raise SnapshotIngestionError("commit_retry_limit_invalid", run_id, "commit")
-    result: dict[str, Any] | None = None
-    for _ in range(attempts):
-        result = _post(ingest_url, token, {"action": "commit", "run_id": run_id}, run_id, "commit", opener)
-        _require_run_response(result, run_id, "commit")
-        status = result.get("status")
-        if status == "COMMITTING":
-            processed = result.get("processed_records")
-            remaining = result.get("remaining_records")
-            if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not False
-                    or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0
-                    or isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0):
-                raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
-            continue
-        if status == "COMMITTED":
-            generation = result.get("snapshot_generation")
-            processed = result.get("processed_records")
-            if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not True
-                    or isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
-                    or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0):
-                raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
-            summary.update({"status": status, "accepted_records": accepted, "snapshot_advanced": True, "snapshot_generation": generation})
-            return summary
-        if status == "BLOCKED":
-            if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not False
-                    or ("error" in result and result.get("error") != "incomplete_publication")):
-                raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
-            summary.update({"status": status, "accepted_records": accepted, "snapshot_advanced": False})
-            return summary
-        raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
-    if result and result.get("status") == "COMMITTING":
-        raise SnapshotIngestionError("commit_retry_limit", run_id, "commit")
-    raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
+    return _submit_prepared_records(
+        records, batches, counts, mode=mode, base=base, target=target,
+        endpoint=endpoint, token=token, run_id=run_id, opener=opener,
+        max_commit_attempts=max_commit_attempts,
+    )
 
 
 def _read_json_file(path: Path) -> object:

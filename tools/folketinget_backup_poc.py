@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,7 @@ CLASSIFY_SNAPSHOT_CANDIDATES = "CLASSIFY_SNAPSHOT_CANDIDATES"
 PREPARE_SNAPSHOT_INGESTION = "PREPARE_SNAPSHOT_INGESTION"
 SNAPSHOT_INGESTION_DRY_RUN = "SNAPSHOT_INGESTION_DRY_RUN"
 HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN = "HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN"
+HISTORICAL_SNAPSHOT_BASELINE_LIVE = "HISTORICAL_SNAPSHOT_BASELINE_LIVE"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
@@ -104,6 +106,7 @@ def validate_mode(value: str) -> str:
         PREPARE_SNAPSHOT_INGESTION,
         SNAPSHOT_INGESTION_DRY_RUN,
         HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
+        HISTORICAL_SNAPSHOT_BASELINE_LIVE,
     }:
         raise PocError("workflow_mode_invalid")
     return value
@@ -1335,10 +1338,10 @@ def discover_candidate_provider_schema(
         raise PocError(error_category) from None
 
 
-def run_historical_baseline_dry_run(
+def _prepare_historical_baseline_handoff(
     manifest_context: dict[str, Any], provider: Any, *, progress_callback: Any = None
-) -> dict[str, Any]:
-    """Prove the full baseline, then validate its private prepared-record dry-run handoff."""
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, str]]:
+    """Run the full proof once and retain selected records only for internal handoff."""
     try:
         import folketinget_historical_baseline as historical_baseline
         from collectors import snapshot_ingestion_client
@@ -1414,7 +1417,242 @@ def run_historical_baseline_dry_run(
                 "submission_eligible": True,
             }
     summary["snapshot_client_dry_run"] = client_result
+    if not isinstance(selected_records, list):
+        raise PocError("historical_handoff_count_mismatch")
+    target_metadata = manifest_context["report"]["new"]
+    target_identity = {
+        "backup_sha256": target_metadata["backup_sha256"],
+        "backup_finish_date": target_metadata["backup_finish_date"],
+        "schema_fingerprint": target_metadata["schema_fingerprint"],
+    }
+    return summary, selected_records, target_identity
+
+
+def run_historical_baseline_dry_run(
+    manifest_context: dict[str, Any], provider: Any, *, progress_callback: Any = None
+) -> dict[str, Any]:
+    """Prove the full baseline, then validate its private prepared-record dry-run handoff."""
+    summary, _, _ = _prepare_historical_baseline_handoff(
+        manifest_context, provider, progress_callback=progress_callback
+    )
     return summary
+
+
+def workflow_historical_run_id(workflow_run_id: str) -> str:
+    """Derive a stable UUIDv4-shaped ID from one GitHub Actions run ID."""
+    if not isinstance(workflow_run_id, str) or not re.fullmatch(r"[0-9]+", workflow_run_id):
+        raise PocError("workflow_run_id_invalid")
+    value = bytearray(hashlib.sha256(("DenmarkTgBot:Folketinget:historical:" + workflow_run_id).encode()).digest()[:16])
+    value[6] = (value[6] & 0x0F) | 0x40
+    value[8] = (value[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(value)))
+
+
+def run_historical_baseline_live(
+    manifest_context: dict[str, Any],
+    provider: Any,
+    *,
+    endpoint: str,
+    token: str,
+    workflow_run_id: str,
+    progress_callback: Any = None,
+    opener: Any = None,
+) -> dict[str, Any]:
+    """Prove the full universe, then submit the exact prepared historical selection."""
+    from collectors import snapshot_ingestion_client
+
+    summary, selected_records, target_identity = _prepare_historical_baseline_handoff(
+        manifest_context, provider, progress_callback=progress_callback
+    )
+    run_id = workflow_historical_run_id(workflow_run_id)
+    result: dict[str, Any] = {
+        "status": "FAIL", "run_id": run_id, "final_ingestion_status": "NOT_STARTED",
+        "snapshot_generation": None, "snapshot_advanced": False,
+    }
+    if historical_baseline_exit_code(summary) != 0:
+        result["failure_category"] = "historical_baseline_incomplete"
+        summary["snapshot_client_live"] = result
+        return summary
+
+    try:
+        submit_kwargs: dict[str, Any] = {
+            "activation_mode": HISTORICAL_SNAPSHOT_BASELINE_LIVE,
+            "mode": "historical",
+            "state_kind": "snapshot",
+            "base_snapshot": None,
+            "target_snapshot": target_identity,
+            "endpoint": endpoint,
+            "token": token,
+            "run_id": run_id,
+        }
+        if opener is not None:
+            submit_kwargs["opener"] = opener
+        client_result = snapshot_ingestion_client.submit_prepared_historical_records(
+            selected_records, **submit_kwargs
+        )
+    except snapshot_ingestion_client.SnapshotIngestionError as error:
+        # Any error after submission begins can be ambiguous. Preserve the same
+        # workflow-derived run ID and never generate a replacement automatically.
+        stage = error.stage
+        final_status = "NOT_STARTED" if stage in {None, "readiness"} else "UNKNOWN"
+        advanced: bool | None = False if final_status == "NOT_STARTED" else None
+        result.update({
+            "failure_category": error.code,
+            "final_ingestion_status": final_status,
+            "snapshot_advanced": advanced,
+        })
+        summary["snapshot_client_live"] = result
+        return summary
+    except Exception:
+        summary["snapshot_client_live"] = {
+            **result, "failure_category": "historical_live_submission_failed",
+            "final_ingestion_status": "UNKNOWN", "snapshot_advanced": None,
+        }
+        return summary
+
+    selected_count = summary.get("selected_historical_ingestion_record_count")
+    client_counts = client_result.get("relevance_counts")
+    if (client_result.get("status") == "BLOCKED"
+            and client_result.get("snapshot_advanced") is False
+            and client_result.get("run_id") == run_id):
+        result.update({
+            "failure_category": "historical_live_run_blocked",
+            "final_ingestion_status": "BLOCKED", "snapshot_advanced": False,
+        })
+        summary["snapshot_client_live"] = result
+        return summary
+    if client_result.get("status") == "COMMITTED":
+        generation = client_result.get("snapshot_generation")
+        processed = client_result.get("processed_records")
+        if isinstance(generation, int) and not isinstance(generation, bool) and generation >= 1:
+            result["snapshot_generation"] = generation
+        if client_result.get("snapshot_advanced") is True:
+            result["snapshot_advanced"] = True
+        if isinstance(processed, int) and not isinstance(processed, bool) and processed >= 0:
+            result["final_ingestion_status"] = "COMMITTED"
+    if (client_result.get("status") != "COMMITTED"
+            or client_result.get("mode") != "historical"
+            or client_result.get("state_kind") != "snapshot"
+            or client_result.get("run_id") != run_id
+            or client_result.get("records") != selected_count
+            or client_result.get("accepted_records") != selected_count
+            or client_result.get("processed_records") != selected_count
+            or client_result.get("batches") != summary.get("selected_historical_ingestion_batch_count")
+            or not isinstance(client_counts, dict)
+            or client_counts.get("DIRECT") != summary.get("DIRECT")
+            or client_counts.get("POTENTIAL") != summary.get("POTENTIAL")
+            or client_result.get("base_snapshot") is not None
+            or client_result.get("target_snapshot") != target_identity
+            or client_result.get("snapshot_advanced") is not True
+            or isinstance(client_result.get("snapshot_generation"), bool)
+            or client_result.get("snapshot_generation") != 1):
+        result.update({
+            "failure_category": "historical_live_commit_contract_mismatch",
+            "final_ingestion_status": "UNKNOWN", "snapshot_advanced": None,
+        })
+    else:
+        result.update({
+            "status": "PASS", "final_ingestion_status": "COMMITTED",
+            "snapshot_generation": 1, "snapshot_advanced": True,
+        })
+    summary["snapshot_client_live"] = result
+    return summary
+
+
+def write_historical_baseline_live_summary(summary: dict[str, Any]) -> None:
+    """Write safe aggregate fields for the one-time historical live workflow."""
+    live = summary.get("snapshot_client_live")
+    if not isinstance(live, dict):
+        raise PocError("historical_live_summary_invalid")
+    status = live.get("status")
+    final_status = live.get("final_ingestion_status")
+    if (not isinstance(status, str) or status not in {"PASS", "FAIL"}
+            or not isinstance(final_status, str)
+            or final_status not in {"NOT_STARTED", "UNKNOWN", "COMMITTED", "BLOCKED"}):
+        raise PocError("historical_live_summary_invalid")
+    run_id = live.get("run_id")
+    if not isinstance(run_id, str) or (run_id != "unknown" and not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", run_id
+    )):
+        raise PocError("historical_live_summary_invalid")
+    advanced = live.get("snapshot_advanced")
+    if advanced is not None and not isinstance(advanced, bool):
+        raise PocError("historical_live_summary_invalid")
+    generation = live.get("snapshot_generation")
+    if generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 1):
+        raise PocError("historical_live_summary_invalid")
+    finish = summary.get("target_backup_finish", "unknown")
+    if finish != "unknown" and (
+        not isinstance(finish, str)
+        or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9:.+\-Z]{1,24}", finish)
+    ):
+        raise PocError("historical_live_summary_invalid")
+    fields: list[str] = []
+    for label, key in (
+        ("full Sag count", "manifest_sag_count"),
+        ("selected record count", "selected_historical_ingestion_record_count"),
+        ("batch count", "selected_historical_ingestion_batch_count"),
+        ("DIRECT count", "DIRECT"),
+        ("POTENTIAL count", "POTENTIAL"),
+    ):
+        value = summary.get(key)
+        if value is None and summary.get("status") == "INCOMPLETE":
+            rendered = "unknown"
+        elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            rendered = str(value)
+        else:
+            raise PocError("historical_live_summary_invalid")
+        fields.append(f"- {label}: {rendered}")
+    failure = live.get("failure_category")
+    if failure is not None and (not isinstance(failure, str) or not re.fullmatch(r"[a-z0-9_]+", failure)):
+        raise PocError("historical_live_summary_invalid")
+    lines = [
+        f"Historical snapshot baseline live submission: {status}",
+        "",
+        *fields,
+        f"- target backup finish: {finish}",
+        f"- run_id: {run_id}",
+        f"- final ingestion status: {final_status}",
+        f"- snapshot generation: {generation if generation is not None else 'unknown'}",
+        f"- snapshot advanced: {str(advanced).lower() if advanced is not None else 'unknown'}",
+    ]
+    if failure:
+        lines.append(f"- error category: {failure}")
+    text = "\n".join(lines) + "\n"
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as output:
+                output.write(text)
+        except OSError:
+            raise PocError("historical_live_summary_write_failed") from None
+    print(text, end="")
+
+
+def historical_baseline_live_exit_code(summary: dict[str, Any]) -> int:
+    live = summary.get("snapshot_client_live")
+    if (summary.get("status") == "PASS" and isinstance(live, dict)
+            and live.get("status") == "PASS" and live.get("final_ingestion_status") == "COMMITTED"
+            and live.get("snapshot_generation") == 1 and live.get("snapshot_advanced") is True):
+        return 0
+    return 2
+
+
+def historical_live_failure_summary(workflow_run_id: str, finish: str | None, category: str) -> dict[str, Any]:
+    try:
+        run_id = workflow_historical_run_id(workflow_run_id)
+    except PocError:
+        run_id = "unknown"
+    safe_category = category if isinstance(category, str) and re.fullmatch(r"[a-z0-9_]+", category) else "historical_live_failed"
+    return {
+        "status": "INCOMPLETE",
+        "target_backup_finish": finish if isinstance(finish, str) else "unknown",
+        "snapshot_client_live": {
+            "status": "FAIL", "run_id": run_id, "final_ingestion_status": "NOT_STARTED",
+            "snapshot_generation": None, "snapshot_advanced": False,
+            "failure_category": safe_category,
+        },
+    }
 
 
 def historical_baseline_progress_reporter() -> Any:
@@ -2302,6 +2540,9 @@ def main() -> int:
     data_dir: Path | None = None
     download_dir: Path | None = None
     candidate_context: dict[str, Any] | None = None
+    historical_context: dict[str, Any] | None = None
+    mode: str | None = None
+    historical_live_summary_written = False
     try:
         mode = validate_mode(os.environ.get("INPUT_MODE", RESTORE_VALIDATE))
         validate_confirmation(os.environ.get("INPUT_CONFIRM_RESTORE", ""))
@@ -2311,8 +2552,10 @@ def main() -> int:
             PREPARE_SNAPSHOT_INGESTION,
             SNAPSHOT_INGESTION_DRY_RUN,
         }
-        historical_mode = mode == HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN
-        historical_context: dict[str, Any] | None = None
+        historical_mode = mode in {
+            HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
+            HISTORICAL_SNAPSHOT_BASELINE_LIVE,
+        }
         if mode in candidate_modes:
             candidate_context = validate_candidate_manifest_inputs(
                 Path(os.environ.get("OLD_MANIFEST_PATH", "")),
@@ -2333,7 +2576,10 @@ def main() -> int:
         require_x64_ubuntu24(platform.machine(), release)
         runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
         initial_free = free_bytes(runner_temp)
-        quiet_modes = candidate_modes | {HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN}
+        quiet_modes = candidate_modes | {
+            HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
+            HISTORICAL_SNAPSHOT_BASELINE_LIVE,
+        }
         if mode not in quiet_modes:
             print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
         check_free_space(initial_free, 8 * GIB)
@@ -2413,7 +2659,7 @@ def main() -> int:
         entities = validate_entities(password)
         if entities["missing"] or entities["no_primary_key"]:
             raise PocError("required_entity_validation_failed")
-        if mode == HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN:
+        if mode in {HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN, HISTORICAL_SNAPSHOT_BASELINE_LIVE}:
             if historical_context is None:
                 raise PocError("historical_manifest_context_missing")
             print("progress=historical_baseline_schema_discovery")
@@ -2428,13 +2674,28 @@ def main() -> int:
             )
             provider = create_candidate_sql_provider(password, entities, provider_schemas)
             print("progress=historical_baseline_start")
-            baseline_summary = run_historical_baseline_dry_run(
-                historical_context, provider, progress_callback=historical_baseline_progress_reporter()
-            )
-            write_historical_baseline_summary(baseline_summary)
-            if historical_baseline_exit_code(baseline_summary) != 0:
-                print("restore_validation=INCOMPLETE")
-                return 2
+            if mode == HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN:
+                baseline_summary = run_historical_baseline_dry_run(
+                    historical_context, provider, progress_callback=historical_baseline_progress_reporter()
+                )
+                write_historical_baseline_summary(baseline_summary)
+                if historical_baseline_exit_code(baseline_summary) != 0:
+                    print("restore_validation=INCOMPLETE")
+                    return 2
+            else:
+                baseline_summary = run_historical_baseline_live(
+                    historical_context,
+                    provider,
+                    endpoint=os.environ.get("INGEST_API_URL", ""),
+                    token=os.environ.get("INGEST_API_TOKEN", ""),
+                    workflow_run_id=os.environ.get("GITHUB_RUN_ID", ""),
+                    progress_callback=historical_baseline_progress_reporter(),
+                )
+                historical_live_summary_written = True
+                write_historical_baseline_live_summary(baseline_summary)
+                if historical_baseline_live_exit_code(baseline_summary) != 0:
+                    print("restore_validation=FAIL")
+                    return 2
             print("restore_validation=PASS")
         elif mode in candidate_modes:
             if candidate_context is None:
@@ -2542,9 +2803,29 @@ def main() -> int:
             write_summary(summary)
             print("restore_validation=PASS")
     except PocError as exc:
+        if mode == HISTORICAL_SNAPSHOT_BASELINE_LIVE and not historical_live_summary_written:
+            try:
+                failure_summary = historical_live_failure_summary(
+                    os.environ.get("GITHUB_RUN_ID", ""),
+                    (historical_context or {}).get("report", {}).get("new", {}).get("backup_finish_date"),
+                    exc.category,
+                )
+                write_historical_baseline_live_summary(failure_summary)
+            except PocError:
+                pass
         print(f"restore_validation=FAIL category={exc.category}", file=sys.stderr)
         return_code = 2
     except Exception:
+        if mode == HISTORICAL_SNAPSHOT_BASELINE_LIVE and not historical_live_summary_written:
+            try:
+                failure_summary = historical_live_failure_summary(
+                    os.environ.get("GITHUB_RUN_ID", ""),
+                    (historical_context or {}).get("report", {}).get("new", {}).get("backup_finish_date"),
+                    "unexpected_internal_error",
+                )
+                write_historical_baseline_live_summary(failure_summary)
+            except PocError:
+                pass
         print("restore_validation=FAIL category=unexpected_internal_error", file=sys.stderr)
         return_code = 2
     else:
@@ -2552,6 +2833,7 @@ def main() -> int:
     finally:
         os.environ.pop("ODA_BACKUP_USERNAME", None)
         os.environ.pop("ODA_BACKUP_PASSWORD", None)
+        os.environ.pop("INGEST_API_TOKEN", None)
         try:
             cleanup(password, backup_dir, data_dir, download_dir)
         except PocError as exc:
