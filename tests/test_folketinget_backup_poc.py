@@ -528,6 +528,10 @@ class BackupPocSafetyTests(unittest.TestCase):
             "prepared_record_count": 2, "DIRECT": 1, "POTENTIAL": 0, "IRRELEVANT": 1,
             "notification_blocked_count": 1, "ingestion_batch_count": 1, "largest_batch_records": 2,
             "largest_batch_bytes": 500, "incomplete_case_count": 1,
+            "provider_adaptive_splits": 4, "provider_adaptive_split_successes": 0,
+            "provider_max_split_depth": 2, "provider_terminal_singleton_failures": 2,
+            "provider_terminal_transport_row_shapes": {"null_token": 1, "missing_separator_ascii": 1},
+            "provider_terminal_transport_line_length_buckets": {"1-16": 1, "17-64": 1},
             "diagnostics": {
                 "missing_status": 1,
                 "source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_json_invalid": 120,
@@ -541,6 +545,10 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("Historical snapshot baseline dry-run: INCOMPLETE", rendered)
         self.assertEqual(POC.historical_baseline_exit_code(summary), 2)
         self.assertIn("missing_status: 1", rendered)
+        self.assertIn("provider terminal singleton failures: 2", rendered)
+        self.assertIn("null_token: 1", rendered)
+        self.assertIn("missing_separator_ascii: 1", rendered)
+        self.assertIn("1-16: 1", rendered)
         self.assertIn("source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_json_invalid: 120", rendered)
         self.assertNotIn("DO NOT PRINT", rendered)
         self.assertNotIn("987654", rendered)

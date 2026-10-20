@@ -211,7 +211,7 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
             def find_by_field(self, entity, field, values):
                 if entity == "SagDokument" and field == "sagid":
                     raise SQLProviderError(
-                        "provider_transport_failed", transport_category="manifest_page_json_invalid"
+                        "provider_transport_failed", transport_category="manifest_page_chunk_row_invalid"
                     )
                 return super().find_by_field(entity, field, values)
 
@@ -220,9 +220,13 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "INCOMPLETE")
         self.assertEqual(result["diagnostics"].get("source_lookup_failed"), 1)
-        categorized = "source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_json_invalid"
+        categorized = "source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_chunk_row_invalid"
         self.assertEqual(result["diagnostics"].get(categorized), 1)
         self.assertEqual(result["incomplete_case_count"], 0)
+        # This synthetic provider raises directly and has no adaptive summary;
+        # terminal transport counters are owned by SQLServerFolketingetProvider.
+        self.assertEqual(result["provider_terminal_singleton_failures"], 0)
+        self.assertEqual(result["provider_terminal_transport_row_shapes"], {})
         self.assertTrue(BASELINE.candidate_extraction.is_safe_diagnostic_code(categorized))
 
     def test_historical_baseline_recovers_when_transient_lookup_failure_splits(self):
@@ -269,6 +273,7 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
         self.assertGreater(result["provider_adaptive_splits"], 0)
         self.assertGreater(result["provider_adaptive_split_successes"], 0)
         self.assertEqual(result["provider_max_split_depth"], 1)
+        self.assertEqual(result["provider_terminal_singleton_failures"], 0)
         self.assertEqual(result["diagnostics"], {})
 
 

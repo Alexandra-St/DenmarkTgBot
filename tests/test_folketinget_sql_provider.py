@@ -106,6 +106,9 @@ class SQLServerProviderTests(unittest.TestCase):
                     "adaptive_split_count": 3,
                     "adaptive_split_success_count": 1,
                     "adaptive_split_max_depth": 2,
+                    "adaptive_terminal_failure_count": 0,
+                    "adaptive_terminal_failures_by_row_shape": {},
+                    "adaptive_terminal_failures_by_line_length_bucket": {},
                 })
 
     def test_nonretryable_errors_and_single_value_failures_propagate_without_splitting(self) -> None:
@@ -130,7 +133,9 @@ class SQLServerProviderTests(unittest.TestCase):
             self.assertEqual(provider.adaptive_summary()["adaptive_split_count"], 0)
 
         persistent = PROVIDER_MODULE.SQLProviderError(
-            "provider_transport_failed", transport_category="manifest_page_chunk_row_invalid"
+            "provider_transport_failed", transport_category="manifest_page_chunk_row_invalid",
+            transport_row_shape="null_token", transport_line_length_bucket="1-16",
+            transport_separator_count_bucket="0",
         )
         calls = []
 
@@ -147,6 +152,9 @@ class SQLServerProviderTests(unittest.TestCase):
             "adaptive_split_count": 0,
             "adaptive_split_success_count": 0,
             "adaptive_split_max_depth": 0,
+            "adaptive_terminal_failure_count": 1,
+            "adaptive_terminal_failures_by_row_shape": {"null_token": 1},
+            "adaptive_terminal_failures_by_line_length_bucket": {"1-16": 1},
         })
 
     def test_adaptive_split_merge_preserves_duplicate_conflict_protection(self) -> None:
@@ -187,6 +195,8 @@ class SQLServerProviderTests(unittest.TestCase):
         self.assertEqual(metrics["adaptive_split_count"], 499)
         self.assertEqual(metrics["adaptive_split_success_count"], 1)
         self.assertEqual(metrics["adaptive_split_max_depth"], 9)
+        self.assertEqual(metrics["adaptive_terminal_failure_count"], 0)
+        self.assertEqual(metrics["adaptive_terminal_failures_by_row_shape"], {})
         self.assertEqual(calls, 999)
         self.assertLessEqual(metrics["adaptive_split_max_depth"], PROVIDER_MODULE.MAX_ADAPTIVE_SPLIT_DEPTH)
         rendered = json.dumps(metrics)
@@ -200,6 +210,9 @@ class SQLServerProviderTests(unittest.TestCase):
             "adaptive_split_count": 0,
             "adaptive_split_success_count": 0,
             "adaptive_split_max_depth": 0,
+            "adaptive_terminal_failure_count": 0,
+            "adaptive_terminal_failures_by_row_shape": {},
+            "adaptive_terminal_failures_by_line_length_bucket": {},
         })
 
     def test_sql_uses_only_allowlisted_projection_and_chunk_transport(self) -> None:
@@ -406,6 +419,30 @@ class SQLServerProviderTests(unittest.TestCase):
         self.assertEqual(smoke_error.exception.category, "sql_provider_get_by_ids_provider_transport_failed")
         self.assertIn("transport_category=manifest_page_chunk_row_invalid", err.getvalue())
         self.assertNotIn("private", out.getvalue() + err.getvalue())
+
+    def test_parser_row_shape_metadata_propagates_through_provider_error_safely(self) -> None:
+        import folketinget_sql_provider as canonical_provider
+
+        provider = canonical_provider.SQLServerFolketingetProvider(
+            SCHEMAS,
+            lambda query, entity: POC.run_provider_chunked_json("private", query, entity),
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(POC, "run_manifest_page_sql", return_value="NULL\n"), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(canonical_provider.SQLProviderError) as raised:
+                provider.get_by_ids("Sag", [987654])
+        error = raised.exception
+        self.assertEqual(error.category, "provider_transport_failed")
+        self.assertEqual(error.transport_category, "manifest_page_chunk_row_invalid")
+        self.assertEqual(error.transport_row_shape, "null_token")
+        self.assertEqual(error.transport_line_length_bucket, "1-16")
+        self.assertEqual(error.transport_separator_count_bucket, "0")
+        self.assertEqual(provider.adaptive_summary()["adaptive_terminal_failure_count"], 1)
+        self.assertEqual(provider.adaptive_summary()["adaptive_terminal_failures_by_row_shape"], {"null_token": 1})
+        self.assertEqual(provider.adaptive_summary()["adaptive_terminal_failures_by_line_length_bucket"], {"1-16": 1})
+        for private in ("987654", "private", "NULL", "SELECT", "payload"):
+            self.assertNotIn(private, out.getvalue() + err.getvalue())
 
     def test_provider_shape_errors_are_distinguished_without_field_leakage(self) -> None:
         import folketinget_sql_provider as canonical_provider

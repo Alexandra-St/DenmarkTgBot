@@ -34,10 +34,14 @@ if TOOLS_DIRECTORY not in sys.path:
 import folketinget_snapshot_manifest as snapshot_manifest
 import folketinget_snapshot_diff as snapshot_diff
 from folketinget_sql_transport import (
+    CHUNK_LINE_LENGTH_BUCKETS,
+    CHUNK_ROW_SHAPES,
+    CHUNK_SEPARATOR_COUNT_BUCKETS,
     MANIFEST_BASE64_CHUNK_SIZE,
     MANIFEST_MAX_BASE64_CHUNKS,
     MANIFEST_SQL_ROW_WIDTH,
     build_chunked_json_query as _build_chunked_json_query,
+    classify_chunk_row_structure,
     quote_identifier as _quote_identifier,
 )
 
@@ -68,8 +72,20 @@ SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
 class PocError(Exception):
     """Safe error category; messages must not contain external values."""
 
-    def __init__(self, category: str) -> None:
+    def __init__(
+        self,
+        category: str,
+        *,
+        row_shape_category: str | None = None,
+        line_length_bucket: str | None = None,
+        separator_count_bucket: str | None = None,
+    ) -> None:
         self.category = category
+        self.row_shape_category = row_shape_category if row_shape_category in CHUNK_ROW_SHAPES else None
+        self.line_length_bucket = line_length_bucket if line_length_bucket in CHUNK_LINE_LENGTH_BUCKETS else None
+        self.separator_count_bucket = (
+            separator_count_bucket if separator_count_bucket in CHUNK_SEPARATOR_COUNT_BUCKETS else None
+        )
         super().__init__(category)
 
 
@@ -835,13 +851,27 @@ def parse_manifest_page_output(output: str, *, entity: str, offset: int) -> str:
     chunk_count = len(lines)
     encoded_chars = 0
 
-    def fail(stage: str, category: str) -> None:
+    def fail(stage: str, category: str, *, line: str | None = None) -> None:
+        structural = classify_chunk_row_structure(line) if stage == "row" and line is not None else None
+        detail_log = ""
+        detail_kwargs: dict[str, str] = {}
+        if structural is not None:
+            row_shape, line_bucket, separator_bucket = structural
+            detail_log = (
+                f" row_shape={row_shape} line_length_bucket={line_bucket} "
+                f"separator_count_bucket={separator_bucket}"
+            )
+            detail_kwargs = {
+                "row_shape_category": row_shape,
+                "line_length_bucket": line_bucket,
+                "separator_count_bucket": separator_bucket,
+            }
         print(
             f"manifest_page_parse_failure entity={entity} offset={offset} "
-            f"chunk_count={chunk_count} encoded_chars={encoded_chars} stage={stage} category={category}",
+            f"chunk_count={chunk_count} encoded_chars={encoded_chars} stage={stage} category={category}{detail_log}",
             file=sys.stderr,
         )
-        raise PocError(category)
+        raise PocError(category, **detail_kwargs)
 
     if not lines or chunk_count > MANIFEST_MAX_BASE64_CHUNKS:
         fail("sequence", "manifest_page_chunk_sequence_invalid")
@@ -849,7 +879,7 @@ def parse_manifest_page_output(output: str, *, entity: str, offset: int) -> str:
     for expected_sequence, line in enumerate(lines, start=1):
         parts = line.split("|")
         if len(parts) != 2 or not re.fullmatch(r"[1-9][0-9]{0,4}", parts[0]):
-            fail("row", "manifest_page_chunk_row_invalid")
+            fail("row", "manifest_page_chunk_row_invalid", line=line)
         sequence = int(parts[0], 10)
         chunk = parts[1]
         encoded_chars += len(chunk)
@@ -1939,6 +1969,7 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
         "IRRELEVANT", "notification_blocked_count", "ingestion_batch_count", "largest_batch_records",
         "largest_batch_bytes", "incomplete_case_count", "provider_adaptive_splits",
         "provider_adaptive_split_successes", "provider_max_split_depth",
+        "provider_terminal_singleton_failures",
     )
     if summary.get("status") not in {"PASS", "INCOMPLETE"}:
         raise PocError("historical_baseline_summary_invalid")
@@ -1966,6 +1997,26 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise PocError("historical_baseline_summary_invalid")
         diagnostic_lines.append(f"  - {code}: {count}")
+    terminal_shapes = summary.get("provider_terminal_transport_row_shapes", {})
+    terminal_lengths = summary.get("provider_terminal_transport_line_length_buckets", {})
+    for values_map, allowed in (
+        (terminal_shapes, CHUNK_ROW_SHAPES),
+        (terminal_lengths, CHUNK_LINE_LENGTH_BUCKETS),
+    ):
+        if not isinstance(values_map, dict) or any(
+            key not in allowed or isinstance(count, bool) or not isinstance(count, int) or count < 1
+            for key, count in values_map.items()
+        ):
+            raise PocError("historical_baseline_summary_invalid")
+        if sum(values_map.values()) > clean["provider_terminal_singleton_failures"]:
+            raise PocError("historical_baseline_summary_invalid")
+    row_shape_lines = [
+        f"  - {shape}: {terminal_shapes.get(shape, 0)}" for shape in sorted(CHUNK_ROW_SHAPES)
+    ]
+    line_length_order = ("0", "1-16", "17-64", "65-256", ">256")
+    line_length_lines = [
+        f"  - {bucket}: {terminal_lengths.get(bucket, 0)}" for bucket in line_length_order
+    ]
     lines = [
         f"Historical snapshot baseline dry-run: {summary['status']}",
         "",
@@ -1983,6 +2034,11 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
         f"- provider adaptive splits: {clean['provider_adaptive_splits']}",
         f"- provider adaptive split successes: {clean['provider_adaptive_split_successes']}",
         f"- provider max split depth: {clean['provider_max_split_depth']}",
+        f"- provider terminal singleton failures: {clean['provider_terminal_singleton_failures']}",
+        "- terminal transport row shapes:",
+        *row_shape_lines,
+        "- terminal transport line length buckets:",
+        *line_length_lines,
         "- diagnostics:",
         *(diagnostic_lines or ["  - none"]),
         f"- target backup finish: {finish}",

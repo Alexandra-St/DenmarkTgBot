@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -17,7 +18,13 @@ TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
 if TOOLS_DIRECTORY not in sys.path:
     sys.path.insert(0, TOOLS_DIRECTORY)
 
-from folketinget_sql_transport import build_chunked_json_query, quote_identifier
+from folketinget_sql_transport import (
+    CHUNK_LINE_LENGTH_BUCKETS,
+    CHUNK_ROW_SHAPES,
+    CHUNK_SEPARATOR_COUNT_BUCKETS,
+    build_chunked_json_query,
+    quote_identifier,
+)
 
 
 REQUIRED_ENTITIES = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
@@ -78,9 +85,25 @@ MAX_ADAPTIVE_SPLIT_DEPTH = 9  # ceil(log2(MAX_IDS_PER_QUERY))
 class SQLProviderError(Exception):
     """Safe provider failure category; contains no SQL or row data."""
 
-    def __init__(self, category: str, *, transport_category: str | None = None) -> None:
+    def __init__(
+        self,
+        category: str,
+        *,
+        transport_category: str | None = None,
+        transport_row_shape: str | None = None,
+        transport_line_length_bucket: str | None = None,
+        transport_separator_count_bucket: str | None = None,
+    ) -> None:
         self.category = category
         self.transport_category = transport_category
+        self.transport_row_shape = transport_row_shape if transport_row_shape in CHUNK_ROW_SHAPES else None
+        self.transport_line_length_bucket = (
+            transport_line_length_bucket if transport_line_length_bucket in CHUNK_LINE_LENGTH_BUCKETS else None
+        )
+        self.transport_separator_count_bucket = (
+            transport_separator_count_bucket
+            if transport_separator_count_bucket in CHUNK_SEPARATOR_COUNT_BUCKETS else None
+        )
         super().__init__(category)
 
 
@@ -110,6 +133,9 @@ class SQLServerFolketingetProvider:
         self._adaptive_split_count = 0
         self._adaptive_split_success_count = 0
         self._adaptive_split_max_depth = 0
+        self._adaptive_terminal_failure_count = 0
+        self._adaptive_terminal_row_shapes: Counter[str] = Counter()
+        self._adaptive_terminal_line_lengths: Counter[str] = Counter()
         self._column_types: dict[str, dict[str, str]] = {entity: {} for entity in REQUIRED_ENTITIES}
         if column_types is not None:
             if set(column_types) != set(REQUIRED_ENTITIES):
@@ -184,7 +210,11 @@ class SQLServerFolketingetProvider:
                 )
             ):
                 raise SQLProviderError(
-                    "provider_transport_failed", transport_category=transport_category
+                    "provider_transport_failed",
+                    transport_category=transport_category,
+                    transport_row_shape=getattr(exc, "row_shape_category", None),
+                    transport_line_length_bucket=getattr(exc, "line_length_bucket", None),
+                    transport_separator_count_bucket=getattr(exc, "separator_count_bucket", None),
                 ) from None
             raise SQLProviderError("provider_query_failed") from None
         rows = self._parse_rows(payload, entity)
@@ -238,10 +268,14 @@ class SQLServerFolketingetProvider:
         try:
             return self._query(entity, field, values)
         except SQLProviderError as error:
-            if (error.category != "provider_transport_failed"
-                    or error.transport_category not in ADAPTIVE_RETRY_TRANSPORT_CATEGORIES
-                    or len(values) <= 1
-                    or depth >= MAX_ADAPTIVE_SPLIT_DEPTH):
+            retryable = (
+                error.category == "provider_transport_failed"
+                and error.transport_category in ADAPTIVE_RETRY_TRANSPORT_CATEGORIES
+            )
+            if retryable and len(values) == 1:
+                self._record_adaptive_terminal_failure(error)
+                raise
+            if (not retryable or len(values) <= 1 or depth >= MAX_ADAPTIVE_SPLIT_DEPTH):
                 raise
             midpoint = len(values) // 2
             left, right = values[:midpoint], values[midpoint:]
@@ -258,12 +292,23 @@ class SQLServerFolketingetProvider:
                 self._adaptive_split_success_count += 1
             return merged
 
-    def adaptive_summary(self) -> dict[str, int]:
+    def _record_adaptive_terminal_failure(self, error: SQLProviderError) -> None:
+        self._adaptive_terminal_failure_count += 1
+        row_shape = error.transport_row_shape
+        self._adaptive_terminal_row_shapes[row_shape if row_shape in CHUNK_ROW_SHAPES else "other"] += 1
+        line_bucket = error.transport_line_length_bucket
+        if line_bucket in CHUNK_LINE_LENGTH_BUCKETS:
+            self._adaptive_terminal_line_lengths[line_bucket] += 1
+
+    def adaptive_summary(self) -> dict[str, object]:
         """Return aggregate-only adaptive query metrics; never includes lookup values."""
         return {
             "adaptive_split_count": self._adaptive_split_count,
             "adaptive_split_success_count": self._adaptive_split_success_count,
             "adaptive_split_max_depth": self._adaptive_split_max_depth,
+            "adaptive_terminal_failure_count": self._adaptive_terminal_failure_count,
+            "adaptive_terminal_failures_by_row_shape": dict(sorted(self._adaptive_terminal_row_shapes.items())),
+            "adaptive_terminal_failures_by_line_length_bucket": dict(sorted(self._adaptive_terminal_line_lengths.items())),
         }
 
     def _lookup(self, entity: str, field: str, values: Sequence[int]) -> tuple[Mapping[str, object], ...]:

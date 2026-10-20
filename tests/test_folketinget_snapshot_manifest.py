@@ -310,10 +310,66 @@ class FolketingetManifestTests(unittest.TestCase):
                 self.assertRegex(
                     rendered,
                     rf"^manifest_page_parse_failure entity=Sag offset=9 chunk_count=\d+ encoded_chars=\d+ "
-                    rf"stage={stage} category={re.escape(category)}\n$",
+                    rf"stage={stage} category={re.escape(category)}"
+                    + (r" row_shape=[a-z_]+ line_length_bucket=(?:0|1-16|17-64|65-256|>256) "
+                       r"separator_count_bucket=(?:0|1|>1)" if stage == "row" else "")
+                    + r"\n$",
                 )
                 for private in ("SECRET_HEADER", "SECRET_SEPARATOR", "UNEXPECTED_LINE", "not JSON", "WwBd"):
                     self.assertNotIn(private, rendered)
+
+    def test_chunk_row_shape_classification_is_safe_and_bucketed(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_row_shape_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        classify = poc.classify_chunk_row_structure
+        cases = {
+            "NULL": ("null_token", "1-16", "0"),
+            "": ("empty_or_whitespace", "0", "0"),
+            " \t": ("empty_or_whitespace", "1-16", "0"),
+            "Sqlcmd: Error: client issue": ("sqlcmd_message", "17-64", "0"),
+            "Msg 245, Level 16, State 1": ("sql_message", "17-64", "0"),
+            "(1 rows affected)": ("rows_affected", "17-64", "0"),
+            "12345": ("numeric_only", "1-16", "0"),
+            "private diagnostic": ("missing_separator_ascii", "17-64", "0"),
+            "søger efter fejl i output": ("missing_separator_non_ascii", "17-64", "0"),
+            "1|ABC|DEF": ("extra_separator", "1-16", ">1"),
+            "x|WwBd": ("invalid_sequence", "1-16", "1"),
+            "1|WwB!": ("invalid_base64_shape", "1-16", "1"),
+            "1|WwBd": ("other", "1-16", "1"),
+        }
+        for line, expected in cases.items():
+            with self.subTest(expected=expected[0]):
+                self.assertEqual(classify(line), expected)
+        self.assertEqual(classify("a" * 16)[1], "1-16")
+        self.assertEqual(classify("a" * 17)[1], "17-64")
+        self.assertEqual(classify("a" * 65)[1], "65-256")
+        self.assertEqual(classify("a" * 257)[1], ">256")
+
+    def test_row_shape_parser_log_and_error_keep_only_allowlisted_metadata(self) -> None:
+        poc_spec = importlib.util.spec_from_file_location(
+            "folketinget_backup_poc_row_shape_error_test", ROOT / "tools" / "folketinget_backup_poc.py"
+        )
+        poc = importlib.util.module_from_spec(poc_spec)
+        assert poc_spec.loader is not None
+        poc_spec.loader.exec_module(poc)
+        output = StringIO()
+        raw_line = "PRIVATE ROW DATA without separators"
+        with self.assertRaises(poc.PocError) as raised:
+            with redirect_stderr(output):
+                poc.parse_manifest_page_output(raw_line + "\n", entity="Sag", offset=4)
+        self.assertEqual(raised.exception.category, "manifest_page_chunk_row_invalid")
+        self.assertEqual(raised.exception.row_shape_category, "missing_separator_ascii")
+        self.assertEqual(raised.exception.line_length_bucket, "17-64")
+        self.assertEqual(raised.exception.separator_count_bucket, "0")
+        diagnostic = output.getvalue()
+        self.assertIn("row_shape=missing_separator_ascii", diagnostic)
+        self.assertIn("line_length_bucket=17-64", diagnostic)
+        self.assertIn("separator_count_bucket=0", diagnostic)
+        self.assertNotIn(raw_line, diagnostic)
 
     def test_manifest_chunk_diagnostics_do_not_leak_payload(self) -> None:
         poc_spec = importlib.util.spec_from_file_location(

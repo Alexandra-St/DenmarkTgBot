@@ -22,6 +22,7 @@ from collectors.relevance import DIRECT, IRRELEVANT, POTENTIAL, RULESET_VERSION
 import folketinget_candidate_extraction as candidate_extraction
 import folketinget_snapshot_diff as snapshot_diff
 import folketinget_snapshot_manifest as snapshot_manifest
+from folketinget_sql_transport import CHUNK_LINE_LENGTH_BUCKETS, CHUNK_ROW_SHAPES
 
 
 MAX_SAGS_PER_HYDRATION = 250
@@ -93,7 +94,7 @@ def _iter_sag_id_batches(path: Path, batch_size: int):
         connection.close()
 
 
-def _adaptive_provider_metrics(provider: object) -> dict[str, int]:
+def _adaptive_provider_metrics(provider: object) -> dict[str, object]:
     """Read only the SQL provider's aggregate counters, with a zero default for other providers."""
     getter = getattr(provider, "adaptive_summary", None)
     if getter is None:
@@ -101,6 +102,9 @@ def _adaptive_provider_metrics(provider: object) -> dict[str, int]:
             "provider_adaptive_splits": 0,
             "provider_adaptive_split_successes": 0,
             "provider_max_split_depth": 0,
+            "provider_terminal_singleton_failures": 0,
+            "provider_terminal_transport_row_shapes": {},
+            "provider_terminal_transport_line_length_buckets": {},
         }
     if not callable(getter):
         raise HistoricalBaselineError("provider_metrics_invalid")
@@ -114,13 +118,27 @@ def _adaptive_provider_metrics(provider: object) -> dict[str, int]:
         result.get("adaptive_split_count"),
         result.get("adaptive_split_success_count"),
         result.get("adaptive_split_max_depth"),
+        result.get("adaptive_terminal_failure_count", 0),
     )
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
         raise HistoricalBaselineError("provider_metrics_invalid")
+    row_shapes = result.get("adaptive_terminal_failures_by_row_shape", {})
+    line_buckets = result.get("adaptive_terminal_failures_by_line_length_bucket", {})
+    for values_map, allowed in ((row_shapes, CHUNK_ROW_SHAPES), (line_buckets, CHUNK_LINE_LENGTH_BUCKETS)):
+        if not isinstance(values_map, dict) or any(
+            key not in allowed or isinstance(count, bool) or not isinstance(count, int) or count < 1
+            for key, count in values_map.items()
+        ):
+            raise HistoricalBaselineError("provider_metrics_invalid")
+        if sum(values_map.values()) > values[3]:
+            raise HistoricalBaselineError("provider_metrics_invalid")
     return {
         "provider_adaptive_splits": values[0],
         "provider_adaptive_split_successes": values[1],
         "provider_max_split_depth": values[2],
+        "provider_terminal_singleton_failures": values[3],
+        "provider_terminal_transport_row_shapes": dict(sorted(row_shapes.items())),
+        "provider_terminal_transport_line_length_buckets": dict(sorted(line_buckets.items())),
     }
 
 
