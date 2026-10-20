@@ -223,6 +223,8 @@ class SQLServerProviderTests(unittest.TestCase):
         for field in PROVIDER_MODULE.PROJECTIONS["Afstemning"]:
             self.assertIn(f"[{field}] AS [{field}]", query)
         self.assertIn("FOR JSON PATH, INCLUDE_NULL_VALUES", query)
+        self.assertIn("SET @provider_json = COALESCE((SELECT ", query)
+        self.assertIn("), N'[]');", query)
         self.assertIn("BASE64_ENCODE(CONVERT(varbinary(max), @provider_json))", query)
         self.assertIn("varchar(6000)", query)
         self.assertIn("ORDER BY sequence_number", query)
@@ -235,6 +237,16 @@ class SQLServerProviderTests(unittest.TestCase):
         self.assertIn("-W", argv)
         self.assertNotIn("-y", argv)
         self.assertEqual(argv[argv.index("-w") + 1], "6100")
+
+    def test_empty_provider_lookup_uses_valid_encoded_empty_array(self) -> None:
+        encoded_empty_array = "1|" + base64.b64encode("[]".encode("utf-16-le")).decode("ascii")
+        provider = PROVIDER_MODULE.SQLServerFolketingetProvider(
+            SCHEMAS,
+            lambda query, entity: POC.run_provider_chunked_json("private", query, entity),
+        )
+        with mock.patch.object(POC, "run_manifest_page_sql", return_value=encoded_empty_array):
+            self.assertEqual(provider.find_by_field("Afstemning", "sagstrinid", [7654321]), ())
+        self.assertEqual(provider.adaptive_summary()["adaptive_terminal_failure_count"], 0)
 
     def test_shared_transport_imports_in_either_order_without_poc_dependency(self) -> None:
         scripts = (
@@ -277,6 +289,15 @@ class SQLServerProviderTests(unittest.TestCase):
         self.assertIn("CAST(sequence_number AS varchar(5)) + '|'", query)
         self.assertIn("ORDER BY sequence_number", query)
         self.assertIn("OPTION (MAXRECURSION 30000)", query)
+        self.assertIn("SET @provider_json = COALESCE((SELECT ", query)
+        manifest_query = transport.build_chunked_json_query(
+            "SELECT [id] FROM [dbo].[Sag] FOR JSON PATH", variable="manifest"
+        )
+        self.assertEqual(manifest_query, transport.build_chunked_json_query(
+            "SELECT [id] FROM [dbo].[Sag] FOR JSON PATH", variable="manifest"
+        ))
+        self.assertIn("SET @manifest_json = COALESCE((SELECT ", manifest_query)
+        self.assertIn("), N'[]');", manifest_query)
 
     def test_provider_validation_unexpected_sample_error_is_phase_categorized(self) -> None:
         entities = {"objects": {entity: ("dbo", "USER_TABLE") for entity in ENTITIES}}

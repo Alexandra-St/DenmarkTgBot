@@ -212,7 +212,8 @@ class FolketingetManifestTests(unittest.TestCase):
         self.assertIn("varchar(6000)", query)
         self.assertIn("varchar(6006)", query)
         self.assertIn("ORDER BY sequence_number", query)
-        self.assertIn("SET @manifest_json = (SELECT", query)
+        self.assertIn("SET @manifest_json = COALESCE((SELECT", query)
+        self.assertIn("), N'[]');", query)
         self.assertNotIn("private", query)
 
     def test_manifest_page_converts_legacy_text_types_before_for_json(self) -> None:
@@ -288,6 +289,7 @@ class FolketingetManifestTests(unittest.TestCase):
         poc_spec.loader.exec_module(poc)
         malformed_outputs = (
             ("not-a-row\n", "manifest_page_chunk_row_invalid", "row"),
+            ("NULL\n", "manifest_page_chunk_row_invalid", "row"),
             ("1|" + "A" * 6000 + "\n3|WwBd\n", "manifest_page_chunk_sequence_invalid", "sequence"),
             ("1|" + "A" * 6000 + "\n1|WwBd\n", "manifest_page_chunk_sequence_invalid", "sequence"),
             ("2|WwBd\n", "manifest_page_chunk_sequence_invalid", "sequence"),
@@ -306,6 +308,8 @@ class FolketingetManifestTests(unittest.TestCase):
                     with redirect_stderr(diagnostic):
                         poc.parse_manifest_page_output(malformed, entity="Sag", offset=9)
                 self.assertEqual(raised.exception.category, category)
+                if malformed == "NULL\n":
+                    self.assertEqual(raised.exception.row_shape_category, "null_token")
                 rendered = diagnostic.getvalue()
                 self.assertRegex(
                     rendered,

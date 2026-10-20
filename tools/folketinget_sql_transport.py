@@ -85,7 +85,7 @@ def build_chunked_json_query(select_query: str, *, variable: str) -> str:
     b64_variable = f"@{variable}_b64"
     return (
         f"SET NOCOUNT ON; DECLARE {json_variable} nvarchar(max); "
-        f"SET {json_variable} = ({select_query}); "
+        f"SET {json_variable} = COALESCE(({select_query}), N'[]'); "
         f"DECLARE {b64_variable} varchar(max); "
         f"SET {b64_variable} = BASE64_ENCODE(CONVERT(varbinary(max), {json_variable})); "
         ";WITH chunk_sequence AS ("
