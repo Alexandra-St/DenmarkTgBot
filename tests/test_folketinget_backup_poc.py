@@ -659,6 +659,17 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("class NoRedirect", preflight)
         self.assertIn("response.read(4097)", preflight)
         self.assertIn("len(raw_body) > 4096", preflight)
+        http_error_handler = preflight.index("except urllib.error.HTTPError as error:")
+        url_error_handler = preflight.index("except (urllib.error.URLError, TimeoutError, OSError")
+        self.assertLess(http_error_handler, url_error_handler)
+        for category in (
+            "worker_unauthorized", "worker_forbidden", "readiness_endpoint_not_found",
+            "readiness_method_not_allowed", "worker_server_error", "worker_http_error",
+        ):
+            self.assertIn(category, preflight)
+        self.assertIn("finish(\"FAIL\", category, http_status=http_status)", preflight)
+        self.assertIn("finish(\"FAIL\", \"worker_request_failed\")", preflight)
+        self.assertNotIn("error.read()", preflight)
         self.assertIn("inputs.mode != 'HISTORICAL_SNAPSHOT_PRODUCTION_PREFLIGHT'", workflow)
         self.assertNotIn("actions/download-artifact@v8", preflight)
         self.assertNotIn("curl", preflight)

@@ -72,7 +72,7 @@ jobs:
               def redirect_request(self, request, response, code, message, headers, new_url):
                   return None
 
-          def finish(status, category=None, readiness=None):
+          def finish(status, category=None, readiness=None, http_status=None):
               fields = []
               if readiness is not None:
                   fields = [
@@ -86,6 +86,8 @@ jobs:
               lines = [f"Production snapshot readiness preflight: {status}", "", *fields]
               if category:
                   lines.extend(["", f"- Error category: {category}"])
+              if http_status is not None:
+                  lines.append(f"- HTTP status: {http_status}")
               report = "\n".join(lines) + "\n"
               print(report, end="")
               summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -126,6 +128,23 @@ jobs:
                       finish("FAIL", "readiness_response_invalid")
                       sys.exit(2)
                   body = json.loads(raw_body.decode("utf-8"))
+          except urllib.error.HTTPError as error:
+              http_status = error.code
+              if http_status == 401:
+                  category = "worker_unauthorized"
+              elif http_status == 403:
+                  category = "worker_forbidden"
+              elif http_status == 404:
+                  category = "readiness_endpoint_not_found"
+              elif http_status == 405:
+                  category = "readiness_method_not_allowed"
+              elif 500 <= http_status <= 599:
+                  category = "worker_server_error"
+              else:
+                  category = "worker_http_error"
+              error.close()
+              finish("FAIL", category, http_status=http_status)
+              sys.exit(2)
           except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError):
               finish("FAIL", "worker_request_failed")
               sys.exit(2)
