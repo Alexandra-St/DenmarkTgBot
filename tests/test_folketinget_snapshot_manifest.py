@@ -49,7 +49,15 @@ def schema() -> dict[str, object]:
 
 
 def schemas() -> dict[str, dict[str, object]]:
-    return {entity: schema() for entity in MANIFEST.REQUIRED_ENTITIES}
+    result = {entity: schema() for entity in MANIFEST.REQUIRED_ENTITIES}
+    route_fields = {"Sag": ("statusid",), "Sagstrin": ("sagid",), "SagDokument": ("sagid", "dokumentid"),
+                    "Dokument": (), "Afstemning": ("sagstrinid",), "Sagsstatus": ()}
+    for entity, fields in route_fields.items():
+        columns = result[entity]["columns"]
+        for field in fields:
+            columns.append({"ordinal": len(columns) + 1, "name": field, "type_name": "int", "max_length": 4,
+                            "precision": 10, "scale": 0, "nullable": 1, "key_ordinal": 0, "collation": None})
+    return result
 
 
 class FolketingetManifestTests(unittest.TestCase):
@@ -92,7 +100,12 @@ class FolketingetManifestTests(unittest.TestCase):
 
     def _build(self, path: pathlib.Path, pages: dict[str, list[dict[str, object]]], counts: dict[str, int]):
         def fetch(entity: str, _schema_name: str, _schema: dict[str, object], offset: int, limit: int) -> str:
-            return json.dumps(pages[entity][offset : offset + limit], ensure_ascii=False)
+            selected = [dict(row) for row in pages[entity][offset : offset + limit]]
+            for row in selected:
+                identifier = row["c0000"]
+                for index, field in enumerate(MANIFEST.ROUTING_FIELDS[entity], start=4):
+                    row.setdefault(f"c{index:04d}", identifier)
+            return json.dumps(selected, ensure_ascii=False)
 
         return MANIFEST.build_manifest(
             path,
@@ -116,14 +129,32 @@ class FolketingetManifestTests(unittest.TestCase):
             path = pathlib.Path(directory) / "manifest.sqlite"
             result = self._build(path, pages, counts)
             self.assertEqual(result["total_rows"], 6)
+            self.assertEqual(result["manifest_format_version"], 2)
+            self.assertEqual(result["schema_fingerprint"], MANIFEST.schema_fingerprint(schemas()))
             self.assertEqual(result["validation"], "PASS")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             with sqlite3.connect(path) as db:
                 columns = [row[1] for row in db.execute('PRAGMA table_info("rows")')]
                 self.assertEqual(columns, ["entity", "canonical_key", "full_hash", "semantic_hash"])
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM "rows"').fetchone()[0], 6)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM routing").fetchone()[0], 6)
+                self.assertEqual(db.execute("SELECT manifest_format_version,routing_row_count FROM snapshot_metadata").fetchone(), (2, 6))
                 self.assertEqual(db.execute('SELECT length(full_hash), length(semantic_hash) FROM "rows" LIMIT 1').fetchone(), (32, 32))
+                self.assertTrue({"routing_sagid_idx", "routing_dokumentid_idx", "routing_sagstrinid_idx", "routing_statusid_idx"}
+                                .issubset({row[1] for row in db.execute('PRAGMA index_list("routing")')}))
             self.assertNotIn(b"PRIVATE ROW CONTENT", path.read_bytes())
+
+    def test_routing_schema_requires_integer_relationship_fields_even_when_empty(self) -> None:
+        source = schemas()
+        source["Sagstrin"]["columns"] = [column for column in source["Sagstrin"]["columns"] if column["name"] != "sagid"]
+        pages = {entity: [] for entity in MANIFEST.REQUIRED_ENTITIES}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(MANIFEST.ManifestError) as raised:
+                MANIFEST.build_manifest(pathlib.Path(directory) / "manifest.sqlite", backup_sha256="a" * 64,
+                                        backup_finish_date="timestamp", source_sql_major=17, schemas=source,
+                                        expected_counts={entity: 0 for entity in MANIFEST.REQUIRED_ENTITIES},
+                                        fetch_page=lambda *_: "[]")
+        self.assertEqual(raised.exception.category, "manifest_routing_schema_invalid")
 
     def test_duplicate_canonical_keys_are_rejected_and_partial_manifest_removed(self) -> None:
         pages = {entity: [] for entity in MANIFEST.REQUIRED_ENTITIES}

@@ -16,6 +16,15 @@ from typing import Any, Callable
 
 
 REQUIRED_ENTITIES = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
+FORMAT_VERSION = 2
+ROUTING_FIELDS = {
+    "Sag": ("statusid",),
+    "Sagstrin": ("sagid",),
+    "SagDokument": ("sagid", "dokumentid"),
+    "Dokument": (),
+    "Afstemning": ("sagstrinid",),
+    "Sagsstatus": (),
+}
 DEFAULT_BATCH_SIZE = 5000
 MAX_BATCH_JSON_BYTES = 64 * 1024 * 1024
 SUPPORTED_SQL_TYPES = frozenset(
@@ -228,6 +237,27 @@ def _row_hash_inputs(entity: str, schema: dict[str, Any], row: dict[str, Any]) -
     return canonical_key, full_hash, semantic_hash
 
 
+def _routing_values(entity: str, schema: dict[str, Any], row: dict[str, Any]) -> tuple[int, int | None, int | None, int | None, int | None]:
+    """Return the minimal integer routing projection; source contents never persist here."""
+    columns = schema["columns"]
+    aliases = {column["name"].casefold(): f"c{index:04d}" for index, column in enumerate(columns)}
+    required = {"id", *ROUTING_FIELDS[entity]}
+    if not required.issubset(aliases):
+        raise ManifestError("manifest_routing_schema_invalid")
+    values: dict[str, int | None] = {}
+    for name in required:
+        column = next(column for column in columns if column["name"].casefold() == name)
+        if column["type_name"] not in {"tinyint", "smallint", "int", "bigint"}:
+            raise ManifestError("manifest_routing_schema_invalid")
+        value = _sql_value(row[aliases[name]], column["type_name"])
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ManifestError("manifest_routing_row_invalid")
+        if name == "id" and value is None:
+            raise ManifestError("manifest_routing_row_invalid")
+        values[name] = value
+    return values["id"], values.get("sagid"), values.get("dokumentid"), values.get("sagstrinid"), values.get("statusid")
+
+
 def _decode_json_page(payload: str | bytes) -> list[dict[str, Any]]:
     if isinstance(payload, bytes):
         if len(payload) > MAX_BATCH_JSON_BYTES:
@@ -273,6 +303,14 @@ def build_manifest(
     if generated_at is None:
         generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     normalized_schemas = {entity: normalize_schema(entity, schemas[entity]) for entity in REQUIRED_ENTITIES}
+    for entity, schema in normalized_schemas.items():
+        if schema["primary_key"] != ["id"]:
+            raise ManifestError("manifest_primary_key_missing_or_invalid")
+        by_name = {column["name"].casefold(): column for column in schema["columns"]}
+        for name in {"id", *ROUTING_FIELDS[entity]}:
+            column = by_name.get(name)
+            if column is None or column["type_name"] not in {"tinyint", "smallint", "int", "bigint"}:
+                raise ManifestError("manifest_routing_schema_invalid")
     fingerprint = hashlib.sha256(canonical_json_bytes([normalized_schemas[entity] for entity in REQUIRED_ENTITIES])).hexdigest()
     manifest_path = Path(manifest_path)
     manifest_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -289,12 +327,19 @@ def build_manifest(
             "CREATE TABLE snapshot_metadata ("
             "singleton INTEGER PRIMARY KEY CHECK(singleton=1), backup_sha256 TEXT NOT NULL, "
             "backup_finish_date TEXT NOT NULL, source_sql_major INTEGER NOT NULL, "
-            "schema_fingerprint TEXT NOT NULL, generated_at TEXT NOT NULL, total_rows INTEGER NOT NULL);"
+            "schema_fingerprint TEXT NOT NULL, generated_at TEXT NOT NULL, total_rows INTEGER NOT NULL, "
+            "manifest_format_version INTEGER NOT NULL, routing_row_count INTEGER NOT NULL);"
             "CREATE TABLE entity_counts (entity TEXT PRIMARY KEY, row_count INTEGER NOT NULL) WITHOUT ROWID;"
             'CREATE TABLE "rows" (entity TEXT NOT NULL, canonical_key TEXT NOT NULL, '
             "full_hash BLOB NOT NULL CHECK(length(full_hash)=32), "
             "semantic_hash BLOB NOT NULL CHECK(length(semantic_hash)=32), "
             "PRIMARY KEY(entity, canonical_key)) WITHOUT ROWID;"
+            "CREATE TABLE routing (entity TEXT NOT NULL, row_id INTEGER NOT NULL, sagid INTEGER, dokumentid INTEGER, "
+            "sagstrinid INTEGER, statusid INTEGER, PRIMARY KEY(entity,row_id)) WITHOUT ROWID;"
+            "CREATE INDEX routing_sagid_idx ON routing(sagid) WHERE sagid IS NOT NULL;"
+            "CREATE INDEX routing_dokumentid_idx ON routing(dokumentid) WHERE entity='SagDokument' AND dokumentid IS NOT NULL;"
+            "CREATE INDEX routing_sagstrinid_idx ON routing(sagstrinid) WHERE entity='Afstemning' AND sagstrinid IS NOT NULL;"
+            "CREATE INDEX routing_statusid_idx ON routing(statusid) WHERE entity='Sag' AND statusid IS NOT NULL;"
         )
         total_rows = 0
         per_entity: dict[str, int] = {}
@@ -316,9 +361,14 @@ def build_manifest(
                     with connection:
                         for row in page:
                             canonical_key, full_hash, semantic_hash = _row_hash_inputs(entity, schema, row)
+                            routing = _routing_values(entity, schema, row)
                             connection.execute(
                                 'INSERT INTO "rows" (entity, canonical_key, full_hash, semantic_hash) VALUES (?, ?, ?, ?)',
                                 (entity, canonical_key, full_hash, semantic_hash),
+                            )
+                            connection.execute(
+                                "INSERT INTO routing(entity,row_id,sagid,dokumentid,sagstrinid,statusid) VALUES (?,?,?,?,?,?)",
+                                (entity, *routing),
                             )
                 except sqlite3.IntegrityError:
                     raise ManifestError("duplicate_canonical_key") from None
@@ -338,15 +388,17 @@ def build_manifest(
             total_rows += count
             per_entity[entity] = count
         connection.execute(
-            "INSERT INTO snapshot_metadata VALUES (1,?,?,?,?,?,?)",
-            (backup_sha256.lower(), backup_finish_date, source_sql_major, fingerprint, generated_at, total_rows),
+            "INSERT INTO snapshot_metadata VALUES (1,?,?,?,?,?,?,?,?)",
+            (backup_sha256.lower(), backup_finish_date, source_sql_major, fingerprint, generated_at, total_rows, FORMAT_VERSION, total_rows),
         )
         connection.commit()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if integrity != ("ok",):
             raise ManifestError("manifest_integrity_check_failed")
         stored_total = connection.execute('SELECT COUNT(*) FROM "rows"').fetchone()[0]
-        if stored_total != total_rows:
+        routing_total = connection.execute("SELECT COUNT(*) FROM routing").fetchone()[0]
+        per_entity_routing = dict(connection.execute("SELECT entity,COUNT(*) FROM routing GROUP BY entity"))
+        if stored_total != total_rows or routing_total != total_rows or per_entity_routing != per_entity:
             raise ManifestError("manifest_row_count_mismatch")
         connection.execute("VACUUM")
         connection.close()
@@ -355,6 +407,8 @@ def build_manifest(
         return {
             "schema_fingerprint": fingerprint,
             "total_rows": total_rows,
+            "manifest_format_version": FORMAT_VERSION,
+            "routing_row_count": routing_total,
             "entity_counts": per_entity,
             "manifest_bytes": manifest_path.stat().st_size,
             "validation": "PASS",

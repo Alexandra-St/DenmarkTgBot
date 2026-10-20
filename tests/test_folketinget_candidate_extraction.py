@@ -58,24 +58,50 @@ def canonical_key(entity: str, identifier: int) -> str:
                       sort_keys=True, separators=(",", ":"))
 
 
-def make_manifest(path: pathlib.Path, rows: dict[str, list[tuple[str, int, int]]], *, backup: str) -> None:
+def make_manifest(path: pathlib.Path, rows: dict[str, list[tuple[str, int, int]]], *, backup: str,
+                  routing: dict[tuple[str, int], dict[str, int | None]] | None = None, format_version: int = 2) -> None:
     total = sum(len(items) for items in rows.values())
+    routing = routing or {}
     with sqlite3.connect(path) as db:
+        metadata_columns = ("manifest_format_version INTEGER NOT NULL, routing_row_count INTEGER NOT NULL") if format_version == 2 else ""
         db.executescript(
             "CREATE TABLE snapshot_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), backup_sha256 TEXT NOT NULL, "
             "backup_finish_date TEXT NOT NULL, source_sql_major INTEGER NOT NULL, schema_fingerprint TEXT NOT NULL, "
-            "generated_at TEXT NOT NULL, total_rows INTEGER NOT NULL);"
+            f"generated_at TEXT NOT NULL, total_rows INTEGER NOT NULL{', ' + metadata_columns if metadata_columns else ''});"
             "CREATE TABLE entity_counts (entity TEXT PRIMARY KEY, row_count INTEGER NOT NULL) WITHOUT ROWID;"
             'CREATE TABLE "rows" (entity TEXT NOT NULL, canonical_key TEXT NOT NULL, full_hash BLOB NOT NULL CHECK(length(full_hash)=32), '
             "semantic_hash BLOB NOT NULL CHECK(length(semantic_hash)=32), PRIMARY KEY(entity, canonical_key)) WITHOUT ROWID;"
+            + ("CREATE TABLE routing (entity TEXT NOT NULL,row_id INTEGER NOT NULL,sagid INTEGER,dokumentid INTEGER,sagstrinid INTEGER,statusid INTEGER,PRIMARY KEY(entity,row_id)) WITHOUT ROWID;"
+               "CREATE INDEX routing_sagid_idx ON routing(sagid) WHERE sagid IS NOT NULL;"
+               "CREATE INDEX routing_dokumentid_idx ON routing(dokumentid) WHERE entity='SagDokument' AND dokumentid IS NOT NULL;"
+               "CREATE INDEX routing_sagstrinid_idx ON routing(sagstrinid) WHERE entity='Afstemning' AND sagstrinid IS NOT NULL;"
+               "CREATE INDEX routing_statusid_idx ON routing(statusid) WHERE entity='Sag' AND statusid IS NOT NULL;" if format_version == 2 else "")
         )
-        db.execute("INSERT INTO snapshot_metadata VALUES (1, ?, ?, 17, ?, ?, ?)",
-                   (backup * 64, "2026-10-18T02:00:00Z", "a" * 64, "2026-10-18T03:00:00Z", total))
+        if format_version == 2:
+            db.execute("INSERT INTO snapshot_metadata VALUES (1, ?, ?, 17, ?, ?, ?, 2, ?)",
+                       (backup * 64, "2026-10-18T02:00:00Z", "a" * 64, "2026-10-18T03:00:00Z", total, total))
+        else:
+            db.execute("INSERT INTO snapshot_metadata VALUES (1, ?, ?, 17, ?, ?, ?)",
+                       (backup * 64, "2026-10-18T02:00:00Z", "a" * 64, "2026-10-18T03:00:00Z", total))
         for entity in ENTITIES:
             entity_rows = rows.get(entity, [])
             db.execute("INSERT INTO entity_counts VALUES (?, ?)", (entity, len(entity_rows)))
             db.executemany('INSERT INTO "rows" VALUES (?, ?, ?, ?)',
                            ((entity, key, bytes([full]) * 32, bytes([semantic]) * 32) for key, full, semantic in entity_rows))
+            if format_version == 2:
+                for key, _full, _semantic in entity_rows:
+                    try:
+                        identifier = json.loads(key)["key"][0][2]
+                    except (ValueError, KeyError, IndexError, TypeError):
+                        continue
+                    values = routing.get((entity, identifier), {})
+                    defaults = {"sagid": identifier, "dokumentid": identifier, "sagstrinid": identifier, "statusid": identifier}
+                    defaults.update(values)
+                    db.execute("INSERT INTO routing VALUES (?,?,?,?,?,?)",
+                               (entity, identifier, defaults.get("sagid") if entity in {"Sagstrin", "SagDokument"} else None,
+                                defaults.get("dokumentid") if entity == "SagDokument" else None,
+                                defaults.get("sagstrinid") if entity == "Afstemning" else None,
+                                defaults.get("statusid") if entity == "Sag" else None))
 
 
 class CandidateExtractionTests(unittest.TestCase):
@@ -88,7 +114,9 @@ class CandidateExtractionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def build(self, changes: list[tuple[str, str, int]], source_rows: dict[str, list[dict[str, object]]]):
+    def build(self, changes: list[tuple[str, str, int]], source_rows: dict[str, list[dict[str, object]]], *,
+              old_routing: dict[tuple[str, int], dict[str, int | None]] | None = None, old_format: int = 2,
+              max_affected_cases: int = CANDIDATES.MAX_AFFECTED_CASES):
         new_rows: dict[str, list[tuple[str, int, int]]] = {entity: [] for entity in ENTITIES}
         old_rows: dict[str, list[tuple[str, int, int]]] = {entity: [] for entity in ENTITIES}
         for entity, category, identifier in changes:
@@ -109,10 +137,10 @@ class CandidateExtractionTests(unittest.TestCase):
                 old_rows[entity].append((key, 1, 1))
         self.old.unlink(missing_ok=True)
         self.new.unlink(missing_ok=True)
-        make_manifest(self.old, old_rows, backup="1")
+        make_manifest(self.old, old_rows, backup="1", routing=old_routing, format_version=old_format)
         make_manifest(self.new, new_rows, backup="2")
         provider = CANDIDATES.InMemoryFolketingetProvider(source_rows)
-        return CANDIDATES.extract_candidates(self.old, self.new, provider)
+        return CANDIDATES.extract_candidates(self.old, self.new, provider, max_affected_cases=max_affected_cases)
 
     def test_direct_sag_addition_produces_classifier_compatible_case(self) -> None:
         title = "Fordrevne fra Ukraine"
@@ -180,15 +208,69 @@ class CandidateExtractionTests(unittest.TestCase):
         bundle = self.build([("SagDokument", "removed", 33)], {})
         self.assertFalse(bundle["complete"])
         self.assertEqual(bundle["cases"], [])
-        self.assertIn("removed_change_requires_old_snapshot_hydration", {item["code"] for item in bundle["diagnostics"]})
+        self.assertNotIn("removed_change_requires_old_snapshot_hydration", {item["code"] for item in bundle["diagnostics"]})
+        self.assertIn("affected_case_missing", {item["code"] for item in bundle["diagnostics"]})
         summary = CANDIDATES.candidate_summary(bundle)
         self.assertEqual(summary["diff"]["totals"]["removed"], 1)
+
+    def test_removed_sag_resolves_its_own_case_id_but_cannot_hydrate_deleted_case(self) -> None:
+        bundle = self.build([("Sag", "removed", 10)], {})
+        self.assertFalse(bundle["complete"])
+        self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
+        self.assertIn("affected_case_missing", {item["code"] for item in bundle["diagnostics"]})
+
+    def test_removed_sagstrin_and_sagdokument_use_old_sagid(self) -> None:
+        for entity, source in (("Sagstrin", {"Sag": [sag(10)], "Sagstrin": [stage(99, 10)]}),
+                              ("SagDokument", {"Sag": [sag(10)]})):
+            bundle = self.build([(entity, "removed", 33)], source,
+                                old_routing={(entity, 33): {"sagid": 10}})
+            self.assertTrue(bundle["complete"], entity)
+            self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
+            self.assertEqual(bundle["cases"][0]["external_id"], "10")
+
+    def test_removed_document_routes_through_old_sagdokument(self) -> None:
+        bundle = self.build([("Dokument", "removed", 20), ("SagDokument", "removed", 30)],
+                            {"Sag": [sag(10)]},
+                            old_routing={("Dokument", 20): {}, ("SagDokument", 30): {"sagid": 10, "dokumentid": 20}})
+        self.assertTrue(bundle["complete"])
+        self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
+
+    def test_removed_vote_routes_through_old_stage(self) -> None:
+        bundle = self.build([("Afstemning", "removed", 40), ("Sagstrin", "unchanged", 50)],
+                            {"Sag": [sag(10)], "Sagstrin": [stage(50, 10)]},
+                            old_routing={("Afstemning", 40): {"sagstrinid": 50}, ("Sagstrin", 50): {"sagid": 10}})
+        self.assertTrue(bundle["complete"])
+        self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
+
+    def test_removed_status_routes_to_all_old_sags_and_deduplicates(self) -> None:
+        bundle = self.build([("Sagsstatus", "removed", 60), ("Sag", "changed", 10)],
+                            {"Sag": [sag(10)]},
+                            old_routing={("Sagsstatus", 60): {}, ("Sag", 10): {"statusid": 60}})
+        self.assertTrue(bundle["complete"])
+        self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
+
+    def test_v1_removed_manifest_remains_incomplete(self) -> None:
+        bundle = self.build([("Sagstrin", "removed", 33)], {"Sag": [sag(10)]}, old_format=1)
+        self.assertFalse(bundle["complete"])
+        self.assertIn("removed_change_requires_old_snapshot_hydration", {d["code"] for d in bundle["diagnostics"]})
+
+    def test_removed_and_current_changes_deduplicate_before_case_limit(self) -> None:
+        bundle = self.build([("Sag", "added", 10), ("Sagstrin", "changed", 22), ("Sagstrin", "removed", 33)],
+                            {"Sag": [sag(10)], "Sagstrin": [stage(22, 10)]},
+                            old_routing={("Sagstrin", 33): {"sagid": 10}})
+        self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
+        with self.assertRaises(CANDIDATES.CandidateExtractionError) as raised:
+            self.build([("Sagstrin", "removed", 31), ("Sagstrin", "removed", 32), ("Sagstrin", "removed", 33)],
+                       {"Sag": [sag(10), sag(11), sag(12)]},
+                       old_routing={("Sagstrin", 31): {"sagid": 10}, ("Sagstrin", 32): {"sagid": 11},
+                                    ("Sagstrin", 33): {"sagid": 12}}, max_affected_cases=2)
+        self.assertEqual(raised.exception.category, "affected_case_limit_exceeded")
 
     def test_malformed_canonical_key_is_rejected_without_disclosing_it(self) -> None:
         make_manifest(self.old, {entity: [] for entity in ENTITIES}, backup="1")
         rows = {entity: [] for entity in ENTITIES}
         rows["Sag"].append(("PRIVATE-MALFORMED-KEY", 1, 1))
-        make_manifest(self.new, rows, backup="2")
+        make_manifest(self.new, rows, backup="2", format_version=1)
         provider = CANDIDATES.InMemoryFolketingetProvider({"Sag": [sag(1)]})
         with self.assertRaises(CANDIDATES.CandidateExtractionError) as raised:
             CANDIDATES.extract_candidates(self.old, self.new, provider)

@@ -247,6 +247,45 @@ def _resolve_affected_sag_ids(
     return set()
 
 
+def _resolve_removed_sag_ids(entity: str, record_id: int, routing: snapshot_diff.ManifestRoutingReader) -> set[int]:
+    """Resolve old-side removals using only validated integer routing metadata."""
+    if entity == "Sag":
+        return {record_id}
+    if entity in {"Sagstrin", "SagDokument"}:
+        row = routing.get_row(entity, record_id)
+        sagid = row.get("sagid") if row else None
+        if not _is_int(sagid):
+            raise snapshot_diff.DiffError("manifest_routing_unresolved")
+        return {sagid}
+    if entity == "Dokument":
+        affected: set[int] = set()
+        for row in routing.iter_by_field("SagDokument", "dokumentid", record_id):
+            if _is_int(row.get("sagid")):
+                affected.add(row["sagid"])
+                if len(affected) > MAX_AFFECTED_CASES:
+                    raise CandidateExtractionError("affected_case_limit_exceeded")
+        return affected
+    if entity == "Afstemning":
+        vote = routing.get_row(entity, record_id)
+        stage_id = vote.get("sagstrinid") if vote else None
+        if not _is_int(stage_id):
+            raise snapshot_diff.DiffError("manifest_routing_unresolved")
+        stage_row = routing.get_row("Sagstrin", stage_id)
+        sagid = stage_row.get("sagid") if stage_row else None
+        if not _is_int(sagid):
+            raise snapshot_diff.DiffError("manifest_routing_unresolved")
+        return {sagid}
+    if entity == "Sagsstatus":
+        affected: set[int] = set()
+        for row in routing.iter_by_field("Sag", "statusid", record_id):
+            if _is_int(row.get("id")):
+                affected.add(row["id"])
+                if len(affected) > MAX_AFFECTED_CASES:
+                    raise CandidateExtractionError("affected_case_limit_exceeded")
+        return affected
+    raise CandidateExtractionError("removed_entity_unsupported")
+
+
 def _hydrate_cases(
     affected_ids: set[int], provider: FolketingetReadOnlyProvider, diagnostics: Counter[str]
 ) -> tuple[tuple[LegislativeCase, ...], int]:
@@ -303,7 +342,8 @@ def extract_candidates(
     diff_counts = _aggregate_diff(diff_report)
     diagnostics: Counter[str] = Counter()
     affected_ids: set[int] = set()
-    removed_seen = False
+    routing: snapshot_diff.ManifestRoutingReader | None = None
+    routing_unavailable = False
     try:
         changes = snapshot_diff._iter_manifest_changes_validated(
             snapshot_diff._manifest_file(old_manifest), snapshot_diff._manifest_file(new_manifest)
@@ -312,7 +352,24 @@ def extract_candidates(
             if category in {"technical_only"}:
                 continue
             if category == "removed":
-                removed_seen = True
+                if routing is None and not routing_unavailable:
+                    try:
+                        routing = snapshot_diff.ManifestRoutingReader(snapshot_diff._manifest_file(old_manifest))
+                    except snapshot_diff.DiffError as error:
+                        if error.category == "manifest_routing_unavailable":
+                            routing_unavailable = True
+                        else:
+                            raise
+                if routing_unavailable:
+                    diagnostics["removed_change_requires_old_snapshot_hydration"] += 1
+                    continue
+                record_id = decode_canonical_key(entity, canonical_key)
+                try:
+                    affected_ids.update(_resolve_removed_sag_ids(entity, record_id, routing))
+                except snapshot_diff.DiffError:
+                    diagnostics["removed_relationship_unresolved"] += 1
+                if len(affected_ids) > max_affected_cases:
+                    raise CandidateExtractionError("affected_case_limit_exceeded")
                 continue
             if category not in {"added", "changed"}:
                 continue
@@ -322,11 +379,9 @@ def extract_candidates(
                 raise CandidateExtractionError("affected_case_limit_exceeded")
     except snapshot_diff.DiffError as error:
         raise CandidateExtractionError(error.category) from None
-
-    if removed_seen:
-        totals = diff_counts.get("totals")
-        removed_total = totals.get("removed", 0) if isinstance(totals, Mapping) else 0
-        diagnostics["removed_change_requires_old_snapshot_hydration"] += int(removed_total)
+    finally:
+        if routing is not None:
+            routing.close()
     cases, hydrated_count = _hydrate_cases(affected_ids, provider, diagnostics)
     payloads: list[dict[str, object]] = []
     for case in cases:
@@ -334,7 +389,7 @@ def extract_candidates(
         payload.update({"historical": False, "notify_eligible": None})
         payloads.append(payload)
     payloads.sort(key=lambda item: str(item.get("external_id", "")))
-    complete = not removed_seen and not diagnostics and all(case.complete for case in cases)
+    complete = not diagnostics and all(case.complete for case in cases)
     return {
         "format_version": FORMAT_VERSION,
         "source": SOURCE,

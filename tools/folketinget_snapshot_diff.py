@@ -30,6 +30,15 @@ EXPECTED_COLUMN_TYPES = {
     "entity_counts": ("TEXT", "INTEGER"),
     "rows": ("TEXT", "TEXT", "BLOB", "BLOB"),
 }
+V2_METADATA_COLUMNS = EXPECTED_TABLE_COLUMNS["snapshot_metadata"] + ("manifest_format_version", "routing_row_count")
+ROUTING_COLUMNS = ("entity", "row_id", "sagid", "dokumentid", "sagstrinid", "statusid")
+ROUTING_INDEXES = {"routing_sagid_idx", "routing_dokumentid_idx", "routing_sagstrinid_idx", "routing_statusid_idx"}
+ROUTING_INDEX_COLUMNS = {
+    "routing_sagid_idx": ("sagid",),
+    "routing_dokumentid_idx": ("dokumentid",),
+    "routing_sagstrinid_idx": ("sagstrinid",),
+    "routing_statusid_idx": ("statusid",),
+}
 
 
 class DiffError(Exception):
@@ -75,9 +84,20 @@ def validate_manifest(path: Path) -> dict[str, Any]:
             )}
         except sqlite3.Error:
             raise DiffError("manifest_structure_invalid") from None
-        if tables != set(EXPECTED_TABLE_COLUMNS):
+        metadata_columns = _table_columns(connection, "snapshot_metadata")
+        if metadata_columns == EXPECTED_TABLE_COLUMNS["snapshot_metadata"]:
+            format_version = 1
+            expected_tables = set(EXPECTED_TABLE_COLUMNS)
+        elif metadata_columns == V2_METADATA_COLUMNS:
+            format_version = 2
+            expected_tables = set(EXPECTED_TABLE_COLUMNS) | {"routing"}
+        else:
             raise DiffError("manifest_structure_invalid")
-        if any(_table_columns(connection, table) != expected for table, expected in EXPECTED_TABLE_COLUMNS.items()):
+        if tables != expected_tables:
+            raise DiffError("manifest_structure_invalid")
+        if any(_table_columns(connection, table) != expected for table, expected in EXPECTED_TABLE_COLUMNS.items() if table != "snapshot_metadata"):
+            raise DiffError("manifest_structure_invalid")
+        if format_version == 2 and _table_columns(connection, "routing") != ROUTING_COLUMNS:
             raise DiffError("manifest_structure_invalid")
 
         # Confirm the v1 primary-key and WITHOUT ROWID layout, not just column names.
@@ -85,30 +105,37 @@ def validate_manifest(path: Path) -> dict[str, Any]:
             rows_info = connection.execute('PRAGMA table_info("rows")').fetchall()
             counts_info = connection.execute('PRAGMA table_info("entity_counts")').fetchall()
             metadata_info = connection.execute('PRAGMA table_info("snapshot_metadata")').fetchall()
+            routing_info = connection.execute('PRAGMA table_info("routing")').fetchall() if format_version == 2 else []
         except sqlite3.Error:
             raise DiffError("manifest_structure_invalid") from None
         if [(row[1], row[5]) for row in rows_info] != [("entity", 1), ("canonical_key", 2), ("full_hash", 0), ("semantic_hash", 0)]:
             raise DiffError("manifest_structure_invalid")
         if [(row[1], row[5]) for row in counts_info] != [("entity", 1), ("row_count", 0)]:
             raise DiffError("manifest_structure_invalid")
-        if [(row[1], row[5]) for row in metadata_info] != [("singleton", 1), ("backup_sha256", 0), ("backup_finish_date", 0), ("source_sql_major", 0), ("schema_fingerprint", 0), ("generated_at", 0), ("total_rows", 0)]:
+        expected_metadata_pk = [("singleton", 1)] + [(name, 0) for name in metadata_columns[1:]]
+        if [(row[1], row[5]) for row in metadata_info] != expected_metadata_pk:
             raise DiffError("manifest_structure_invalid")
-        if any(tuple(row[2].upper() for row in info) != EXPECTED_COLUMN_TYPES[table]
-               for table, info in (("snapshot_metadata", metadata_info), ("entity_counts", counts_info), ("rows", rows_info))):
+        expected_metadata_types = EXPECTED_COLUMN_TYPES["snapshot_metadata"] + (("INTEGER", "INTEGER") if format_version == 2 else ())
+        if (tuple(row[2].upper() for row in metadata_info) != expected_metadata_types
+                or any(tuple(row[2].upper() for row in info) != EXPECTED_COLUMN_TYPES[table]
+                       for table, info in (("entity_counts", counts_info), ("rows", rows_info)))):
             raise DiffError("manifest_structure_invalid")
+        if format_version == 2:
+            if ([(row[1], row[5]) for row in routing_info] != [("entity", 1), ("row_id", 2)] + [(name, 0) for name in ROUTING_COLUMNS[2:]]
+                    or tuple(row[2].upper() for row in routing_info) != ("TEXT", "INTEGER", "INTEGER", "INTEGER", "INTEGER", "INTEGER")):
+                raise DiffError("manifest_structure_invalid")
         try:
             ddl = {name: sql.upper() for name, sql in connection.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('entity_counts','rows')"
+                "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('entity_counts','rows','routing')"
             )}
         except sqlite3.Error:
             raise DiffError("manifest_structure_invalid") from None
-        if any("WITHOUT ROWID" not in ddl.get(table, "") for table in ("entity_counts", "rows")):
+        expected_without_rowid = ("entity_counts", "rows", "routing") if format_version == 2 else ("entity_counts", "rows")
+        if any("WITHOUT ROWID" not in ddl.get(table, "") for table in expected_without_rowid):
             raise DiffError("manifest_structure_invalid")
 
         try:
-            metadata_rows = connection.execute(
-                "SELECT singleton, backup_sha256, backup_finish_date, source_sql_major, schema_fingerprint, generated_at, total_rows FROM snapshot_metadata"
-            ).fetchall()
+            metadata_rows = connection.execute("SELECT * FROM snapshot_metadata").fetchall()
             entity_counts = connection.execute("SELECT entity, row_count FROM entity_counts ORDER BY entity").fetchall()
             actual_counts = connection.execute('SELECT entity, COUNT(*) FROM "rows" GROUP BY entity ORDER BY entity').fetchall()
             total = connection.execute('SELECT COUNT(*) FROM "rows"').fetchone()[0]
@@ -121,7 +148,7 @@ def validate_manifest(path: Path) -> dict[str, Any]:
             raise DiffError("manifest_structure_invalid") from None
         if len(metadata_rows) != 1:
             raise DiffError("manifest_structure_invalid")
-        singleton, backup_sha, finish_date, sql_major, fingerprint, generated_at, declared_total = metadata_rows[0]
+        singleton, backup_sha, finish_date, sql_major, fingerprint, generated_at, declared_total = metadata_rows[0][:7]
         if {entity for entity, _ in entity_counts} != set(manifest.REQUIRED_ENTITIES):
             raise DiffError("manifest_required_entities_invalid")
         if not {entity for entity, _ in actual_counts}.issubset(set(manifest.REQUIRED_ENTITIES)):
@@ -139,14 +166,115 @@ def validate_manifest(path: Path) -> dict[str, Any]:
                 or not isinstance(generated_at, str) or not generated_at
                 or not isinstance(declared_total, int) or declared_total < 0):
             raise DiffError("manifest_metadata_invalid")
+        routing_available = format_version == 2
+        if routing_available:
+            manifest_version, declared_routing = metadata_rows[0][-2:]
+            actual_routing = connection.execute("SELECT COUNT(*) FROM routing").fetchone()[0]
+            route_counts = dict(connection.execute("SELECT entity,COUNT(*) FROM routing GROUP BY entity"))
+            if (manifest_version != 2 or declared_routing != total or actual_routing != total
+                    or {entity: route_counts.get(entity, 0) for entity in manifest.REQUIRED_ENTITIES}
+                    != {entity: actual_count_map.get(entity, 0) for entity in manifest.REQUIRED_ENTITIES}):
+                raise DiffError("manifest_routing_invalid")
+            indexes = {row[1] for row in connection.execute('PRAGMA index_list("routing")')}
+            if not ROUTING_INDEXES.issubset(indexes):
+                raise DiffError("manifest_routing_invalid")
+            for index_name, expected_columns in ROUTING_INDEX_COLUMNS.items():
+                actual_columns = tuple(row[2] for row in connection.execute(f'PRAGMA index_info("{index_name}")'))
+                if actual_columns != expected_columns:
+                    raise DiffError("manifest_routing_invalid")
+            allowed = {entity: {"Sag": ("statusid",), "Sagstrin": ("sagid",), "SagDokument": ("sagid", "dokumentid"),
+                                "Dokument": (), "Afstemning": ("sagstrinid",), "Sagsstatus": ()}[entity]
+                       for entity in manifest.REQUIRED_ENTITIES}
+            try:
+                cursor = connection.execute('SELECT r.entity,r.canonical_key,t.entity,t.row_id,t.sagid,t.dokumentid,t.sagstrinid,t.statusid '
+                                            'FROM "rows" r LEFT JOIN routing t ON t.entity=r.entity '
+                                            "AND t.row_id=json_extract(r.canonical_key,'$.key[0][2]') ORDER BY r.entity,r.canonical_key")
+                batches = iter(lambda: cursor.fetchmany(5000), [])
+                for batch in batches:
+                    for entity, key, route_entity, row_id, sagid, dokumentid, sagstrinid, statusid in batch:
+                        try:
+                            parsed = json.loads(key)
+                            key_fields = parsed["key"]
+                            if (not isinstance(parsed, dict) or set(parsed) != {"entity", "key"} or parsed.get("entity") != entity
+                                    or not isinstance(key_fields, list) or len(key_fields) != 1
+                                    or not isinstance(key_fields[0], list) or len(key_fields[0]) != 3 or key_fields[0][0] != "id"
+                                    or key_fields[0][1] not in {"tinyint", "smallint", "int", "bigint"}
+                                    or isinstance(key_fields[0][2], bool) or not isinstance(key_fields[0][2], int)
+                                    or json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":")) != key):
+                                raise ValueError
+                            decoded = key_fields[0][2]
+                        except (TypeError, ValueError, KeyError, IndexError):
+                            raise DiffError("manifest_routing_invalid") from None
+                        if (route_entity != entity or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id != decoded
+                                or isinstance(decoded, bool) or not isinstance(decoded, int)):
+                            raise DiffError("manifest_routing_invalid")
+                        values = {"sagid": sagid, "dokumentid": dokumentid, "sagstrinid": sagstrinid, "statusid": statusid}
+                        if any(value is not None and (isinstance(value, bool) or not isinstance(value, int)) for value in values.values()):
+                            raise DiffError("manifest_routing_invalid")
+                        if any(values[name] is not None for name in values if name not in allowed[entity]):
+                            raise DiffError("manifest_routing_invalid")
+            except sqlite3.Error:
+                raise DiffError("manifest_routing_invalid") from None
         return {
             "backup_sha256": backup_sha,
             "backup_finish_date": finish_date,
             "schema_fingerprint": fingerprint,
             "total_rows": total,
+            "manifest_format_version": format_version,
+            "routing_available": routing_available,
         }
     finally:
         connection.close()
+
+
+class ManifestRoutingReader:
+    """Read validated old-side routing integers without exposing source rows."""
+
+    _reverse_fields = {
+        "SagDokument": frozenset({"dokumentid"}),
+        "Afstemning": frozenset({"sagstrinid"}),
+        "Sag": frozenset({"statusid"}),
+    }
+
+    def __init__(self, path: Path) -> None:
+        self._path = _manifest_file(path)
+        metadata = validate_manifest(self._path)
+        if not metadata["routing_available"]:
+            raise DiffError("manifest_routing_unavailable")
+        self._connection = _readonly_connection(self._path)
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def get_row(self, entity: str, row_id: int) -> dict[str, int | None] | None:
+        if entity not in manifest.REQUIRED_ENTITIES or isinstance(row_id, bool) or not isinstance(row_id, int):
+            raise DiffError("manifest_routing_lookup_invalid")
+        try:
+            row = self._connection.execute(
+                "SELECT sagid,dokumentid,sagstrinid,statusid FROM routing WHERE entity=? AND row_id=?",
+                (entity, row_id),
+            ).fetchone()
+        except sqlite3.Error:
+            raise DiffError("manifest_routing_invalid") from None
+        if row is None:
+            return None
+        return dict(zip(("sagid", "dokumentid", "sagstrinid", "statusid"), row))
+
+    def iter_by_field(self, entity: str, field: str, value: int) -> Iterator[dict[str, int | None]]:
+        if (entity not in self._reverse_fields or field not in self._reverse_fields[entity]
+                or isinstance(value, bool) or not isinstance(value, int)):
+            raise DiffError("manifest_routing_lookup_invalid")
+        try:
+            cursor = self._connection.execute(
+                f"SELECT row_id,sagid,dokumentid,sagstrinid,statusid FROM routing WHERE entity=? AND {field}=? ORDER BY row_id",
+                (entity, value),
+            )
+            while batch := cursor.fetchmany(1000):
+                for row_id, sagid, dokumentid, sagstrinid, statusid in batch:
+                    yield dict(zip(("id", "sagid", "dokumentid", "sagstrinid", "statusid"),
+                                   (row_id, sagid, dokumentid, sagstrinid, statusid)))
+        except sqlite3.Error:
+            raise DiffError("manifest_routing_invalid") from None
 
 
 def _manifest_file(value: Path) -> Path:

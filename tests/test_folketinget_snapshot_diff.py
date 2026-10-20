@@ -40,7 +40,69 @@ def create_manifest(path: pathlib.Path, records: dict[str, list[tuple[str, bytes
             db.executemany('INSERT INTO "rows" VALUES (?, ?, ?, ?)', ((entity, key, full, semantic) for key, full, semantic in rows))
 
 
+def add_routing_v2(path: pathlib.Path) -> None:
+    with sqlite3.connect(path) as db:
+        db.execute("ALTER TABLE snapshot_metadata ADD COLUMN manifest_format_version INTEGER NOT NULL DEFAULT 2")
+        db.execute("ALTER TABLE snapshot_metadata ADD COLUMN routing_row_count INTEGER NOT NULL DEFAULT 0")
+        db.executescript(
+            "CREATE TABLE routing(entity TEXT NOT NULL,row_id INTEGER NOT NULL,sagid INTEGER,dokumentid INTEGER,"
+            "sagstrinid INTEGER,statusid INTEGER,PRIMARY KEY(entity,row_id)) WITHOUT ROWID;"
+            "CREATE INDEX routing_sagid_idx ON routing(sagid) WHERE sagid IS NOT NULL;"
+            "CREATE INDEX routing_dokumentid_idx ON routing(dokumentid) WHERE entity='SagDokument' AND dokumentid IS NOT NULL;"
+            "CREATE INDEX routing_sagstrinid_idx ON routing(sagstrinid) WHERE entity='Afstemning' AND sagstrinid IS NOT NULL;"
+            "CREATE INDEX routing_statusid_idx ON routing(statusid) WHERE entity='Sag' AND statusid IS NOT NULL;"
+        )
+        for entity, key, _full, _semantic in db.execute('SELECT entity,canonical_key,full_hash,semantic_hash FROM "rows"'):
+            identifier = json.loads(key)["key"][0][2]
+            route = {"sagid": identifier if entity in {"Sagstrin", "SagDokument"} else None,
+                     "dokumentid": identifier if entity == "SagDokument" else None,
+                     "sagstrinid": identifier if entity == "Afstemning" else None,
+                     "statusid": identifier if entity == "Sag" else None}
+            db.execute("INSERT INTO routing VALUES (?,?,?,?,?,?)",
+                       (entity, identifier, route["sagid"], route["dokumentid"], route["sagstrinid"], route["statusid"]))
+        total = db.execute('SELECT COUNT(*) FROM "rows"').fetchone()[0]
+        db.execute("UPDATE snapshot_metadata SET routing_row_count=?", (total,))
+
+
 class FolketingetSnapshotDiffTests(unittest.TestCase):
+    def test_v1_remains_valid_for_diff_but_has_no_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "v1.sqlite"
+            create_manifest(path, {})
+            self.assertEqual(DIFF.validate_manifest(path)["manifest_format_version"], 1)
+            with self.assertRaises(DIFF.DiffError) as raised:
+                DIFF.ManifestRoutingReader(path)
+            self.assertEqual(raised.exception.category, "manifest_routing_unavailable")
+
+    def test_v2_routing_is_integrity_and_count_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "v2.sqlite"
+            key = json.dumps({"entity": "Sagstrin", "key": [["id", "int", 7]]}, sort_keys=True, separators=(",", ":"))
+            create_manifest(path, {"Sagstrin": [(key, b"a" * 32, b"b" * 32)]})
+            add_routing_v2(path)
+            report = DIFF.validate_manifest(path)
+            self.assertEqual(report["manifest_format_version"], 2)
+            self.assertTrue(report["routing_available"])
+            reader = DIFF.ManifestRoutingReader(path)
+            self.assertEqual(reader.get_row("Sagstrin", 7)["sagid"], 7)
+            reader.close()
+            with sqlite3.connect(path) as db:
+                db.execute("DELETE FROM routing")
+            with self.assertRaises(DIFF.DiffError) as raised:
+                DIFF.validate_manifest(path)
+            self.assertEqual(raised.exception.category, "manifest_routing_invalid")
+
+    def test_v2_malformed_integer_routing_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "malformed.sqlite"
+            key = json.dumps({"entity": "Sagstrin", "key": [["id", "int", 7]]}, sort_keys=True, separators=(",", ":"))
+            create_manifest(path, {"Sagstrin": [(key, b"a" * 32, b"b" * 32)]})
+            add_routing_v2(path)
+            with sqlite3.connect(path) as db:
+                db.execute("UPDATE routing SET sagid='not-an-integer'")
+            with self.assertRaises(DIFF.DiffError) as raised:
+                DIFF.validate_manifest(path)
+            self.assertEqual(raised.exception.category, "manifest_routing_invalid")
     def test_all_categories_and_aggregate_report_have_no_row_leakage(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             directory = pathlib.Path(temp)
