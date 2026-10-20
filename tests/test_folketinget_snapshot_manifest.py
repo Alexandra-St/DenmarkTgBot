@@ -189,11 +189,12 @@ class FolketingetManifestTests(unittest.TestCase):
             MANIFEST.schema_fingerprint(inputs)
         self.assertEqual(raised.exception.category, "unsupported_sql_type")
 
-    def test_workflow_upload_is_manual_scoped_short_lived_and_manifest_only(self) -> None:
+    def test_workflow_upload_is_manual_scoped_30_day_baseline_and_manifest_only(self) -> None:
         workflow = (ROOT / ".github/workflows/folketinget-backup-poc.yml").read_text()
         self.assertIn("CREATE_MANIFEST_BASELINE", workflow)
         self.assertIn("uses: actions/upload-artifact@v7", workflow)
-        self.assertIn("retention-days: 2", workflow)
+        baseline_upload = workflow.split("- name: Upload validated manifest only", 1)[1].split("- name: Remove temporary manifest files", 1)[0]
+        self.assertIn("retention-days: 30", baseline_upload)
         self.assertIn("manifest.sqlite", workflow)
         self.assertIn("if: success() && inputs.mode == 'CREATE_MANIFEST_BASELINE'", workflow)
         self.assertIn("if: always() && inputs.mode == 'CREATE_MANIFEST_BASELINE'", workflow)

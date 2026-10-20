@@ -1371,7 +1371,8 @@ else:
         self.assertIn("secrets.ODA_BACKUP_USERNAME", workflow)
         self.assertIn("secrets.ODA_BACKUP_PASSWORD", workflow)
         self.assertIn("uses: actions/upload-artifact@v7", workflow)
-        self.assertIn("retention-days: 2", workflow)
+        baseline_upload = workflow.split("- name: Upload validated manifest only", 1)[1].split("- name: Remove temporary manifest files", 1)[0]
+        self.assertIn("retention-days: 30", baseline_upload)
         self.assertIn("CREATE_MANIFEST_BASELINE", workflow)
         self.assertIn("VALIDATE_SQL_PROVIDER", workflow)
         self.assertIn("if: inputs.mode != 'DIFF_MANIFESTS' && inputs.mode != 'HISTORICAL_SNAPSHOT_PRODUCTION_PREFLIGHT'", workflow)

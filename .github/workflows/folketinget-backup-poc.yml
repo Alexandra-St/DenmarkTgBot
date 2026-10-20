@@ -326,7 +326,7 @@ jobs:
           name: folketinget-snapshot-manifest-${{ github.run_id }}
           path: ${{ runner.temp }}/denmarkbot-folketinget-manifest/manifest.sqlite
           if-no-files-found: error
-          retention-days: 2
+          retention-days: 30
       - name: Remove temporary manifest files
         if: always() && inputs.mode == 'CREATE_MANIFEST_BASELINE'
         env:
