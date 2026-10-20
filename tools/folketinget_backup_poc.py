@@ -1338,13 +1338,14 @@ def discover_candidate_provider_schema(
 def run_historical_baseline_dry_run(
     manifest_context: dict[str, Any], provider: Any, *, progress_callback: Any = None
 ) -> dict[str, Any]:
-    """Call the streaming historical preparer only; never submit or advance state."""
+    """Prove the full baseline, then validate its private prepared-record dry-run handoff."""
     try:
         import folketinget_historical_baseline as historical_baseline
+        from collectors import snapshot_ingestion_client
     except Exception:
         raise PocError("historical_baseline_import_failed") from None
     try:
-        summary = historical_baseline.run_historical_baseline(
+        summary, selected_records = historical_baseline.run_historical_baseline_with_records(
             manifest_context["path"], provider, progress_callback=progress_callback
         )
     except historical_baseline.HistoricalBaselineError as error:
@@ -1353,6 +1354,66 @@ def run_historical_baseline_dry_run(
         raise PocError("historical_baseline_failed") from None
     if not isinstance(summary, dict) or summary.get("status") not in {"PASS", "INCOMPLETE"}:
         raise PocError("historical_baseline_summary_invalid")
+    summary = dict(summary)
+    client_result: dict[str, Any] = {
+        "status": "FAIL", "records": 0, "batches": 0,
+        "DIRECT": 0, "POTENTIAL": 0, "submission_eligible": False,
+    }
+    if summary["status"] == "PASS":
+        if not isinstance(selected_records, list) or len(selected_records) != summary.get(
+            "selected_historical_ingestion_record_count"
+        ):
+            raise PocError("historical_handoff_count_mismatch")
+        try:
+            target_metadata = manifest_context["report"]["new"]
+            target_identity = {
+                "backup_sha256": target_metadata["backup_sha256"],
+                "backup_finish_date": target_metadata["backup_finish_date"],
+                "schema_fingerprint": target_metadata["schema_fingerprint"],
+            }
+            if summary.get("target_backup_finish") != target_identity["backup_finish_date"]:
+                raise PocError("historical_handoff_snapshot_mismatch")
+            client_result = snapshot_ingestion_client.dry_run_prepared_historical_records(
+                selected_records,
+                mode="historical",
+                state_kind="snapshot",
+                dry_run=True,
+                base_snapshot=None,
+                target_snapshot=target_identity,
+            )
+        except snapshot_ingestion_client.SnapshotIngestionError:
+            summary["diagnostics"] = dict(summary.get("diagnostics", {}))
+            summary["diagnostics"]["snapshot_client_dry_run_failed"] = 1
+            summary["status"] = "INCOMPLETE"
+        except PocError:
+            raise
+        except Exception:
+            raise PocError("historical_handoff_failed") from None
+        counts = client_result.get("relevance_counts")
+        expected_records = summary.get("selected_historical_ingestion_record_count")
+        if (client_result.get("records") != expected_records
+                or client_result.get("batches") != summary.get("selected_historical_ingestion_batch_count")
+                or not isinstance(counts, dict)
+                or counts.get("DIRECT") != summary.get("DIRECT")
+                or counts.get("POTENTIAL") != summary.get("POTENTIAL")
+                or counts.get("IRRELEVANT") != 0
+                or client_result.get("base_snapshot") is not None
+                or client_result.get("target_snapshot") != target_identity
+                or client_result.get("submission_eligible") is not True):
+            summary["diagnostics"] = dict(summary.get("diagnostics", {}))
+            summary["diagnostics"]["snapshot_client_contract_mismatch"] = 1
+            summary["status"] = "INCOMPLETE"
+            client_result = {**client_result, "submission_eligible": False}
+        else:
+            client_result = {
+                "status": "PASS",
+                "records": client_result["records"],
+                "batches": client_result["batches"],
+                "DIRECT": counts["DIRECT"],
+                "POTENTIAL": counts["POTENTIAL"],
+                "submission_eligible": True,
+            }
+    summary["snapshot_client_dry_run"] = client_result
     return summary
 
 
@@ -1982,6 +2043,21 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
         or summary["selected_payload_fits_worker_limit"] is not True
     ):
         raise PocError("historical_baseline_summary_invalid")
+    client = summary.get("snapshot_client_dry_run")
+    if not isinstance(client, dict) or client.get("status") not in {"PASS", "FAIL"}:
+        raise PocError("historical_baseline_summary_invalid")
+    client_clean: dict[str, int] = {}
+    for field in ("records", "batches", "DIRECT", "POTENTIAL"):
+        value = client.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise PocError("historical_baseline_summary_invalid")
+        client_clean[field] = value
+    if not isinstance(client.get("submission_eligible"), bool):
+        raise PocError("historical_baseline_summary_invalid")
+    if summary["status"] == "PASS" and (
+        client.get("status") != "PASS" or client.get("submission_eligible") is not True
+    ):
+        raise PocError("historical_baseline_summary_invalid")
     clean: dict[str, int] = {}
     for field in expected_integer_fields:
         # Optional for compatibility with pre-adaptive fixture/provider summaries.
@@ -2042,6 +2118,12 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
         f"- selected largest batch records: {clean['selected_largest_batch_records']}",
         f"- selected largest batch bytes: {clean['selected_largest_batch_bytes']}",
         f"- selected payload fits Worker 200-batch limit: {str(summary['selected_payload_fits_worker_limit']).lower()}",
+        f"- snapshot client dry-run: {client['status']}",
+        f"- snapshot client records: {client_clean['records']}",
+        f"- snapshot client batches: {client_clean['batches']}",
+        f"- snapshot client DIRECT: {client_clean['DIRECT']}",
+        f"- snapshot client POTENTIAL: {client_clean['POTENTIAL']}",
+        f"- snapshot client submission eligible: {str(client['submission_eligible']).lower()}",
         f"- incomplete case count: {clean['incomplete_case_count']}",
         f"- provider adaptive splits: {clean['provider_adaptive_splits']}",
         f"- provider adaptive split successes: {clean['provider_adaptive_split_successes']}",
@@ -2069,9 +2151,11 @@ def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
 
 
 def historical_baseline_exit_code(summary: dict[str, Any]) -> int:
-    if summary.get("status") == "PASS":
+    client = summary.get("snapshot_client_dry_run")
+    if (summary.get("status") == "PASS" and isinstance(client, dict)
+            and client.get("status") == "PASS" and client.get("submission_eligible") is True):
         return 0
-    if summary.get("status") == "INCOMPLETE":
+    if summary.get("status") == "INCOMPLETE" or (isinstance(client, dict) and client.get("status") == "FAIL"):
         return 2
     raise PocError("historical_baseline_summary_invalid")
 

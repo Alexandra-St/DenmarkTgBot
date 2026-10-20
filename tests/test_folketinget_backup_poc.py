@@ -510,17 +510,63 @@ class BackupPocSafetyTests(unittest.TestCase):
         from collectors import ingestion_client, snapshot_ingestion_client
         import folketinget_historical_baseline as historical_baseline
 
-        context = {"path": pathlib.Path("private-manifest.sqlite")}
-        expected = {"status": "PASS", "manifest_sag_count": 0}
-        with mock.patch.object(historical_baseline, "run_historical_baseline", return_value=expected) as run, \
+        target = {"backup_sha256": "a" * 64, "backup_finish_date": "2026-10-18 02:00:00.000", "schema_fingerprint": "b" * 64}
+        context = {"path": pathlib.Path("private-manifest.sqlite"), "report": {"new": target}}
+        record = ingestion_client.prepare_records(
+            {"cases": [{"source": "folketinget", "external_id": "42", "title": "Public title",
+                        "source_url": "https://oda.ft.dk/api/Sag(42)", "complete": True,
+                        "number": "L 42", "status": {}, "documents": [], "stages": [], "votes": []}]},
+            source="folketinget", mode="historical",
+        )[0]
+        record["relevance"] = "DIRECT"
+        expected = {"status": "PASS", "manifest_sag_count": 1, "target_backup_finish": target["backup_finish_date"],
+                    "selected_historical_ingestion_record_count": 1,
+                    "selected_historical_ingestion_batch_count": 1, "DIRECT": 1, "POTENTIAL": 0}
+        with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(expected, [record])) as run, \
                 mock.patch.object(ingestion_client, "upload", side_effect=AssertionError("forbidden")), \
                 mock.patch.object(ingestion_client, "_request", side_effect=AssertionError("forbidden")), \
                 mock.patch.object(ingestion_client, "proposed_checkpoints", side_effect=AssertionError("forbidden")), \
                 mock.patch.object(ingestion_client, "collection_complete", side_effect=AssertionError("forbidden")), \
                 mock.patch.object(snapshot_ingestion_client, "_post", side_effect=AssertionError("forbidden")):
             result = POC.run_historical_baseline_dry_run(context, SimpleNamespace(), progress_callback=lambda *_: None)
-        self.assertIs(result, expected)
+        self.assertEqual(result["snapshot_client_dry_run"]["status"], "PASS")
+        self.assertTrue(result["snapshot_client_dry_run"]["submission_eligible"])
         run.assert_called_once_with(context["path"], mock.ANY, progress_callback=mock.ANY)
+
+    def test_historical_handoff_requires_full_pass_and_exact_client_counts_and_identity(self) -> None:
+        from collectors import ingestion_client, snapshot_ingestion_client
+        import folketinget_historical_baseline as historical_baseline
+
+        target = {"backup_sha256": "a" * 64, "backup_finish_date": "2026-10-18 02:00:00.000", "schema_fingerprint": "b" * 64}
+        context = {"path": pathlib.Path("private-manifest.sqlite"), "report": {"new": target}}
+        incomplete = {"status": "INCOMPLETE", "manifest_sag_count": 1, "diagnostics": {}}
+        with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(incomplete, [])), \
+                mock.patch.object(snapshot_ingestion_client, "dry_run_prepared_historical_records", side_effect=AssertionError("must not hand off")) as client:
+            result = POC.run_historical_baseline_dry_run(context, SimpleNamespace())
+        client.assert_not_called()
+        self.assertEqual(result["snapshot_client_dry_run"]["status"], "FAIL")
+        self.assertEqual(POC.historical_baseline_exit_code(result), 2)
+
+        record = ingestion_client.prepare_records(
+            {"cases": [{"external_id": "42", "title": "Ukraine law", "source_url": "https://oda.ft.dk/api/Sag(42)",
+                        "complete": True, "number": "L 42", "status": {}, "documents": [], "stages": [], "votes": []}]},
+            "folketinget", "historical",
+        )[0]
+        record["relevance"] = "DIRECT"
+        complete = {"status": "PASS", "target_backup_finish": target["backup_finish_date"],
+                    "selected_historical_ingestion_record_count": 1, "selected_historical_ingestion_batch_count": 1,
+                    "DIRECT": 1, "POTENTIAL": 0, "diagnostics": {}}
+        wrong_client = {"dry_run": True, "mode": "historical", "state_kind": "snapshot", "records": 0,
+                        "batches": 1, "relevance_counts": {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0},
+                        "collection_complete": True, "submission_eligible": True, "base_snapshot": None,
+                        "target_snapshot": target}
+        with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(complete, [record])), \
+                mock.patch.object(snapshot_ingestion_client, "dry_run_prepared_historical_records", return_value=wrong_client):
+            result = POC.run_historical_baseline_dry_run(context, SimpleNamespace())
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertFalse(result["snapshot_client_dry_run"]["submission_eligible"])
+        self.assertEqual(result["diagnostics"]["snapshot_client_contract_mismatch"], 1)
+        self.assertEqual(POC.historical_baseline_exit_code(result), 2)
 
     def test_historical_baseline_summary_is_aggregate_and_incomplete_is_explicit(self) -> None:
         summary = {
@@ -540,6 +586,8 @@ class BackupPocSafetyTests(unittest.TestCase):
                 "source_lookup_failed_SagDokument_by_field_sagid_provider_transport_failed_transport_manifest_page_json_invalid": 120,
             }, "target_backup_finish": "2026-10-19T02:00:00Z",
             "ruleset_version": "1.1", "private_title": "DO NOT PRINT", "external_id": "987654",
+            "snapshot_client_dry_run": {"status": "FAIL", "records": 1, "batches": 1,
+                                         "DIRECT": 1, "POTENTIAL": 0, "submission_eligible": False},
         }
         output = StringIO()
         with redirect_stdout(output):
@@ -562,10 +610,13 @@ class BackupPocSafetyTests(unittest.TestCase):
         summary["status"] = "PASS"
         summary["full_universe_complete"] = True
         summary["selected_payload_fits_worker_limit"] = True
+        summary["snapshot_client_dry_run"] = {"status": "PASS", "records": 1, "batches": 1,
+                                              "DIRECT": 1, "POTENTIAL": 0, "submission_eligible": True}
         output = StringIO()
         with redirect_stdout(output):
             POC.write_historical_baseline_summary(summary)
         self.assertIn("Historical snapshot baseline dry-run: PASS", output.getvalue())
+        self.assertIn("snapshot client dry-run: PASS", output.getvalue())
         self.assertEqual(POC.historical_baseline_exit_code(summary), 0)
 
     def test_historical_progress_reports_only_aggregate_counts_at_bounded_intervals(self) -> None:

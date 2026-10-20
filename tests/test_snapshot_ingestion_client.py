@@ -12,7 +12,10 @@ from io import StringIO
 from unittest.mock import patch
 
 from collectors import ingestion_client
-from collectors.snapshot_ingestion_client import SnapshotIngestionError, ingest_snapshot_candidates, main, validate_snapshot_identity
+from collectors.snapshot_ingestion_client import (
+    SnapshotIngestionError, dry_run_prepared_historical_records,
+    ingest_snapshot_candidates, main, validate_snapshot_identity,
+)
 from tests.test_ingestion_client import oda_output
 
 BASE = {"backup_sha256": "a" * 64, "backup_finish_date": "2026-10-17 00:00:00.000", "schema_fingerprint": "c" * 64}
@@ -118,6 +121,43 @@ class SnapshotIngestionClientTests(unittest.TestCase):
         result = ingest_snapshot_candidates(bundle(), mode="historical", base_snapshot=None,
                                             target_snapshot=TARGET, dry_run=True)
         self.assertFalse(result["submission_eligible"])
+
+    def test_prepared_historical_handoff_dry_run_validates_and_never_networks(self) -> None:
+        records = ingestion_client.prepare_records(bundle(2), "folketinget", "historical")
+        records[0]["relevance"] = "DIRECT"
+        records[1]["relevance"] = "POTENTIAL"
+        records[1]["historical"] = True
+        result = dry_run_prepared_historical_records(
+            records, base_snapshot=None, target_snapshot=TARGET
+        )
+        self.assertEqual((result["records"], result["batches"]), (2, 1))
+        self.assertEqual(result["relevance_counts"], {"DIRECT": 1, "POTENTIAL": 1, "IRRELEVANT": 0})
+        self.assertTrue(result["submission_eligible"])
+        self.assertIsNone(result["base_snapshot"])
+        self.assertEqual(result["target_snapshot"], TARGET)
+        self.assertNotIn("cases", result)
+
+    def test_prepared_historical_handoff_rejects_bad_contract_without_http(self) -> None:
+        record = ingestion_client.prepare_records(bundle(), "folketinget", "historical")[0]
+        record["relevance"] = "DIRECT"
+        for field, value, category in (
+            ("historical", False, "prepared_record_invalid"),
+            ("complete", False, "prepared_record_invalid"),
+            ("relevance", "IRRELEVANT", "prepared_record_invalid"),
+            ("ruleset_version", "unknown", "prepared_record_invalid"),
+            ("url", "https://example.invalid/item", "prepared_record_invalid"),
+        ):
+            invalid = {**record, field: value}
+            with self.subTest(field=field), self.assertRaisesRegex(SnapshotIngestionError, category):
+                dry_run_prepared_historical_records([invalid], base_snapshot=None, target_snapshot=TARGET)
+        with self.assertRaisesRegex(SnapshotIngestionError, "snapshot_base_must_be_null"):
+            dry_run_prepared_historical_records([record], base_snapshot=BASE, target_snapshot=TARGET)
+        with self.assertRaisesRegex(SnapshotIngestionError, "invalid_mode"):
+            dry_run_prepared_historical_records([record], mode="incremental", base_snapshot=None, target_snapshot=TARGET)
+        with self.assertRaisesRegex(SnapshotIngestionError, "historical_snapshot_submission_not_enabled"):
+            dry_run_prepared_historical_records([record], dry_run=False, base_snapshot=None, target_snapshot=TARGET)
+        with patch("collectors.snapshot_ingestion_client._post", side_effect=AssertionError("HTTP forbidden")):
+            dry_run_prepared_historical_records([record], base_snapshot=None, target_snapshot=TARGET)
 
     def test_historical_live_rejected_before_network(self) -> None:
         with self.assertRaisesRegex(SnapshotIngestionError, "historical_snapshot_submission_not_enabled"):

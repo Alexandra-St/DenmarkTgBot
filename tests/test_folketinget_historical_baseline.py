@@ -140,6 +140,23 @@ class FolketingetHistoricalBaselineTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["mode"] == "historical" for call in prepare.call_args_list))
         self.assertTrue(all(record["historical"] is True for record in prepared))
 
+    def test_prepared_records_handoff_is_private_and_only_released_after_full_pass(self):
+        create_manifest(self.manifest, [1, 2, 3])
+        summary, records = BASELINE.run_historical_baseline_with_records(
+            self.manifest, TrackingProvider(source_rows([1, 2, 3]))
+        )
+        self.assertEqual(summary["status"], "PASS")
+        self.assertEqual(len(records), summary["selected_historical_ingestion_record_count"])
+        self.assertTrue(all(record["historical"] is True and record["complete"] is True for record in records))
+        self.assertTrue(all(record["relevance"] in {DIRECT, POTENTIAL} for record in records))
+        self.assertNotIn("records", summary)
+
+        incomplete, withheld = BASELINE.run_historical_baseline_with_records(
+            self.manifest, TrackingProvider(source_rows([1]))
+        )
+        self.assertEqual(incomplete["status"], "INCOMPLETE")
+        self.assertEqual(withheld, [])
+
     def test_existing_relation_hydration_assembles_full_case_graph(self):
         create_manifest(self.manifest, [7])
         rows = source_rows([7])

@@ -163,14 +163,14 @@ def _adaptive_provider_metrics(provider: object) -> dict[str, object]:
     }
 
 
-def run_historical_baseline(
+def _run_historical_baseline(
     manifest_path: Path,
     provider: candidate_extraction.FolketingetReadOnlyProvider,
     *,
     batch_size: int = MAX_SAGS_PER_HYDRATION,
     progress_callback: Callable[[int, int], None] | None = None,
-) -> dict[str, object]:
-    """Hydrate and prepare all current Sag records; performs no HTTP or submission."""
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Shared implementation; return selected rows only after the full proof passes."""
     manifest_count = _manifest_sag_count(Path(manifest_path))
     totals: Counter[str] = Counter()
     diagnostics: Counter[str] = Counter()
@@ -314,7 +314,7 @@ def run_historical_baseline(
         metadata = snapshot_diff.validate_manifest(Path(manifest_path))
     except snapshot_diff.DiffError as error:
         raise HistoricalBaselineError(error.category) from None
-    return {
+    summary = {
         "status": "PASS" if full_universe_complete and selected_fits_worker_limit and not diagnostics else "INCOMPLETE",
         "full_universe_complete": full_universe_complete,
         "manifest_sag_count": manifest_count,
@@ -335,6 +335,41 @@ def run_historical_baseline(
         "ruleset_version": RULESET_VERSION,
         **_adaptive_provider_metrics(provider),
     }
+    return summary, selected_records if summary["status"] == "PASS" else []
 
 
-__all__ = ["HistoricalBaselineError", "MAX_SAGS_PER_HYDRATION", "run_historical_baseline"]
+def run_historical_baseline(
+    manifest_path: Path,
+    provider: candidate_extraction.FolketingetReadOnlyProvider,
+    *,
+    batch_size: int = MAX_SAGS_PER_HYDRATION,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> dict[str, object]:
+    """Hydrate and prepare all current Sag records; return aggregate metrics only."""
+    summary, _ = _run_historical_baseline(
+        manifest_path, provider, batch_size=batch_size, progress_callback=progress_callback
+    )
+    return summary
+
+
+def run_historical_baseline_with_records(
+    manifest_path: Path,
+    provider: candidate_extraction.FolketingetReadOnlyProvider,
+    *,
+    batch_size: int = MAX_SAGS_PER_HYDRATION,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Return selected historical rows solely for an explicit downstream dry-run handoff.
+
+    The list is empty unless the complete full-universe proof and payload
+    limits pass. Callers must keep it private and must not submit it live.
+    """
+    return _run_historical_baseline(
+        manifest_path, provider, batch_size=batch_size, progress_callback=progress_callback
+    )
+
+
+__all__ = [
+    "HistoricalBaselineError", "MAX_SAGS_PER_HYDRATION", "run_historical_baseline",
+    "run_historical_baseline_with_records",
+]

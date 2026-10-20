@@ -23,12 +23,16 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from collectors import ingestion_client
+from collectors.relevance import DIRECT, POTENTIAL, RULESET_VERSION
 
 USER_AGENT = "DenmarkTgBot-SnapshotIngestionClient/1.0"
 MAX_COMMIT_ATTEMPTS = 10
 REQUEST_TIMEOUT_SECONDS = 15
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _BACKUP_TIMESTAMP = re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})$")
+MAX_HISTORICAL_SELECTED_RECORDS = 10_000
+MAX_HISTORICAL_SELECTED_BYTES = 200 * ingestion_client.MAX_BATCH_BYTES
+MAX_HISTORICAL_BATCHES = 200
 Opener = Callable[..., Any]
 
 WORKER_ERRORS = frozenset({
@@ -133,6 +137,100 @@ def _relevance_counts(records: list[dict[str, Any]]) -> dict[str, int]:
             raise SnapshotIngestionError("prepared_record_invalid")
         counts[relevance] += 1
     return counts
+
+
+def _validate_prepared_historical_record(value: object) -> dict[str, Any]:
+    """Validate the already-prepared publication contract without reclassifying it."""
+    if not isinstance(value, Mapping):
+        raise SnapshotIngestionError("prepared_record_invalid")
+    record = dict(value)
+    if (record.get("source") != "folketinget" or record.get("historical") is not True
+            or record.get("complete") is not True or record.get("relevance") not in {DIRECT, POTENTIAL}
+            or record.get("ruleset_version") != RULESET_VERSION):
+        raise SnapshotIngestionError("prepared_record_invalid")
+    external_id = record.get("external_id")
+    title = record.get("title")
+    if (not isinstance(external_id, str) or not re.fullmatch(r"\d{1,20}", external_id)
+            or not isinstance(title, str) or not title.strip()):
+        raise SnapshotIngestionError("prepared_record_invalid")
+    url = record.get("url")
+    try:
+        parsed_url = urlsplit(url) if isinstance(url, str) else None
+        hostname = parsed_url.hostname if parsed_url else None
+    except ValueError:
+        parsed_url = None
+        hostname = None
+    if (parsed_url is None or parsed_url.scheme != "https" or hostname not in {"oda.ft.dk", "www.ft.dk"}
+            or parsed_url.username is not None or parsed_url.password is not None
+            or parsed_url.query or parsed_url.fragment):
+        raise SnapshotIngestionError("prepared_record_invalid")
+    if (not isinstance(record.get("notification_blocked"), bool)
+            or not isinstance(record.get("diagnostics"), list)
+            or not isinstance(record.get("source_metadata"), Mapping)
+            or not isinstance(record.get("relevance_reason"), str)):
+        raise SnapshotIngestionError("prepared_record_invalid")
+    for field in ("status", "publication_type", "published_at", "source_updated_at", "source_updated_at_raw"):
+        if record.get(field) is not None and not isinstance(record.get(field), str):
+            raise SnapshotIngestionError("prepared_record_invalid")
+    snapshot = record.get("normalized_snapshot")
+    if (not isinstance(snapshot, Mapping) or snapshot.get("title") != title
+            or snapshot.get("content_text") is not None and not isinstance(snapshot.get("content_text"), str)
+            or snapshot.get("status") is not None and not isinstance(snapshot.get("status"), str)
+            or snapshot.get("publication_type") is not None and not isinstance(snapshot.get("publication_type"), str)
+            or not all(isinstance(snapshot.get(name), list) for name in ("documents", "stages", "votes"))):
+        raise SnapshotIngestionError("prepared_record_invalid")
+    for name in ("documents", "stages", "votes"):
+        if any(not isinstance(item, Mapping) for item in snapshot[name]):
+            raise SnapshotIngestionError("prepared_record_invalid")
+    return record
+
+
+def dry_run_prepared_historical_records(
+    records: object,
+    *,
+    mode: str = "historical",
+    state_kind: str = "snapshot",
+    dry_run: bool = True,
+    base_snapshot: object,
+    target_snapshot: object,
+) -> dict[str, Any]:
+    """Validate already-prepared historical records and batch them, with no network path."""
+    if mode != "historical":
+        raise SnapshotIngestionError("invalid_mode")
+    if state_kind != "snapshot":
+        raise SnapshotIngestionError("snapshot_state_kind_invalid")
+    if dry_run is not True:
+        raise SnapshotIngestionError("historical_snapshot_submission_not_enabled")
+    if base_snapshot is not None:
+        raise SnapshotIngestionError("snapshot_base_must_be_null")
+    _, target = _validate_pair("historical", base_snapshot, target_snapshot)
+    if not isinstance(records, list) or len(records) > MAX_HISTORICAL_SELECTED_RECORDS:
+        raise SnapshotIngestionError("prepared_record_limit_exceeded")
+    try:
+        prepared = [_validate_prepared_historical_record(item) for item in records]
+        encoded_size = len(json.dumps(prepared, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if encoded_size > MAX_HISTORICAL_SELECTED_BYTES:
+            raise SnapshotIngestionError("prepared_record_limit_exceeded")
+        batches = ingestion_client.chunks(prepared)
+        counts = _relevance_counts(prepared)
+    except SnapshotIngestionError:
+        raise
+    except Exception:
+        raise SnapshotIngestionError("prepared_record_invalid") from None
+    if len(batches) > MAX_HISTORICAL_BATCHES:
+        raise SnapshotIngestionError("prepared_batch_limit_exceeded")
+    return {
+        "dry_run": True,
+        "mode": "historical",
+        "state_kind": "snapshot",
+        "records": len(prepared),
+        "batches": len(batches),
+        "relevance_counts": counts,
+        "collection_complete": True,
+        "submission_eligible": True,
+        "base_snapshot": None,
+        "target_snapshot": target.to_dict(),
+    }
 
 
 def _ingest_url(endpoint: str) -> str:
