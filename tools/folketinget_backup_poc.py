@@ -1512,6 +1512,11 @@ def run_historical_baseline_live(
 
     selected_count = summary.get("selected_historical_ingestion_record_count")
     client_counts = client_result.get("relevance_counts")
+    processed_count = client_result.get("processed_records")
+    processed_contract_ok = (
+        processed_count == selected_count
+        or (client_result.get("start_idempotent") is True and processed_count == 0)
+    )
     if (client_result.get("status") == "BLOCKED"
             and client_result.get("snapshot_advanced") is False
             and client_result.get("run_id") == run_id):
@@ -1536,7 +1541,7 @@ def run_historical_baseline_live(
             or client_result.get("run_id") != run_id
             or client_result.get("records") != selected_count
             or client_result.get("accepted_records") != selected_count
-            or client_result.get("processed_records") != selected_count
+            or not processed_contract_ok
             or client_result.get("batches") != summary.get("selected_historical_ingestion_batch_count")
             or not isinstance(client_counts, dict)
             or client_counts.get("DIRECT") != summary.get("DIRECT")

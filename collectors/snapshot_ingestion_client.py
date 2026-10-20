@@ -317,8 +317,9 @@ def verify_historical_snapshot_readiness(
     token: str,
     *,
     opener: Opener | None = None,
+    allow_same_run_resume: bool = False,
 ) -> dict[str, Any]:
-    """Read the production gate immediately before a historical snapshot write."""
+    """Read readiness; optionally permit an exact Worker-verified same-run resume."""
     if not isinstance(token, str) or not token:
         raise SnapshotIngestionError("ingestion_configuration_missing", stage="readiness")
     ingest_url = _ingest_url(endpoint)
@@ -372,11 +373,32 @@ def verify_historical_snapshot_readiness(
                 or result["snapshot_generation"] < 1
             ))):
         raise SnapshotIngestionError("snapshot_readiness_response_invalid", stage="readiness")
-    if (result["schema_ready"] is not True or result["snapshot_state_initialized"] is not False
-            or result["snapshot_generation"] is not None or result["active_ingestion_run"] is not False
-            or result["worker_supports_snapshot_ingestion"] is not True
-            or result["historical_snapshot_start_allowed"] is not True):
+    if (result["schema_ready"] is not True
+            or result["worker_supports_snapshot_ingestion"] is not True):
         raise SnapshotIngestionError("snapshot_readiness_blocked", stage="readiness")
+    fresh = (result["snapshot_state_initialized"] is False
+             and result["snapshot_generation"] is None
+             and result["active_ingestion_run"] is False
+             and result["historical_snapshot_start_allowed"] is True)
+    if fresh:
+        result["same_run_resume_candidate"] = False
+        return result
+
+    # Readiness is aggregate-only and cannot identify a run. A non-fresh state
+    # is therefore only a candidate: the subsequent start request must use the
+    # caller's unchanged run_id and contract, and the Worker must confirm its
+    # stored start_request_hash by returning idempotent=true.
+    initialized = result["snapshot_state_initialized"] is True
+    active = result["active_ingestion_run"] is True
+    generation_consistent = ((initialized and result["snapshot_generation"] is not None)
+                             or (not initialized and result["snapshot_generation"] is None))
+    readiness_consistent = result["historical_snapshot_start_allowed"] is False
+    state_flags_known = (isinstance(result["snapshot_state_initialized"], bool)
+                         and isinstance(result["active_ingestion_run"], bool))
+    if (not allow_same_run_resume or not state_flags_known or not generation_consistent
+            or not readiness_consistent or not (initialized or active)):
+        raise SnapshotIngestionError("snapshot_readiness_blocked", stage="readiness")
+    result["same_run_resume_candidate"] = True
     return result
 
 
@@ -393,6 +415,7 @@ def _submit_prepared_records(
     run_id: str,
     opener: Opener,
     max_commit_attempts: int,
+    require_idempotent_start: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(token, str) or not token:
         raise SnapshotIngestionError("ingestion_configuration_missing", run_id, "start")
@@ -421,9 +444,15 @@ def _submit_prepared_records(
         raise SnapshotIngestionError("worker_response_invalid", run_id, "start")
     if state != "OPEN" and started.get("idempotent") is not True:
         raise SnapshotIngestionError("worker_response_invalid", run_id, "start")
+    start_idempotent = started.get("idempotent") is True
+    if require_idempotent_start and not start_idempotent:
+        raise SnapshotIngestionError("historical_resume_not_confirmed", run_id, "start")
 
-    accepted = 0
+    # On an idempotent resume the Worker intentionally does not re-accept
+    # batches. Count the exact previously accepted contract, not new requests.
+    accepted = sum(len(batch) for batch in batches) if start_idempotent else 0
     if state == "OPEN":
+        accepted = 0
         for index, batch in enumerate(batches):
             result = _post(ingest_url, token, {
                 "action": "batch", "run_id": run_id, "batch_index": index, "records": batch,
@@ -459,14 +488,15 @@ def _submit_prepared_records(
                     or isinstance(processed, bool) or not isinstance(processed, int) or processed < 0):
                 raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
             summary.update({"status": status, "accepted_records": accepted, "processed_records": processed,
-                            "snapshot_advanced": True, "snapshot_generation": generation})
+                            "snapshot_advanced": True, "snapshot_generation": generation,
+                            "start_idempotent": start_idempotent})
             return summary
         if status == "BLOCKED":
             if (result.get("checkpoints_advanced") is not False or result.get("snapshot_advanced") is not False
                     or ("error" in result and result.get("error") != "incomplete_publication")):
                 raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
             summary.update({"status": status, "accepted_records": accepted, "processed_records": 0,
-                            "snapshot_advanced": False})
+                            "snapshot_advanced": False, "start_idempotent": start_idempotent})
             return summary
         raise SnapshotIngestionError("worker_response_invalid", run_id, "commit")
     if result and result.get("status") == "COMMITTING":
@@ -502,11 +532,14 @@ def submit_prepared_historical_records(
     # Use one stable identifier across manual workflow retries. A readiness failure
     # must never cause the caller to mint a different run after an ambiguous write.
     readiness_opener = None if opener is urllib.request.urlopen else opener
-    verify_historical_snapshot_readiness(endpoint, token, opener=readiness_opener)
+    readiness = verify_historical_snapshot_readiness(
+        endpoint, token, opener=readiness_opener, allow_same_run_resume=True
+    )
     return _submit_prepared_records(
         prepared, batches, counts, mode="historical", base=None, target=target,
         endpoint=endpoint, token=token, run_id=run_id, opener=opener,
         max_commit_attempts=max_commit_attempts,
+        require_idempotent_start=readiness["same_run_resume_candidate"],
     )
 
 

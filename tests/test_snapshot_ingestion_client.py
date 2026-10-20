@@ -174,6 +174,14 @@ class SnapshotIngestionClientTests(unittest.TestCase):
             "historical_snapshot_start_allowed": True, **overrides,
         }
 
+    def _resume_ready(self, *, initialized=False, generation=None, active=True):
+        return self._ready(
+            snapshot_state_initialized=initialized,
+            snapshot_generation=generation,
+            active_ingestion_run=active,
+            historical_snapshot_start_allowed=False,
+        )
+
     def _prepared_history(self):
         record = ingestion_client.prepare_records(bundle(), "folketinget", "historical")[0]
         record.update({"historical": True, "relevance": "DIRECT"})
@@ -218,12 +226,82 @@ class SnapshotIngestionClientTests(unittest.TestCase):
         self.assertTrue(all("notification" not in request.full_url for request in opener.requests))
 
     def test_readiness_blocks_before_any_ingestion_write(self) -> None:
-        opener = QueueOpener([self._ready(snapshot_state_initialized=True)])
-        with self.assertRaisesRegex(SnapshotIngestionError, "snapshot_readiness_blocked") as raised:
+        error = urllib.error.HTTPError("https://example.test", 409, "conflict", {},
+                                       io.BytesIO(b'{"error":"snapshot_state_already_initialized"}'))
+        opener = QueueOpener([self._resume_ready(initialized=True, generation=1, active=False), error])
+        with self.assertRaisesRegex(SnapshotIngestionError, "snapshot_state_already_initialized") as raised:
             self._submit_history(self._prepared_history(), opener)
-        self.assertEqual(raised.exception.stage, "readiness")
-        self.assertEqual(len(opener.requests), 1)
-        self.assertEqual(opener.requests[0].get_method(), "GET")
+        self.assertEqual(raised.exception.stage, "start")
+        self.assertEqual([request.get_method() for request in opener.requests], ["GET", "POST"])
+
+    def test_ambiguous_start_retry_resumes_same_open_run_idempotently(self) -> None:
+        records = self._prepared_history()
+        # Model a timeout after the Worker accepted start but before its response
+        # reached the client. The retry must prove the same stored run by hash.
+        first = QueueOpener([self._ready(), TimeoutError("ambiguous")])
+        with self.assertRaisesRegex(SnapshotIngestionError, "ingestion_transport_failed"):
+            self._submit_history(records, first)
+        second = QueueOpener([
+            self._resume_ready(), start_response(idempotent=True),
+            {"accepted": True, "run_id": RUN_ID, "batch_index": 0, "accepted_records": 1},
+            commit_response(snapshot_generation=1, processed_records=1),
+        ])
+        result = self._submit_history(records, second)
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["accepted_records"], 1)
+        self.assertTrue(result["start_idempotent"])
+        self.assertEqual([json.loads(request.data).get("run_id") for request in first.requests[1:]], [RUN_ID])
+        self.assertEqual([json.loads(request.data).get("run_id") for request in second.requests[1:]], [RUN_ID] * 3)
+
+    def test_committing_resume_does_not_resend_batches_and_counts_prior_acceptance(self) -> None:
+        opener = QueueOpener([
+            self._resume_ready(), start_response(status="COMMITTING", idempotent=True),
+            {"run_id": RUN_ID, "status": "COMMITTING", "processed_records": 0, "remaining_records": 1,
+             "checkpoints_advanced": False, "snapshot_advanced": False},
+            commit_response(snapshot_generation=1, processed_records=1),
+        ])
+        result = self._submit_history(self._prepared_history(), opener)
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["accepted_records"], 1)
+        self.assertEqual(result["processed_records"], 1)
+        self.assertTrue(result["start_idempotent"])
+        self.assertEqual([json.loads(request.data).get("action") for request in opener.requests[1:]],
+                         ["start", "commit", "commit"])
+
+    def test_committed_resume_reports_logical_accepted_count(self) -> None:
+        opener = QueueOpener([
+            self._resume_ready(initialized=True, generation=1, active=False),
+            start_response(status="COMMITTED", idempotent=True),
+            commit_response(snapshot_generation=1, processed_records=0),
+        ])
+        result = self._submit_history(self._prepared_history(), opener)
+        self.assertEqual(result["status"], "COMMITTED")
+        self.assertEqual(result["accepted_records"], 1)
+        self.assertEqual(result["processed_records"], 0)
+        self.assertTrue(result["start_idempotent"])
+        self.assertEqual([request.get_method() for request in opener.requests], ["GET", "POST", "POST"])
+
+    def test_resume_candidate_requires_worker_idempotency_and_never_changes_run_id(self) -> None:
+        error = urllib.error.HTTPError("https://example.test", 409, "conflict", {},
+                                       io.BytesIO(b'{"error":"source_run_active_or_run_conflict"}'))
+        opener = QueueOpener([self._resume_ready(), error])
+        with self.assertRaisesRegex(SnapshotIngestionError, "source_run_active_or_run_conflict"):
+            self._submit_history(self._prepared_history(), opener)
+        self.assertEqual([request.get_method() for request in opener.requests], ["GET", "POST"])
+        self.assertEqual(json.loads(opener.requests[-1].data)["run_id"], RUN_ID)
+
+    def test_non_idempotent_new_start_is_rejected_after_nonfresh_readiness(self) -> None:
+        opener = QueueOpener([self._resume_ready(), start_response(idempotent=False)])
+        with self.assertRaisesRegex(SnapshotIngestionError, "historical_resume_not_confirmed"):
+            self._submit_history(self._prepared_history(), opener)
+        self.assertEqual([request.get_method() for request in opener.requests], ["GET", "POST"])
+
+    def test_unknown_readiness_state_cannot_be_used_as_resume_candidate(self) -> None:
+        opener = QueueOpener([self._ready(snapshot_state_initialized=None, active_ingestion_run=True,
+                                          historical_snapshot_start_allowed=False)])
+        with self.assertRaisesRegex(SnapshotIngestionError, "snapshot_readiness_blocked"):
+            self._submit_history(self._prepared_history(), opener)
+        self.assertEqual([request.get_method() for request in opener.requests], ["GET"])
 
     def test_invalid_activation_and_base_snapshot_block_before_network(self) -> None:
         records = self._prepared_history()

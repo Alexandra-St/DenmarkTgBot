@@ -554,7 +554,9 @@ class BackupPocSafetyTests(unittest.TestCase):
             "accepted_records": 1, "processed_records": 1, "batches": 1,
             "relevance_counts": {"DIRECT": 1, "POTENTIAL": 0}, "base_snapshot": None,
             "target_snapshot": target, "snapshot_generation": 1, "snapshot_advanced": True,
+            "start_idempotent": True,
         }
+        committed["processed_records"] = 0
         with mock.patch.object(historical_baseline, "run_historical_baseline_with_records", return_value=(baseline, [record])) as run, \
                 mock.patch.object(snapshot_ingestion_client, "submit_prepared_historical_records", return_value=committed) as submit:
             result = POC.run_historical_baseline_live(
