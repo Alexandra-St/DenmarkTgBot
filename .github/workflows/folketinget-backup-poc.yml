@@ -115,7 +115,11 @@ jobs:
           request = urllib.request.Request(
               base.rstrip("/") + "/internal/snapshot-readiness?source=folketinget",
               method="GET",
-              headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+              headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/json",
+                  "User-Agent": "DenmarkTgBot-SnapshotReadinessPreflight/1.0",
+              },
           )
           opener = urllib.request.build_opener(NoRedirect())
           try:

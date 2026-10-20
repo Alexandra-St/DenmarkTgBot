@@ -656,6 +656,9 @@ class BackupPocSafetyTests(unittest.TestCase):
         self.assertIn("INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}", workflow)
         self.assertIn("/internal/snapshot-readiness?source=folketinget", workflow)
         preflight = workflow.split("name: Production snapshot readiness preflight", 1)[1].split("name: Validate manifest run IDs", 1)[0]
+        self.assertIn('"User-Agent": "DenmarkTgBot-SnapshotReadinessPreflight/1.0"', preflight)
+        self.assertIn('"Authorization": "Bearer " + token', preflight)
+        self.assertIn('"Accept": "application/json"', preflight)
         self.assertIn("class NoRedirect", preflight)
         self.assertIn("response.read(4097)", preflight)
         self.assertIn("len(raw_body) > 4096", preflight)
