@@ -196,6 +196,16 @@ after(async () => {
 test("internal routes authenticate before reading state; reject invalid JSON and unknown sources", async () => {
   const denied = await request("/internal/source-states?source=folketinget", "GET", undefined, false);
   assert.equal(denied.status, 401);
+  const readinessBefore = await request("/internal/snapshot-readiness?source=folketinget", "GET", undefined, false);
+  assert.equal(readinessBefore.status, 401);
+  const readiness = await request("/internal/snapshot-readiness?source=folketinget", "GET");
+  assert.equal(readiness.status, 200);
+  assert.deepEqual(readiness.body, {
+    source: "folketinget", schema_ready: true, snapshot_state_initialized: false,
+    snapshot_generation: null, active_ingestion_run: false,
+    worker_supports_snapshot_ingestion: true, historical_snapshot_start_allowed: true,
+  });
+  assert.equal((await query("SELECT COUNT(*) AS count FROM source_snapshot_states WHERE source_id=3"))[0]?.count, 0);
   assert.equal((await request("/internal/ingest", "POST", "{")).status, 400);
   assert.equal((await request("/internal/ingest", "POST", "x".repeat(256 * 1024 + 1))).status, 413);
   assert.equal((await request("/internal/source-states?source=unknown", "GET")).status, 400);

@@ -4,7 +4,7 @@ import { D1UserRepository } from "./database/users.ts";
 import { D1PublicationRepository } from "./database/publications.ts";
 import { D1SourceStatusRepository } from "./database/source_status.ts";
 import type { TelegramUpdate } from "./types/telegram.ts";
-import { handleIngestionRequest, handleSourceStatesRequest, isIngestionRequestAuthorized } from "./ingestion.ts";
+import { handleIngestionRequest, handleSnapshotReadinessRequest, handleSourceStatesRequest, isIngestionRequestAuthorized } from "./ingestion.ts";
 import { deliverPendingNotifications, prepareNotificationQueue, previewNotifications, sendNotificationCanary, type NotificationEnv } from "./notifications.ts";
 
 interface Env {
@@ -46,6 +46,7 @@ export default {
 
     if (url.pathname === "/internal/ingest") return handleIngestionRequest(request, env);
     if (url.pathname === "/internal/source-states") return handleSourceStatesRequest(request, env);
+    if (url.pathname === "/internal/snapshot-readiness") return handleSnapshotReadinessRequest(request, env);
     if (url.pathname.startsWith("/internal/notifications/")) {
       if (!await isIngestionRequestAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
       const notificationEnv = env as Env & NotificationEnv;

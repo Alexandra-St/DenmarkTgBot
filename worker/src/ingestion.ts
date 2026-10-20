@@ -30,6 +30,28 @@ const MAX_RUN_BATCHES = 200;
 const MAX_CLEANUP_RUNS = 20;
 const DEFAULT_INGESTION_RETENTION_DAYS = 90;
 
+const READINESS_TABLE_COLUMNS: Record<string, readonly string[]> = {
+  sources: ["id", "code"],
+  ingestion_runs: [
+    "run_id", "source_id", "status", "mode", "state_kind", "proposed_checkpoints_json",
+    "base_checkpoints_json", "checkpoint_writes", "base_snapshot_json", "target_snapshot_json",
+    "snapshot_state_writes",
+  ],
+  source_states: ["source_id"],
+  source_snapshot_states: ["source_id", "backup_sha256", "backup_finish_date", "schema_fingerprint", "generation", "last_run_id", "initialized_at", "updated_at"],
+};
+const SNAPSHOT_STATE_TRIGGERS = [
+  "source_states_reject_snapshot_run_insert",
+  "source_states_reject_snapshot_run_update",
+  "source_states_reject_snapshot_run_delete",
+  "source_snapshot_states_guard_insert",
+  "source_snapshot_states_count_insert",
+  "source_snapshot_states_guard_update",
+  "source_snapshot_states_count_update",
+  "source_snapshot_states_reject_delete",
+  "ingestion_runs_guard_state_kind_commit",
+] as const;
+
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), {
   status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
 });
@@ -642,4 +664,75 @@ export async function handleIngestionRequest(request: Request, env: IngestEnv): 
 export async function handleSourceStatesRequest(request: Request, env: IngestEnv): Promise<Response> {
   if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
   return sourceStates(request, env);
+}
+
+type SnapshotReadiness = {
+  source: "folketinget";
+  schema_ready: boolean;
+  snapshot_state_initialized: boolean | null;
+  snapshot_generation: number | null;
+  active_ingestion_run: boolean | null;
+  worker_supports_snapshot_ingestion: true;
+  historical_snapshot_start_allowed: boolean;
+};
+
+function snapshotReadiness(
+  schemaReady: boolean,
+  initialized: boolean | null = null,
+  generation: number | null = null,
+  active: boolean | null = null,
+): SnapshotReadiness {
+  return {
+    source: "folketinget",
+    schema_ready: schemaReady,
+    snapshot_state_initialized: initialized,
+    snapshot_generation: generation,
+    active_ingestion_run: active,
+    worker_supports_snapshot_ingestion: true,
+    historical_snapshot_start_allowed: schemaReady && initialized === false && active === false,
+  };
+}
+
+async function inspectSnapshotReadiness(db: D1Database): Promise<SnapshotReadiness> {
+  try {
+    const requiredTables = Object.keys(READINESS_TABLE_COLUMNS);
+    const tablesResult = await db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sources', 'ingestion_runs', 'source_states', 'source_snapshot_states')",
+    ).all<{ name: string }>();
+    const existingTables = new Set((tablesResult.results ?? []).map((row) => row.name));
+    if (requiredTables.some((table) => !existingTables.has(table))) return snapshotReadiness(false);
+
+    for (const [table, expectedColumns] of Object.entries(READINESS_TABLE_COLUMNS)) {
+      const columnsResult = await db.prepare("SELECT name FROM pragma_table_info(?)").bind(table).all<{ name: string }>();
+      const columns = new Set((columnsResult.results ?? []).map((row) => row.name));
+      if (expectedColumns.some((column) => !columns.has(column))) return snapshotReadiness(false);
+    }
+    const triggerResult = await db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (" + SNAPSHOT_STATE_TRIGGERS.map(() => "?").join(",") + ")",
+    ).bind(...SNAPSHOT_STATE_TRIGGERS).all<{ name: string }>();
+    const triggers = new Set((triggerResult.results ?? []).map((row) => row.name));
+    if (SNAPSHOT_STATE_TRIGGERS.some((trigger) => !triggers.has(trigger))) return snapshotReadiness(false);
+
+    const source = await db.prepare("SELECT id FROM sources WHERE code = ?").bind("folketinget").first<{ id: number }>();
+    if (!source || !integer(source.id)) return snapshotReadiness(false);
+    const state = await db.prepare(
+      "SELECT generation FROM source_snapshot_states WHERE source_id = ?",
+    ).bind(source.id).first<{ generation: number }>();
+    if (state && !integer(state.generation)) return snapshotReadiness(false);
+    const active = await db.prepare(
+      "SELECT COUNT(*) AS count FROM ingestion_runs WHERE source_id = ? AND status IN ('OPEN', 'COMMITTING')",
+    ).bind(source.id).first<{ count: number }>();
+    if (!active || !integer(active.count)) return snapshotReadiness(false);
+    return snapshotReadiness(true, Boolean(state), state?.generation ?? null, active.count > 0);
+  } catch {
+    // Metadata/query errors are intentionally reduced to a closed readiness result.
+    return snapshotReadiness(false);
+  }
+}
+
+export async function handleSnapshotReadinessRequest(request: Request, env: IngestEnv): Promise<Response> {
+  if (!await isIngestionRequestAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
+  if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
+  if (new URL(request.url).searchParams.get("source") !== "folketinget") return json({ error: "invalid_source" }, 400);
+  return json(await inspectSnapshotReadiness(env.DB));
 }

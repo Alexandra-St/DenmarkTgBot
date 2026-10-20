@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
       mode:
-        description: "Choose a manual restore, validation, manifest, diff, extraction, relevance, or snapshot-client dry-run"
+        description: "Choose a manual restore, validation, manifest, diff, extraction, relevance, snapshot-client dry-run, or production readiness preflight"
         required: true
         type: choice
         options:
@@ -22,6 +22,7 @@ on:
           - PREPARE_SNAPSHOT_INGESTION
           - SNAPSHOT_INGESTION_DRY_RUN
           - HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN
+          - HISTORICAL_SNAPSHOT_PRODUCTION_PREFLIGHT
         default: RESTORE_VALIDATE
       old_run_id:
         description: "Successful manual baseline run ID for the older manifest (diff/extraction/classification/preparation/snapshot-client dry-run modes)"
@@ -51,6 +52,105 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+      - name: Production snapshot readiness preflight
+        if: inputs.mode == 'HISTORICAL_SNAPSHOT_PRODUCTION_PREFLIGHT'
+        env:
+          INPUT_CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
+          INGEST_API_URL: ${{ vars.INGEST_API_URL }}
+          INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+          from urllib.parse import urlsplit
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, response, code, message, headers, new_url):
+                  return None
+
+          def finish(status, category=None, readiness=None):
+              fields = []
+              if readiness is not None:
+                  fields = [
+                      f"- Schema ready: {str(readiness['schema_ready']).lower()}",
+                      f"- Snapshot state initialized: {str(readiness['snapshot_state_initialized']).lower() if readiness['snapshot_state_initialized'] is not None else 'unknown'}",
+                      f"- Snapshot generation: {readiness['snapshot_generation'] if readiness['snapshot_generation'] is not None else 'null'}",
+                      f"- Active ingestion run: {str(readiness['active_ingestion_run']).lower() if readiness['active_ingestion_run'] is not None else 'unknown'}",
+                      f"- Worker supports snapshot ingestion: {str(readiness['worker_supports_snapshot_ingestion']).lower()}",
+                      f"- Historical snapshot start allowed: {str(readiness['historical_snapshot_start_allowed']).lower()}",
+                  ]
+              lines = [f"Production snapshot readiness preflight: {status}", "", *fields]
+              if category:
+                  lines.extend(["", f"- Error category: {category}"])
+              report = "\n".join(lines) + "\n"
+              print(report, end="")
+              summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary_path:
+                  with open(summary_path, "a", encoding="utf-8") as summary:
+                      summary.write(report)
+
+          if os.environ.get("INPUT_CONFIRM_RESTORE") != "true":
+              finish("FAIL", "manual_confirmation_required")
+              sys.exit(2)
+          base = os.environ.get("INGEST_API_URL", "")
+          token = os.environ.get("INGEST_API_TOKEN", "")
+          try:
+              parsed = urlsplit(base)
+          except ValueError:
+              finish("FAIL", "ingestion_endpoint_invalid")
+              sys.exit(2)
+          if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                  or parsed.password is not None or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
+              finish("FAIL", "ingestion_endpoint_invalid")
+              sys.exit(2)
+          if not token:
+              finish("FAIL", "ingestion_configuration_missing")
+              sys.exit(2)
+          request = urllib.request.Request(
+              base.rstrip("/") + "/internal/snapshot-readiness?source=folketinget",
+              method="GET",
+              headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+          )
+          opener = urllib.request.build_opener(NoRedirect())
+          try:
+              with opener.open(request, timeout=15) as response:
+                  if response.status != 200:
+                      finish("FAIL", "worker_request_rejected")
+                      sys.exit(2)
+                  raw_body = response.read(4097)
+                  if len(raw_body) > 4096:
+                      finish("FAIL", "readiness_response_invalid")
+                      sys.exit(2)
+                  body = json.loads(raw_body.decode("utf-8"))
+          except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+              finish("FAIL", "worker_request_failed")
+              sys.exit(2)
+          expected_keys = {
+              "source", "schema_ready", "snapshot_state_initialized", "snapshot_generation",
+              "active_ingestion_run", "worker_supports_snapshot_ingestion", "historical_snapshot_start_allowed",
+          }
+          nullable_booleans = ("snapshot_state_initialized", "active_ingestion_run")
+          if (not isinstance(body, dict) or set(body) != expected_keys or body.get("source") != "folketinget"
+                  or any(not isinstance(body.get(key), bool) for key in (
+                      "schema_ready", "worker_supports_snapshot_ingestion", "historical_snapshot_start_allowed"))
+                  or any(body.get(key) is not None and not isinstance(body.get(key), bool) for key in nullable_booleans)
+                  or (body.get("snapshot_generation") is not None and
+                      (isinstance(body.get("snapshot_generation"), bool) or not isinstance(body.get("snapshot_generation"), int)))):
+              finish("FAIL", "readiness_response_invalid")
+              sys.exit(2)
+          if body["snapshot_generation"] is not None and body["snapshot_generation"] < 1:
+              finish("FAIL", "readiness_response_invalid")
+              sys.exit(2)
+          safe = {key: body[key] for key in expected_keys}
+          status = "PASS" if safe["historical_snapshot_start_allowed"] is True else "BLOCKED"
+          finish(status, readiness=safe)
+          if status != "PASS":
+              sys.exit(2)
+          PY
       - name: Validate manifest run IDs and artifacts
         if: inputs.mode == 'DIFF_MANIFESTS' || inputs.mode == 'EXTRACT_SNAPSHOT_CANDIDATES' || inputs.mode == 'CLASSIFY_SNAPSHOT_CANDIDATES' || inputs.mode == 'PREPARE_SNAPSHOT_INGESTION' || inputs.mode == 'SNAPSHOT_INGESTION_DRY_RUN'
         env:
@@ -174,7 +274,7 @@ jobs:
             | tee "$RUNNER_TEMP/folketinget-snapshot-diff.json" \
             | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Verify and restore official backup
-        if: inputs.mode != 'DIFF_MANIFESTS'
+        if: inputs.mode != 'DIFF_MANIFESTS' && inputs.mode != 'HISTORICAL_SNAPSHOT_PRODUCTION_PREFLIGHT'
         env:
           INPUT_CONFIRM_RESTORE: ${{ inputs.confirm_restore }}
           INPUT_MODE: ${{ inputs.mode }}
