@@ -35,3 +35,15 @@ export interface InlineKeyboardButton {
 export interface InlineKeyboardMarkup {
   inline_keyboard: InlineKeyboardButton[][];
 }
+
+export interface ReplyKeyboardButton {
+  text: string;
+}
+
+export interface ReplyKeyboardMarkup {
+  keyboard: ReplyKeyboardButton[][];
+  is_persistent: true;
+  resize_keyboard: true;
+}
+
+export type TelegramReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup;

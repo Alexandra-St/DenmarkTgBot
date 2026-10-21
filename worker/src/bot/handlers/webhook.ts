@@ -12,6 +12,7 @@ import {
   languageKeyboard,
   mainKeyboard,
   notificationKeyboard,
+  persistentReplyKeyboard,
   settingsLanguageKeyboard,
   settingsKeyboard,
 } from "../keyboards/index.ts";
@@ -86,13 +87,48 @@ async function showPublicationList(
   telegram: TelegramClient,
   publications: PublicationRepository,
   chatId: number,
-  messageId: number,
+  messageId: number | undefined,
   language: Language,
   context: { kind: "news"; page: number } | { kind: "archive"; filter: ArchiveFilter; page: number },
   metrics?: CallbackMetrics,
 ): Promise<void> {
   const screen = await timed(metrics, "publication_lookup_ms", () => publicationListScreen(publications, language, context));
-  await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, screen.text, screen.keyboard));
+  if (messageId === undefined) await telegram.sendMessage(chatId, screen.text, screen.keyboard);
+  else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, screen.text, screen.keyboard));
+}
+
+async function attachReplyKeyboard(telegram: TelegramClient, chatId: number, language: Language): Promise<void> {
+  await telegram.sendMessage(chatId, t(language, "replyKeyboardReady"), persistentReplyKeyboard(language));
+}
+
+async function showSettings(
+  telegram: TelegramClient,
+  chatId: number,
+  language: Language,
+  messageId?: number,
+  metrics?: CallbackMetrics,
+): Promise<void> {
+  if (messageId === undefined) await telegram.sendMessage(chatId, t(language, "settingsTitle"), settingsKeyboard(language));
+  else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, t(language, "settingsTitle"), settingsKeyboard(language)));
+}
+
+async function showAbout(
+  telegram: TelegramClient,
+  chatId: number,
+  language: Language,
+  sourceStatus?: SourceStatusRepository,
+  messageId?: number,
+  metrics?: CallbackMetrics,
+): Promise<void> {
+  let lastSuccessfulHoeringsportalenRun: string | null = null;
+  try {
+    lastSuccessfulHoeringsportalenRun = await sourceStatus?.lastSuccessfulHoeringsportalenRun() ?? null;
+  } catch {
+    // About must stay available even if source metadata cannot be read.
+  }
+  const text = `${t(language, "aboutText")}\n\n${sourceStatusScreen(language, lastSuccessfulHoeringsportalenRun)}`;
+  if (messageId === undefined) await telegram.sendMessage(chatId, text, backToMainKeyboard(language));
+  else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, text, backToMainKeyboard(language)));
 }
 
 function invalidPublicationNavigation(language: Language): { text: string; keyboard: ReturnType<typeof backToMainKeyboard> } {
@@ -106,7 +142,10 @@ async function handleStart(
 ): Promise<void> {
   if (!message.from || !validTelegramId(message.from.id) || !validTelegramId(message.chat?.id)) return;
   const user = await repository.find(message.from.id);
-  if (user) await showMain(telegram, message.chat.id, user.language);
+  if (user) {
+    await attachReplyKeyboard(telegram, message.chat.id, user.language);
+    await showMain(telegram, message.chat.id, user.language);
+  }
   else await telegram.sendMessage(message.chat.id, languageScreen("uk"), languageKeyboard("uk"));
 }
 
@@ -125,10 +164,33 @@ async function handleMessage(
   message: TelegramMessage,
   repository: UserRepository,
   telegram: TelegramClient,
+  publications?: PublicationRepository,
+  sourceStatus?: SourceStatusRepository,
 ): Promise<void> {
-  const command = message.text?.trim().split(/\s+/, 1)[0]?.split("@")[0].toLowerCase();
+  const text = message.text?.trim();
+  const command = text?.split(/\s+/, 1)[0]?.split("@")[0].toLowerCase();
   if (command === "/start") await handleStart(message, repository, telegram);
   else if (command === "/help") await handleHelp(message, repository, telegram);
+  else if (text && (["news", "archive", "settings", "about"] as const).some((key) => text === t("uk", key) || text === t("ru", key))) {
+    if (!message.from || !validTelegramId(message.from.id) || !validTelegramId(message.chat?.id)) return;
+    const user = await repository.find(message.from.id);
+    if (!user) {
+      await telegram.sendMessage(message.chat.id, languageScreen("uk"), languageKeyboard("uk"));
+      return;
+    }
+    const language = user.language;
+    if (text === t(language, "news")) {
+      if (!publications) await telegram.sendMessage(message.chat.id, t(language, "unavailable"), backToMainKeyboard(language));
+      else await showPublicationList(telegram, publications, message.chat.id, undefined, language, { kind: "news", page: 0 });
+    } else if (text === t(language, "archive")) {
+      if (!publications) await telegram.sendMessage(message.chat.id, t(language, "unavailable"), backToMainKeyboard(language));
+      else await showPublicationList(telegram, publications, message.chat.id, undefined, language, { kind: "archive", filter: "all", page: 0 });
+    } else if (text === t(language, "settings")) {
+      await showSettings(telegram, message.chat.id, language);
+    } else if (text === t(language, "about")) {
+      await showAbout(telegram, message.chat.id, language, sourceStatus);
+    }
+  }
 }
 
 async function processCallback(
@@ -154,6 +216,7 @@ async function processCallback(
         `${t(language, "languageSaved")}\n\n${t(language, "settingsTitle")}`,
         settingsKeyboard(language),
       ));
+      await attachReplyKeyboard(telegram, message.chat.id, language);
     } else {
       const created = await repository.create(callback.from.id, language);
       if (!created) {
@@ -164,6 +227,7 @@ async function processCallback(
           t(language, "languageSaved"),
           { inline_keyboard: [] },
         ));
+        await attachReplyKeyboard(telegram, message.chat.id, language);
         return;
       }
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(
@@ -172,7 +236,7 @@ async function processCallback(
         t(language, "languageSaved"),
         { inline_keyboard: [] },
       ));
-      await telegram.sendMessage(message.chat.id, t(language, "firstTimeWelcome"));
+      await telegram.sendMessage(message.chat.id, t(language, "firstTimeWelcome"), persistentReplyKeyboard(language));
       await showMain(telegram, message.chat.id, language, undefined, undefined, metrics);
     }
     return;
@@ -193,12 +257,7 @@ async function processCallback(
   if (data === "nav:main") {
     await showMain(telegram, message.chat.id, language, message.message_id, undefined, metrics);
   } else if (data === "nav:settings" || data === "menu:settings") {
-    await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(
-      message.chat.id,
-      message.message_id,
-      t(language, "settingsTitle"),
-      settingsKeyboard(language),
-    ));
+    await showSettings(telegram, message.chat.id, language, message.message_id, metrics);
   } else if (data === "settings:language") {
     await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(
       message.chat.id,
@@ -255,18 +314,7 @@ async function processCallback(
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, invalid.text, invalid.keyboard));
     }
   } else if (data === "menu:about") {
-    let lastSuccessfulHoeringsportalenRun: string | null = null;
-    try {
-      lastSuccessfulHoeringsportalenRun = await sourceStatus?.lastSuccessfulHoeringsportalenRun() ?? null;
-    } catch {
-      // About must stay available even if source metadata cannot be read.
-    }
-    await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(
-      message.chat.id,
-      message.message_id,
-      `${t(language, "aboutText")}\n\n${sourceStatusScreen(language, lastSuccessfulHoeringsportalenRun)}`,
-      backToMainKeyboard(language),
-    ));
+    await showAbout(telegram, message.chat.id, language, sourceStatus, message.message_id, metrics);
   }
 }
 
@@ -313,7 +361,7 @@ export async function handleTelegramUpdate(
   sourceStatus?: SourceStatusRepository,
 ): Promise<void> {
   if (update.message) {
-    await handleMessage(update.message, repository, telegram);
+    await handleMessage(update.message, repository, telegram, publications, sourceStatus);
     return;
   }
   if (update.callback_query) {

@@ -6,7 +6,7 @@ import { D1UserRepository, type Language, type UserPreferences, type UserReposit
 import { t } from "../src/localization/index.ts";
 import type { SourceStatusRepository } from "../src/database/source_status.ts";
 import { TelegramApi, type TelegramClient } from "../src/bot/telegram.ts";
-import { languageKeyboard, mainKeyboard, settingsLanguageKeyboard } from "../src/bot/keyboards/index.ts";
+import { languageKeyboard, mainKeyboard, persistentReplyKeyboard, settingsLanguageKeyboard } from "../src/bot/keyboards/index.ts";
 
 class MemoryRepository implements UserRepository {
   readonly users = new Map<number, UserPreferences>();
@@ -156,6 +156,44 @@ test("language selectors in the initial menu and settings use plain language nam
   }
 });
 
+test("persistent reply keyboard has two localized rows and Telegram persistence options", () => {
+  assert.deepEqual(persistentReplyKeyboard("uk"), {
+    keyboard: [[{ text: "📰 Новини" }, { text: "📚 Архів" }], [{ text: "⚙️ Налаштування" }, { text: "ℹ️ Про бота" }]],
+    is_persistent: true,
+    resize_keyboard: true,
+  });
+  assert.deepEqual(persistentReplyKeyboard("ru"), {
+    keyboard: [[{ text: "📰 Новости" }, { text: "📚 Архив" }], [{ text: "⚙️ Настройки" }, { text: "ℹ️ О боте" }]],
+    is_persistent: true,
+    resize_keyboard: true,
+  });
+});
+
+test("localized reply-keyboard text opens new screens with existing inline navigation", async () => {
+  for (const [id, language, labels, headings] of [
+    [290, "uk", ["📰 Новини", "📚 Архів", "⚙️ Налаштування", "ℹ️ Про бота"], ["📰 Новини", "📚 Архів публікацій", "⚙️ Налаштування"]],
+    [291, "ru", ["📰 Новости", "📚 Архив", "⚙️ Настройки", "ℹ️ О боте"], ["📰 Новости", "📚 Архив публикаций", "⚙️ Настройки"]],
+  ] as const) {
+    const repo = new MemoryRepository();
+    const telegram = new MemoryTelegram();
+    repo.users.set(id, { telegram_id: id, language, notify_direct: 1, notify_potential: 0 });
+    const publications = {
+      async listNews() { return { items: [], hasNext: false }; },
+      async listArchive() { return { items: [], hasNext: false }; },
+      async findById() { return null; },
+    };
+    const status = new MemorySourceStatus("2026-10-20T12:00:00.000Z");
+    for (const label of labels) await handleTelegramUpdate(message(id, label), repo, telegram, publications, status);
+    assert.equal(telegram.edited.length, 0, "text-keyboard navigation sends new messages");
+    assert.equal(telegram.sent.length, 4);
+    assert.match(telegram.sent[0].text, new RegExp(headings[0]));
+    assert.match(telegram.sent[1].text, new RegExp(headings[1]));
+    assert.match(telegram.sent[2].text, new RegExp(headings[2]));
+    assert.match(telegram.sent[3].text, language === "uk" ? /Статус офіційних джерел/u : /Статус официальных источников/u);
+    assert.ok(telegram.sent.every(({ keyboard }) => Boolean((keyboard as { inline_keyboard?: unknown }).inline_keyboard)));
+  }
+});
+
 test("repeated start does not duplicate users and returning users retain language", async () => {
   const repo = new MemoryRepository();
   const telegram = new MemoryTelegram();
@@ -164,8 +202,10 @@ test("repeated start does not duplicate users and returning users retain languag
   await handleTelegramUpdate(message(200, "/start"), repo, telegram);
   await handleTelegramUpdate(message(200, "/start@DenmarkForUABot"), repo, telegram);
   assert.equal(repo.creates, 1);
-  assert.equal(telegram.sent.length, 4);
+  assert.equal(telegram.sent.length, 7);
   assert.equal(telegram.sent.filter(({ text }) => text.includes("Добро пожаловать")).length, 1);
+  assert.ok(telegram.sent.filter(({ keyboard }) => (keyboard as { is_persistent?: boolean }).is_persistent).length >= 2);
+  assert.ok(telegram.sent.at(-1)?.keyboard && "inline_keyboard" in (telegram.sent.at(-1)!.keyboard as object));
   assert.match(telegram.sent.at(-1)!.text, /Выберите раздел/);
 });
 
@@ -177,6 +217,7 @@ test("existing users and Settings language changes never receive first-time welc
   await handleTelegramUpdate(callback(249, "lang:uk"), repo, telegram);
   assert.equal(telegram.sent.some(({ text }) => text.includes("Добро пожаловать в DenmarkBot") || text.includes("Вітаємо в DenmarkBot")), false);
   assert.deepEqual(repo.users.get(249), { telegram_id: 249, language: "uk", notify_direct: 0, notify_potential: 1 });
+  assert.deepEqual(telegram.sent.at(-1)?.keyboard, persistentReplyKeyboard("uk"));
 
   await handleTelegramUpdate(callback(250, "lang:uk"), repo, telegram);
   const before = { ...repo.users.get(250)! };
@@ -186,6 +227,7 @@ test("existing users and Settings language changes never receive first-time welc
   assert.equal(repo.users.get(250)?.notify_direct, before.notify_direct);
   assert.equal(repo.users.get(250)?.notify_potential, before.notify_potential);
   assert.match(telegram.edited.at(-1)!.text, /Настройки/);
+  assert.deepEqual(telegram.sent.at(-1)?.keyboard, persistentReplyKeyboard("ru"));
 });
 
 test("concurrent duplicate first language callbacks only send one welcome", async () => {
@@ -386,7 +428,10 @@ test("authenticated webhook persists both language choices, edits to main menu, 
       }
     }
     assert.equal(db.users.size, 2);
-    assert.equal(apiCalls.length, 12);
+    assert.equal(apiCalls.length, 16);
+    const replyKeyboardCalls = apiCalls.filter(({ payload }) => (payload.reply_markup as { is_persistent?: boolean } | undefined)?.is_persistent);
+    assert.equal(replyKeyboardCalls.length, 6);
+    assert.ok(replyKeyboardCalls.every(({ payload }) => (payload.reply_markup as { resize_keyboard?: boolean }).resize_keyboard === true));
     assert.ok(apiCalls.every(({ url }) => url.startsWith("https://api.telegram.org/bottest-token/")));
   } finally {
     globalThis.fetch = oldFetch;

@@ -1,6 +1,6 @@
 import type { Language } from "../../database/users.ts";
 import { t } from "../../localization/index.ts";
-import type { InlineKeyboardMarkup } from "../../types/telegram.ts";
+import type { InlineKeyboardMarkup, ReplyKeyboardMarkup } from "../../types/telegram.ts";
 import type { ArchiveFilter, PublicationRecord } from "../../database/publications.ts";
 
 export type PublicationListContext =
@@ -35,6 +35,17 @@ export function mainKeyboard(language: Language): InlineKeyboardMarkup {
     [{ text: t(language, "settings"), callback_data: "menu:settings" }],
     [{ text: t(language, "about"), callback_data: "menu:about" }],
   );
+}
+
+export function persistentReplyKeyboard(language: Language): ReplyKeyboardMarkup {
+  return {
+    keyboard: [
+      [{ text: t(language, "news") }, { text: t(language, "archive") }],
+      [{ text: t(language, "settings") }, { text: t(language, "about") }],
+    ],
+    is_persistent: true,
+    resize_keyboard: true,
+  };
 }
 
 export function settingsKeyboard(language: Language): InlineKeyboardMarkup {

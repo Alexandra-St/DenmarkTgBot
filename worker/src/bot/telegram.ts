@@ -1,7 +1,7 @@
-import type { InlineKeyboardMarkup } from "../types/telegram.ts";
+import type { InlineKeyboardMarkup, TelegramReplyMarkup } from "../types/telegram.ts";
 
 export interface TelegramClient {
-  sendMessage(chatId: number, text: string, keyboard?: InlineKeyboardMarkup): Promise<void>;
+  sendMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<void>;
   editMessage(chatId: number, messageId: number, text: string, keyboard?: InlineKeyboardMarkup): Promise<void>;
   answerCallback(callbackId: string): Promise<void>;
 }
@@ -50,7 +50,7 @@ export class TelegramApi implements TelegramClient {
     }
   }
 
-  async sendMessage(chatId: number, text: string, keyboard?: InlineKeyboardMarkup): Promise<void> {
+  async sendMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<void> {
     await this.call("sendMessage", {
       chat_id: chatId,
       text,
