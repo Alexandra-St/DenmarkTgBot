@@ -62,6 +62,14 @@ _PREPARATION_ERROR_CATEGORIES = {
     "publication has no source URL": "candidate_source_url_missing",
 }
 _RECORD_TOO_LARGE_ERROR = "one record exceeds the safe request size"
+_WORKER_MAX_BODY_BYTES = 256 * 1024
+_WORKER_MAX_SNAPSHOT_BYTES = 128 * 1024
+_OVERSIZED_DETAIL_KEYS = frozenset({
+    "oversized_record_count", "max_record_bytes", "max_snapshot_bytes",
+    "max_source_metadata_bytes", "max_diagnostics_bytes", "max_document_count",
+    "max_stage_count", "max_vote_count", "worker_snapshot_limit_exceeded_count",
+    "worker_request_limit_exceeded_count",
+})
 
 
 @dataclass(frozen=True)
@@ -81,10 +89,17 @@ class SnapshotIdentity:
 class SnapshotIngestionError(ValueError):
     """Safe failure carrying only a fixed code, stage and optional run UUID."""
 
-    def __init__(self, code: str, run_id: str | None = None, stage: str | None = None) -> None:
+    def __init__(self, code: str, run_id: str | None = None, stage: str | None = None,
+                 details: Mapping[str, int] | None = None) -> None:
         self.code = code
         self.run_id = run_id
         self.stage = stage
+        if details is not None and (
+            not set(details).issubset(_OVERSIZED_DETAIL_KEYS)
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in details.values())
+        ):
+            raise ValueError("unsafe snapshot ingestion error details")
+        self.details = dict(details or {})
         suffix = f" run_id={run_id}" if run_id else ""
         super().__init__(code + suffix)
 
@@ -97,6 +112,47 @@ def _safe_candidate_ingestion_error(error: ingestion_client.IngestionError, *, s
     if stage == "batch" and message == _RECORD_TOO_LARGE_ERROR:
         return "candidate_record_too_large"
     return "candidate_preparation_failed"
+
+
+def _json_bytes(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _oversized_record_diagnostics(records: list[dict[str, Any]]) -> dict[str, int]:
+    oversized: list[tuple[dict[str, Any], int, int]] = []
+    for record in records:
+        record_bytes = _json_bytes(record)
+        request_bytes = _json_bytes({"records": [record]})
+        if request_bytes > ingestion_client.MAX_BATCH_BYTES:
+            oversized.append((record, record_bytes, request_bytes))
+    if not oversized:
+        return {}
+
+    def nested_bytes(record: Mapping[str, Any], field: str) -> int:
+        return _json_bytes(record.get(field))
+
+    def relationship_count(record: Mapping[str, Any], field: str) -> int:
+        snapshot = record.get("normalized_snapshot")
+        value = snapshot.get(field) if isinstance(snapshot, Mapping) else None
+        return len(value) if isinstance(value, list) else 0
+
+    return {
+        "oversized_record_count": len(oversized),
+        "max_record_bytes": max(record_bytes for _, record_bytes, _ in oversized),
+        "max_snapshot_bytes": max(nested_bytes(record, "normalized_snapshot") for record, _, _ in oversized),
+        "max_source_metadata_bytes": max(nested_bytes(record, "source_metadata") for record, _, _ in oversized),
+        "max_diagnostics_bytes": max(nested_bytes(record, "diagnostics") for record, _, _ in oversized),
+        "max_document_count": max(relationship_count(record, "documents") for record, _, _ in oversized),
+        "max_stage_count": max(relationship_count(record, "stages") for record, _, _ in oversized),
+        "max_vote_count": max(relationship_count(record, "votes") for record, _, _ in oversized),
+        "worker_snapshot_limit_exceeded_count": sum(
+            nested_bytes(record, "normalized_snapshot") > _WORKER_MAX_SNAPSHOT_BYTES
+            for record, _, _ in oversized
+        ),
+        "worker_request_limit_exceeded_count": sum(
+            request_bytes > _WORKER_MAX_BODY_BYTES for _, _, request_bytes in oversized
+        ),
+    }
 
 
 def validate_snapshot_identity(value: object) -> SnapshotIdentity:
@@ -687,8 +743,10 @@ def ingest_snapshot_candidates(
     try:
         batches = ingestion_client.chunks(records)
     except ingestion_client.IngestionError as error:
+        code = _safe_candidate_ingestion_error(error, stage="batch")
+        details = _oversized_record_diagnostics(records) if code == "candidate_record_too_large" else None
         raise SnapshotIngestionError(
-            _safe_candidate_ingestion_error(error, stage="batch"), run_id, "batch"
+            code, run_id, "batch", details
         ) from None
     except Exception:
         raise SnapshotIngestionError("candidate_preparation_failed", run_id, "batch") from None
@@ -780,7 +838,8 @@ def main(argv: list[str] | None = None, opener: Opener = urllib.request.urlopen)
         return 0 if result.get("status") == "COMMITTED" else 2
     except SnapshotIngestionError as error:
         print(json.dumps({"error": error.code, **({"run_id": error.run_id} if error.run_id else {}),
-                          **({"stage": error.stage} if error.stage else {})}, separators=(",", ":")), file=sys.stderr)
+                          **({"stage": error.stage} if error.stage else {}),
+                          **error.details}, separators=(",", ":")), file=sys.stderr)
         return 2
 
 

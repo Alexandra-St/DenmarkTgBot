@@ -157,6 +157,48 @@ class SnapshotIngestionClientTests(unittest.TestCase):
                 self.assertEqual(stdout.getvalue(), "")
                 self.assertEqual(stderr.getvalue(), "")
 
+                if expected_code == "candidate_record_too_large":
+                    prepared = ingestion_client.prepare_records({"cases": data["cases"]}, "folketinget", "incremental")
+                    record = prepared[0]
+                    encoded = lambda value: len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                    details = caught.exception.details
+                    self.assertEqual(details["oversized_record_count"], 1)
+                    self.assertEqual(details["max_record_bytes"], encoded(record))
+                    self.assertEqual(details["max_snapshot_bytes"], encoded(record["normalized_snapshot"]))
+                    self.assertEqual(details["max_source_metadata_bytes"], encoded(record["source_metadata"]))
+                    self.assertEqual(details["max_diagnostics_bytes"], encoded(record["diagnostics"]))
+                    self.assertEqual(details["max_document_count"], len(record["normalized_snapshot"]["documents"]))
+                    self.assertEqual(details["max_stage_count"], len(record["normalized_snapshot"]["stages"]))
+                    self.assertEqual(details["max_vote_count"], len(record["normalized_snapshot"]["votes"]))
+                    self.assertEqual(details["worker_snapshot_limit_exceeded_count"], 1)
+                    self.assertEqual(details["worker_request_limit_exceeded_count"], 1)
+
+    def test_oversized_cli_diagnostics_are_aggregate_only(self) -> None:
+        private_title = "PRIVATE TITLE FROM SOURCE" + ("X" * (300 * 1024))
+        data = bundle()
+        data["cases"][0]["title"] = private_title
+        with tempfile.TemporaryDirectory() as directory:
+            bundle_path = Path(directory) / "candidates.json"
+            base_path = Path(directory) / "base.json"
+            target_path = Path(directory) / "target.json"
+            bundle_path.write_text(json.dumps(data), encoding="utf-8")
+            base_path.write_text(json.dumps(BASE), encoding="utf-8")
+            target_path.write_text(json.dumps(TARGET), encoding="utf-8")
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                code = main([str(bundle_path), "--mode", "incremental", "--base-snapshot", str(base_path),
+                             "--target-snapshot", str(target_path)])
+        self.assertEqual(code, 2)
+        diagnostic = json.loads(stderr.getvalue())
+        self.assertEqual(diagnostic["error"], "candidate_record_too_large")
+        self.assertEqual(diagnostic["oversized_record_count"], 1)
+        self.assertEqual(diagnostic["worker_snapshot_limit_exceeded_count"], 1)
+        self.assertEqual(diagnostic["worker_request_limit_exceeded_count"], 1)
+        self.assertNotIn("external_id", diagnostic)
+        self.assertNotIn("title", diagnostic)
+        self.assertNotIn("url", diagnostic)
+        self.assertNotIn("PRIVATE", stderr.getvalue())
+
     def test_unknown_candidate_preparation_error_does_not_leak_details(self) -> None:
         private_error = "PRIVATE-ID-998 PRIVATE TITLE https://private.example/source/998"
         stdout = StringIO()
