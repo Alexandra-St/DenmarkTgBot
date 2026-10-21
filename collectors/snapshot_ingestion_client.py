@@ -56,6 +56,13 @@ WORKER_ERRORS = frozenset({
     "invalid_classification", "invalid_snapshot", "publication_too_large", "batches_incomplete",
 })
 
+_PREPARATION_ERROR_CATEGORIES = {
+    "record has no valid official numeric ID or title": "candidate_identity_or_title_invalid",
+    "Folketinget case has no official source URL": "candidate_source_url_missing",
+    "publication has no source URL": "candidate_source_url_missing",
+}
+_RECORD_TOO_LARGE_ERROR = "one record exceeds the safe request size"
+
 
 @dataclass(frozen=True)
 class SnapshotIdentity:
@@ -80,6 +87,16 @@ class SnapshotIngestionError(ValueError):
         self.stage = stage
         suffix = f" run_id={run_id}" if run_id else ""
         super().__init__(code + suffix)
+
+
+def _safe_candidate_ingestion_error(error: ingestion_client.IngestionError, *, stage: str) -> str:
+    """Map only exact local validation messages to fixed, non-sensitive categories."""
+    message = error.args[0] if len(error.args) == 1 and isinstance(error.args[0], str) else None
+    if stage == "prepare":
+        return _PREPARATION_ERROR_CATEGORIES.get(message, "candidate_preparation_failed")
+    if stage == "batch" and message == _RECORD_TOO_LARGE_ERROR:
+        return "candidate_record_too_large"
+    return "candidate_preparation_failed"
 
 
 def validate_snapshot_identity(value: object) -> SnapshotIdentity:
@@ -652,16 +669,35 @@ def ingest_snapshot_candidates(
         raise SnapshotIngestionError("incomplete_candidates", run_id)
     try:
         records = ingestion_client.prepare_records({"cases": cases}, source="folketinget", mode=mode)
+    except ingestion_client.IngestionError as error:
+        raise SnapshotIngestionError(
+            _safe_candidate_ingestion_error(error, stage="prepare"), run_id, "prepare"
+        ) from None
+    except Exception:
+        raise SnapshotIngestionError("candidate_preparation_failed", run_id, "prepare") from None
+    try:
         case_ids = {record["external_id"] for record in records}
         if case_ids.intersection(item["external_id"] for item in tombstones):
             raise SnapshotIngestionError("tombstone_conflicts_with_publication")
         records.extend(tombstones)
+    except SnapshotIngestionError:
+        raise
+    except Exception:
+        raise SnapshotIngestionError("candidate_preparation_failed", run_id, "prepare") from None
+    try:
         batches = ingestion_client.chunks(records)
+    except ingestion_client.IngestionError as error:
+        raise SnapshotIngestionError(
+            _safe_candidate_ingestion_error(error, stage="batch"), run_id, "batch"
+        ) from None
+    except Exception:
+        raise SnapshotIngestionError("candidate_preparation_failed", run_id, "batch") from None
+    try:
         counts = _relevance_counts([record for record in records if record.get("operation") is None])
     except SnapshotIngestionError:
         raise
     except Exception:
-        raise SnapshotIngestionError("candidate_records_invalid", run_id) from None
+        raise SnapshotIngestionError("candidate_preparation_failed", run_id, "prepare") from None
 
     if mode == "incremental" and (
         len(batches) > MAX_INCREMENTAL_BATCHES

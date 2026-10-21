@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 import urllib.error
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from io import StringIO
 from unittest.mock import patch
@@ -117,6 +117,62 @@ class SnapshotIngestionClientTests(unittest.TestCase):
         result = ingest_snapshot_candidates({"source": "folketinget", "complete": True, "cases": []},
                                             mode="incremental", base_snapshot=BASE, target_snapshot=TARGET)
         self.assertEqual((result["records"], result["batches"]), (0, 1))
+
+    def test_candidate_validation_errors_use_safe_fixed_categories(self) -> None:
+        private_values = (
+            "PRIVATE-ID-998",
+            "PRIVATE TITLE FROM SOURCE",
+            "https://private.example/source/998",
+        )
+        invalid_cases: list[tuple[dict[str, object], str]] = []
+
+        invalid_identity = bundle()
+        invalid_identity["cases"][0].update({
+            "external_id": private_values[0],
+            "title": private_values[1],
+            "source_url": private_values[2],
+        })
+        invalid_cases.append((invalid_identity, "candidate_identity_or_title_invalid"))
+
+        missing_url = bundle()
+        missing_url["cases"][0].update({"title": private_values[1], "source_url": None})
+        invalid_cases.append((missing_url, "candidate_source_url_missing"))
+
+        oversized = bundle()
+        oversized["cases"][0]["title"] = private_values[1] + ("X" * ingestion_client.MAX_BATCH_BYTES)
+        invalid_cases.append((oversized, "candidate_record_too_large"))
+
+        for data, expected_code in invalid_cases:
+            with self.subTest(expected_code=expected_code):
+                stdout = StringIO()
+                stderr = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(SnapshotIngestionError) as caught:
+                    ingest_snapshot_candidates(data, mode="incremental", base_snapshot=BASE,
+                                               target_snapshot=TARGET, dry_run=True)
+                self.assertEqual(caught.exception.code, expected_code)
+                self.assertIn(caught.exception.stage, {"prepare", "batch"})
+                safe_output = str(caught.exception) + stdout.getvalue() + stderr.getvalue()
+                for private_value in private_values:
+                    self.assertNotIn(private_value, safe_output)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_unknown_candidate_preparation_error_does_not_leak_details(self) -> None:
+        private_error = "PRIVATE-ID-998 PRIVATE TITLE https://private.example/source/998"
+        stdout = StringIO()
+        stderr = StringIO()
+        with patch("collectors.snapshot_ingestion_client.ingestion_client.prepare_records",
+                   side_effect=ingestion_client.IngestionError(private_error)), \
+             redirect_stdout(stdout), redirect_stderr(stderr), \
+             self.assertRaises(SnapshotIngestionError) as caught:
+            ingest_snapshot_candidates(bundle(), mode="incremental", base_snapshot=BASE,
+                                       target_snapshot=TARGET, dry_run=True)
+        self.assertEqual(caught.exception.code, "candidate_preparation_failed")
+        self.assertEqual(caught.exception.stage, "prepare")
+        safe_output = str(caught.exception) + stdout.getvalue() + stderr.getvalue()
+        self.assertNotIn(private_error, safe_output)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_incremental_snapshot_tombstone_is_counted_and_batched_without_classification(self) -> None:
         data = {"source": "folketinget", "complete": True, "cases": [],
