@@ -36,14 +36,9 @@ export interface InlineKeyboardMarkup {
   inline_keyboard: InlineKeyboardButton[][];
 }
 
-export interface ReplyKeyboardButton {
-  text: string;
+export interface ReplyKeyboardRemove {
+  remove_keyboard: true;
+  selective?: boolean;
 }
 
-export interface ReplyKeyboardMarkup {
-  keyboard: ReplyKeyboardButton[][];
-  is_persistent: true;
-  resize_keyboard: true;
-}
-
-export type TelegramReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup;
+export type TelegramReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardRemove;

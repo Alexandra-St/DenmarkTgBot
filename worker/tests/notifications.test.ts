@@ -676,15 +676,16 @@ test("local end-to-end: historical baseline, incremental changes, preference que
     assert.ok(candidateRows.results.filter((row) => row.telegram_id === 1002).every((row) => row.language === "ru" && row.relevance === "POTENTIAL"));
     assert.equal(candidateRows.results.some((row) => row.telegram_id === 1003), false);
 
-    const sent: Array<{ chatId: number; text: string }> = [];
+    const sent: Array<{ chatId: number; text: string; keyboard?: unknown }> = [];
     const delivery = await deliverPendingNotifications(envWithCutoff, {
-      async sendMessage(chatId, text) { sent.push({ chatId, text }); },
+      async sendMessage(chatId, text, keyboard) { sent.push({ chatId, text, keyboard }); },
     }, new Date());
     assert.deepEqual(delivery, { enabled: true, sent: 4, failed: 0 });
     assert.equal(sent.length, 4);
     assert.equal(sent.filter((item) => item.chatId === 1001 && item.text.includes("не юридична консультація")).length, 2);
     assert.equal(sent.filter((item) => item.chatId === 1002 && item.text.includes("не юридическая консультация")).length, 2);
     assert.ok(sent.every((item) => item.text.includes("https://hoeringsportalen.dk/Hearing/Details/")));
+    assert.ok(sent.every((item) => JSON.stringify(item.keyboard).includes('"callback_data":"notification:main"')));
     const states = await db.prepare("SELECT status, COUNT(*) AS count FROM notifications GROUP BY status").all<{ status: string; count: number }>();
     assert.deepEqual(states.results.map((row) => ({ ...row })), [{ status: "SENT", count: 4 }]);
     const oldFirstSeenNotifications = await db.prepare("SELECT COUNT(*) AS count FROM notifications n JOIN publication_events e ON e.id=n.event_id WHERE e.event_type='FIRST_SEEN'")

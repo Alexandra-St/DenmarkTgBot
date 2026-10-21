@@ -125,7 +125,7 @@ export async function publicationDetailScreen(
 
   return {
     text: lines.join("\n"),
-    keyboard: publicationDetailKeyboard(language, url ?? undefined),
+    keyboard: publicationDetailKeyboard(language, context, url ?? undefined),
   };
 }
 

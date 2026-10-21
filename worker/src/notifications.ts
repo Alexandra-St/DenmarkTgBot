@@ -1,6 +1,8 @@
 import type { Language } from "./database/users.ts";
 import { validatedOfficialUrl } from "./bot/publications.ts";
+import { notificationMainMenuKeyboard } from "./bot/keyboards/index.ts";
 import { t } from "./localization/index.ts";
+import type { InlineKeyboardMarkup } from "./types/telegram.ts";
 
 const MAX_EVENT_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -17,7 +19,7 @@ export interface NotificationEnv {
 }
 
 export interface NotificationTelegramClient {
-  sendMessage(chatId: number, text: string): Promise<void>;
+  sendMessage(chatId: number, text: string, keyboard?: InlineKeyboardMarkup): Promise<void>;
 }
 
 export interface NotificationQueueResult {
@@ -313,7 +315,7 @@ export async function deliverPendingNotifications(
       continue;
     }
     try {
-      await telegram.sendMessage(row.telegram_id, text);
+      await telegram.sendMessage(row.telegram_id, text, notificationMainMenuKeyboard(row.language));
       const result = await env.DB.prepare("UPDATE notifications SET status = 'SENT', attempts = attempts + 1, sent_at = ?, last_error = NULL WHERE id = ? AND status = 'SENDING'")
         .bind(now.toISOString(), row.id).run();
       if ((result.meta.changes ?? 0) === 1) sent += 1;

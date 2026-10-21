@@ -7,7 +7,7 @@ import { t } from "../src/localization/index.ts";
 import { type NavigationStateRepository, type UserNavigationState } from "../src/database/navigation_state.ts";
 import type { SourceStatusRepository } from "../src/database/source_status.ts";
 import { TelegramApi, type TelegramClient } from "../src/bot/telegram.ts";
-import { languageKeyboard, mainKeyboard, notificationKeyboard, notificationToggleText, persistentReplyKeyboard, sectionNavigationKeyboard, settingsKeyboard, settingsLanguageKeyboard } from "../src/bot/keyboards/index.ts";
+import { detailNavigationKeyboard, languageKeyboard, mainKeyboard, notificationKeyboard, notificationMainMenuKeyboard, replyKeyboardRemoval, sectionNavigationKeyboard, settingsKeyboard, settingsLanguageKeyboard } from "../src/bot/keyboards/index.ts";
 
 class MemoryRepository implements UserRepository {
   readonly users = new Map<number, UserPreferences>();
@@ -163,7 +163,7 @@ test("first language selection sends localized first-time welcome and then main 
   }
 });
 
-test("language selectors in the initial menu and settings use plain language names", () => {
+test("language selectors in the initial menu and settings use plain language names and callbacks", () => {
   const onboardingMarkup = languageKeyboard("uk");
   {
     const labels = onboardingMarkup.inline_keyboard.slice(0, 2).map((row) => row[0].text);
@@ -171,29 +171,27 @@ test("language selectors in the initial menu and settings use plain language nam
     assert.ok(onboardingMarkup.inline_keyboard.flat().every((button) => !/[🇺🇦🇷🇺]/u.test(button.text)));
   }
   for (const markup of [settingsLanguageKeyboard("ru")]) {
-    const labels = markup.keyboard[0].map((row) => row.text);
+    const labels = markup.inline_keyboard[0].map((row) => row.text);
     assert.deepEqual(labels, ["Українська", "Русский"]);
-    assert.ok(markup.keyboard.flat().every((button) => !/[🇺🇦🇷🇺]/u.test(button.text)));
+    assert.ok(markup.inline_keyboard.flat().every((button) => Boolean(button.callback_data) && !/[🇺🇦🇷🇺]/u.test(button.text)));
   }
 });
 
-test("persistent reply keyboard has two localized rows and Telegram persistence options", () => {
-  assert.deepEqual(persistentReplyKeyboard("uk"), {
-    keyboard: [[{ text: "📰 Новини" }, { text: "📚 Архів" }], [{ text: "⚙️ Налаштування" }, { text: "ℹ️ Про бота" }]],
-    is_persistent: true,
-    resize_keyboard: true,
-  });
-  assert.deepEqual(persistentReplyKeyboard("ru"), {
-    keyboard: [[{ text: "📰 Новости" }, { text: "📚 Архив" }], [{ text: "⚙️ Настройки" }, { text: "ℹ️ О боте" }]],
-    is_persistent: true,
-    resize_keyboard: true,
-  });
+test("main menu is inline in Ukrainian and Russian; Reply Keyboard removal is explicit", () => {
+  assert.deepEqual(mainKeyboard("uk").inline_keyboard.map((row) => row.map((button) => button.text)), [
+    ["📰 Новини", "📚 Архів"], ["⚙️ Налаштування", "ℹ️ Про бота"],
+  ]);
+  assert.deepEqual(mainKeyboard("ru").inline_keyboard.map((row) => row.map((button) => button.text)), [
+    ["📰 Новости", "📚 Архив"], ["⚙️ Настройки", "ℹ️ О боте"],
+  ]);
+  assert.ok(mainKeyboard("uk").inline_keyboard.flat().every((button) => Boolean(button.callback_data)));
+  assert.deepEqual(replyKeyboardRemoval(), { remove_keyboard: true });
 });
 
-test("localized reply-keyboard text opens new screens with existing inline navigation", async () => {
+test("inline navigation opens screens and first-level Back returns to root without duplicate Home", async () => {
   for (const [id, language, labels, headings] of [
-    [290, "uk", ["📰 Новини", "📚 Архів", "⚙️ Налаштування", "ℹ️ Про бота"], ["📰 Новини", "📚 Архів публікацій", "⚙️ Налаштування"]],
-    [291, "ru", ["📰 Новости", "📚 Архив", "⚙️ Настройки", "ℹ️ О боте"], ["📰 Новости", "📚 Архив публикаций", "⚙️ Настройки"]],
+    [290, "uk", ["menu:news", "menu:archive", "menu:settings", "menu:about"], ["📰 Новини", "📚 Архів публікацій", "⚙️ Налаштування"]],
+    [291, "ru", ["menu:news", "menu:archive", "menu:settings", "menu:about"], ["📰 Новости", "📚 Архив публикаций", "⚙️ Настройки"]],
   ] as const) {
     const repo = new MemoryRepository();
     const telegram = new MemoryTelegram();
@@ -205,22 +203,22 @@ test("localized reply-keyboard text opens new screens with existing inline navig
     };
     const status = new MemorySourceStatus("2026-10-20T12:00:00.000Z");
     const navigation = new MemoryNavigation();
-    for (const label of labels) await handleTelegramUpdate(message(id, label), repo, telegram, publications, status, navigation);
-    assert.equal(telegram.edited.length, 0, "text-keyboard navigation sends new messages");
-    assert.equal(telegram.sent.length, 6);
-    assert.match(telegram.sent[0].text, new RegExp(headings[0]));
-    assert.match(telegram.sent[2].text, new RegExp(headings[1]));
-    assert.match(telegram.sent[4].text, new RegExp(headings[2]));
-    assert.match(telegram.sent[5].text, language === "uk" ? /Статус офіційних джерел/u : /Статус официальных источников/u);
-    assert.ok(Boolean((telegram.sent[0].keyboard as { inline_keyboard?: unknown }).inline_keyboard));
-    assert.ok(Boolean((telegram.sent[2].keyboard as { inline_keyboard?: unknown }).inline_keyboard));
-    assert.deepEqual(telegram.sent[1].keyboard, sectionNavigationKeyboard(language));
-    assert.deepEqual(telegram.sent[3].keyboard, sectionNavigationKeyboard(language));
+    for (const label of labels) await handleTelegramUpdate(callback(id, label), repo, telegram, publications, status, navigation);
+    assert.equal(telegram.edited.length, 4);
+    assert.equal(telegram.sent.length, 0, "ordinary inline navigation edits the current screen without service messages");
+    assert.match(telegram.edited[0].text, new RegExp(headings[0]));
+    assert.match(telegram.edited[1].text, new RegExp(headings[1]));
+    assert.match(telegram.edited[2].text, new RegExp(headings[2]));
+    assert.match(telegram.edited[3].text, language === "uk" ? /Статус офіційних джерел/u : /Статус официальных источников/u);
+    assert.deepEqual(telegram.edited[0].keyboard, sectionNavigationKeyboard(language));
+    assert.equal(sectionNavigationKeyboard(language).inline_keyboard.flat().length, 1, "first-level screen has Back only");
     assert.equal(navigation.states.get(id)?.screen, "about");
+    await handleTelegramUpdate(callback(id, "nav:main"), repo, telegram, publications, status, navigation);
+    assert.deepEqual(telegram.edited.at(-1)?.keyboard, mainKeyboard(language));
   }
 });
 
-test("settings navigation survives a new handler instance, returns to parent, and Home returns to root", async () => {
+test("inline settings navigation survives restart, toggles preferences, changes language and returns", async () => {
   const repo = new MemoryRepository();
   const telegram = new MemoryTelegram();
   const persisted = new Map<number, UserNavigationState>();
@@ -228,33 +226,29 @@ test("settings navigation survives a new handler instance, returns to parent, an
   const restartedWorkerNavigation = new MemoryNavigation(persisted);
   repo.users.set(292, { telegram_id: 292, language: "ru", notify_direct: 1, notify_potential: 0 });
 
-  await handleTelegramUpdate(message(292, "⚙️ Настройки"), repo, telegram, undefined, undefined, firstWorkerNavigation);
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, settingsKeyboard("ru"));
-  await handleTelegramUpdate(message(292, "🔔 Уведомления"), repo, telegram, undefined, undefined, firstWorkerNavigation);
+  await handleTelegramUpdate(callback(292, "menu:settings"), repo, telegram, undefined, undefined, firstWorkerNavigation);
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, settingsKeyboard("ru"));
+  await handleTelegramUpdate(callback(292, "settings:notifications"), repo, telegram, undefined, undefined, firstWorkerNavigation);
   assert.equal(persisted.get(292)?.screen, "settings_notifications");
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, notificationKeyboard("ru", true, false));
-  const ruNotificationKeyboard = telegram.sent.at(-1)!.keyboard as { keyboard: Array<Array<{ text: string }>> };
-  assert.equal(ruNotificationKeyboard.keyboard[0][0].text, notificationToggleText("ru", "direct", true));
-  assert.equal(ruNotificationKeyboard.keyboard[1][0].text, notificationToggleText("ru", "potential", false));
-
-  await handleTelegramUpdate(message(292, "✅ DIRECT — включено"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, notificationKeyboard("ru", true, false));
+  await handleTelegramUpdate(callback(292, "notify:direct:set:0"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
   assert.equal(repo.users.get(292)?.notify_direct, 0);
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, notificationKeyboard("ru", false, false));
-  await handleTelegramUpdate(message(292, notificationToggleText("ru", "potential", false)), repo, telegram, undefined, undefined, restartedWorkerNavigation);
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, notificationKeyboard("ru", false, false));
+  await handleTelegramUpdate(callback(292, "notify:potential:set:1"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
   assert.equal(repo.users.get(292)?.notify_potential, 1);
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, notificationKeyboard("ru", false, true));
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, notificationKeyboard("ru", false, true));
 
-  await handleTelegramUpdate(message(292, "⬅️ Назад"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
+  await handleTelegramUpdate(callback(292, "nav:back"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
   assert.equal(persisted.get(292)?.screen, "settings");
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, settingsKeyboard("ru"));
-  await handleTelegramUpdate(message(292, "🌐 Язык"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, settingsLanguageKeyboard("ru"));
-  await handleTelegramUpdate(message(292, "Українська"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, settingsKeyboard("ru"));
+  await handleTelegramUpdate(callback(292, "settings:language"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, settingsLanguageKeyboard("ru"));
+  await handleTelegramUpdate(callback(292, "settings:language:uk"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
   assert.equal(repo.users.get(292)?.language, "uk");
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, settingsKeyboard("uk"));
-  await handleTelegramUpdate(message(292, "🏠 Головне меню"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, settingsKeyboard("uk"));
+  await handleTelegramUpdate(callback(292, "nav:back"), repo, telegram, undefined, undefined, restartedWorkerNavigation);
   assert.equal(persisted.get(292)?.screen, "main");
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, mainKeyboard("uk"));
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, mainKeyboard("uk"));
 });
 
 test("missing or invalid navigation state safely sends the main menu", async () => {
@@ -263,9 +257,9 @@ test("missing or invalid navigation state safely sends the main menu", async () 
   const navigation = new MemoryNavigation();
   repo.users.set(293, { telegram_id: 293, language: "uk", notify_direct: 1, notify_potential: 0 });
   navigation.states.set(293, { screen: "publication_detail", parent_screen: "settings", publication_kind: "news", archive_filter: null, page: 0 });
-  await handleTelegramUpdate(message(293, "⬅️ Назад"), repo, telegram, undefined, undefined, navigation);
+  await handleTelegramUpdate(callback(293, "nav:back"), repo, telegram, undefined, undefined, navigation);
   assert.equal(navigation.states.get(293)?.screen, "main");
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, mainKeyboard("uk"));
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, mainKeyboard("uk"));
 });
 
 test("repeated start does not duplicate users and returning users retain language", async () => {
@@ -276,9 +270,9 @@ test("repeated start does not duplicate users and returning users retain languag
   await handleTelegramUpdate(message(200, "/start"), repo, telegram);
   await handleTelegramUpdate(message(200, "/start@DenmarkForUABot"), repo, telegram);
   assert.equal(repo.creates, 1);
-  assert.equal(telegram.sent.length, 5);
+  assert.equal(telegram.sent.length, 7);
   assert.equal(telegram.sent.filter(({ text }) => text.includes("Добро пожаловать")).length, 1);
-  assert.ok(telegram.sent.filter(({ keyboard }) => (keyboard as { is_persistent?: boolean }).is_persistent).length >= 2);
+  assert.equal(telegram.sent.filter(({ keyboard }) => JSON.stringify(keyboard) === JSON.stringify(replyKeyboardRemoval())).length, 2);
   assert.deepEqual(telegram.sent.at(-1)?.keyboard, mainKeyboard("ru"));
   assert.match(telegram.sent.at(-1)!.text, /Выберите раздел/);
 });
@@ -339,10 +333,13 @@ test("explicit preference callbacks are idempotent and DIRECT/POTENTIAL stay ind
   const telegram = new MemoryTelegram();
   await handleTelegramUpdate(callback(300, "lang:uk"), repo, telegram);
   await handleTelegramUpdate(callback(300, "settings:notifications"), repo, telegram);
-  assert.deepEqual(telegram.sent.at(-1)?.keyboard, notificationKeyboard("uk", true, false));
-  const ukNotificationKeyboard = telegram.sent.at(-1)!.keyboard as { keyboard: Array<Array<{ text: string }>> };
-  assert.equal(ukNotificationKeyboard.keyboard[0][0].text, notificationToggleText("uk", "direct", true));
-  assert.equal(ukNotificationKeyboard.keyboard[1][0].text, notificationToggleText("uk", "potential", false));
+  assert.deepEqual(telegram.edited.at(-1)?.keyboard, notificationKeyboard("uk", true, false));
+  const ukNotificationKeyboard = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data?: string }>> };
+  assert.deepEqual(ukNotificationKeyboard.inline_keyboard.flat().map((button) => button.callback_data), [
+    "notify:direct:set:0", "notify:potential:set:1", "nav:back", "nav:main",
+  ]);
+  assert.equal(ukNotificationKeyboard.inline_keyboard[0][0].text, "✅ DIRECT");
+  assert.equal(ukNotificationKeyboard.inline_keyboard[1][0].text, "⬜ POTENTIAL");
   await handleTelegramUpdate(callback(300, "notify:potential:set:1"), repo, telegram);
   await handleTelegramUpdate(callback(300, "notify:potential:set:1"), repo, telegram);
   assert.deepEqual(
@@ -365,6 +362,41 @@ test("explicit preference callbacks are idempotent and DIRECT/POTENTIAL stay ind
   assert.match(telegram.sent.at(-1)!.text, /Настройки/);
 });
 
+test("publication detail exposes Back to its exact list context and Home only once", () => {
+  const news = detailNavigationKeyboard("uk", { kind: "news", page: 3 });
+  assert.deepEqual(news.inline_keyboard.flat().map((button) => button.callback_data), ["news:page:3", "nav:main"]);
+  const archive = detailNavigationKeyboard("ru", { kind: "archive", filter: "potential", page: 4 });
+  assert.deepEqual(archive.inline_keyboard.flat().map((button) => button.callback_data), ["archive:page:potential:4", "nav:main"]);
+  assert.deepEqual(sectionNavigationKeyboard("uk").inline_keyboard.flat().map((button) => button.callback_data), ["nav:main"]);
+});
+
+test("legacy reply-keyboard text is ignored while /start removes the old keyboard", async () => {
+  const repo = new MemoryRepository();
+  const telegram = new MemoryTelegram();
+  const navigation = new MemoryNavigation();
+  repo.users.set(403, { telegram_id: 403, language: "ru", notify_direct: 0, notify_potential: 1 });
+  await handleTelegramUpdate(message(403, "📰 Новости"), repo, telegram, undefined, undefined, navigation);
+  assert.equal(telegram.sent.length, 0, "navigation no longer accepts text labels");
+  await handleTelegramUpdate(message(403, "/start"), repo, telegram, undefined, undefined, navigation);
+  assert.deepEqual(telegram.sent[0].keyboard, replyKeyboardRemoval());
+  assert.match(telegram.sent[0].text, /Обновляю меню/u);
+  assert.deepEqual(telegram.sent[1].keyboard, mainKeyboard("ru"));
+});
+
+test("notification Home sends a new main menu and leaves the notification message unchanged", async () => {
+  const repo = new MemoryRepository();
+  const telegram = new MemoryTelegram();
+  repo.users.set(404, { telegram_id: 404, language: "uk", notify_direct: 1, notify_potential: 0 });
+  const notificationKeyboardMarkup = notificationMainMenuKeyboard("uk");
+  const original = { message_id: 777, chat: { id: 404 } };
+  await handleTelegramUpdate({ callback_query: { id: "notification-home", from: { id: 404 }, data: "notification:main", message: original } }, repo, telegram);
+  assert.equal(telegram.edited.length, 0, "notification is not edited or deleted");
+  assert.equal(telegram.sent.length, 1);
+  assert.match(telegram.sent[0].text, /Оберіть розділ/u);
+  assert.deepEqual(telegram.sent[0].keyboard, mainKeyboard("uk"));
+  assert.deepEqual(notificationKeyboardMarkup.inline_keyboard.flat().map((button) => button.callback_data), ["notification:main"]);
+});
+
 test("About and unknown callbacks are handled in selected language", async () => {
   for (const [id, language, expected] of [
     [400, "ru", [/бесплатный информационный бот/, /Høringsportalen/, /Folketinget: мониторинг пока не активен/, /автоматические уведомления пока отключены/i, /Telegram ID/, /не является юридической консультацией/]],
@@ -376,7 +408,7 @@ test("About and unknown callbacks are handled in selected language", async () =>
     await handleTelegramUpdate(callback(id, "menu:about"), repo, telegram, undefined, new MemorySourceStatus(new Date().toISOString()));
     const about = telegram.edited.at(-1)!.text;
     for (const phrase of expected) assert.match(about, phrase);
-    assert.ok(Array.from(about).length <= 4096, "About screen fits Telegram message limit");
+  assert.ok(Array.from(about).length <= 4096, "About screen fits Telegram message limit");
     assert.deepEqual(
       [repo.users.get(id)?.notify_direct, repo.users.get(id)?.notify_potential],
       [1, 0],
@@ -501,10 +533,9 @@ test("authenticated webhook persists both language choices, edits to main menu, 
       }
     }
     assert.equal(db.users.size, 2);
-    assert.equal(apiCalls.length, 12);
-    const replyKeyboardCalls = apiCalls.filter(({ payload }) => (payload.reply_markup as { is_persistent?: boolean } | undefined)?.is_persistent);
-    assert.equal(replyKeyboardCalls.length, 8);
-    assert.ok(replyKeyboardCalls.every(({ payload }) => (payload.reply_markup as { resize_keyboard?: boolean }).resize_keyboard === true));
+    assert.equal(apiCalls.length, 16);
+    const removalCalls = apiCalls.filter(({ payload }) => (payload.reply_markup as { remove_keyboard?: boolean } | undefined)?.remove_keyboard);
+    assert.equal(removalCalls.length, 4, "each /start removes any old Reply Keyboard before showing inline navigation");
     assert.ok(apiCalls.every(({ url }) => url.startsWith("https://api.telegram.org/bottest-token/")));
   } finally {
     globalThis.fetch = oldFetch;
@@ -650,6 +681,6 @@ test("rapid repeated navigation callbacks edit the existing message without send
   ]);
   assert.equal(telegram.answered.length, 2);
   assert.equal(telegram.edited.length, 2);
-  assert.equal(telegram.sent.length, 2);
+  assert.equal(telegram.sent.length, 0);
   assert.ok(telegram.edited.every(({ text }) => text.includes("Выберите раздел")));
 });

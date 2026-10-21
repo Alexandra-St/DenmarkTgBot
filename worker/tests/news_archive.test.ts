@@ -114,7 +114,6 @@ test("News and Archive read only complete relevant records from local D1", async
     for (const fixture of localized) {
       const telegram = new CaptureTelegram();
       const click = (data: string) => handleTelegramUpdate(callback(data, fixture.id), users, telegram, repo, undefined, new D1NavigationStateRepository(db));
-      const press = (text: string) => handleTelegramUpdate({ message: { message_id: 2, chat: { id: fixture.id }, from: { id: fixture.id }, text } }, users, telegram, repo, undefined, new D1NavigationStateRepository(db));
 
       await click("menu:news");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.newsHeading));
@@ -140,9 +139,9 @@ test("News and Archive read only complete relevant records from local D1", async
       assert.match(telegram.edited.at(-1)!.text, /а не юридична консультація|а не юридическая консультация/u);
       const detailMarkup = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> };
       assert.ok(detailMarkup.inline_keyboard.flat().some((button) => button.url?.startsWith("https://hoeringsportalen.dk/")));
-      assert.equal(detailMarkup.inline_keyboard.flat().some((button) => button.callback_data), false, "navigation is provided by Reply Keyboard");
-      await press("⬅️ Назад");
-      assert.equal(telegram.sent.at(-2)!.text, pageOneNews, "detail Back returns to the same News page after repository recreation");
+      assert.deepEqual(detailMarkup.inline_keyboard.flat().filter((button) => button.callback_data).map((button) => button.callback_data), ["news:page:1", "nav:main"]);
+      await click(detailMarkup.inline_keyboard.flat().find((button) => button.callback_data === "news:page:1")!.callback_data!);
+      assert.equal(telegram.edited.at(-1)!.text, pageOneNews, "detail Back returns to the same News page after repository recreation");
       await click("pub:d:1:news:all:1");
       assert.equal((telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ url?: string }>> }).inline_keyboard.flat().some((button) => button.url), false, "non-official URL is never exposed");
       await click("news:page:9999");
@@ -151,8 +150,8 @@ test("News and Archive read only complete relevant records from local D1", async
       assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
       await click("news:page:1");
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
-      await press("⬅️ Назад");
-      assert.match(telegram.sent.at(-1)!.text, /Оберіть розділ|Выберите раздел/u);
+      await click(markup.inline_keyboard.flat().find((button) => button.callback_data === "nav:main")!.callback_data!);
+      assert.match(telegram.edited.at(-1)!.text, /Оберіть розділ|Выберите раздел/u);
 
       await click("menu:archive");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.archiveHeading));
@@ -181,11 +180,11 @@ test("News and Archive read only complete relevant records from local D1", async
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
       const archiveDetail = markup.inline_keyboard.flat().find((button) => button.callback_data?.startsWith("pub:d:"))!.callback_data!;
       await click(archiveDetail);
-      await press("⬅️ Назад");
-      assert.equal(telegram.sent.at(-2)!.text, pageOneArchive, "detail Back returns to the same Archive filter and page");
+      await click("archive:page:all:1");
+      assert.equal(telegram.edited.at(-1)!.text, pageOneArchive, "detail Back returns to the same Archive filter and page");
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
-      await press("⬅️ Назад");
-      assert.match(telegram.sent.at(-1)!.text, /Оберіть розділ|Выберите раздел/u);
+      await click(markup.inline_keyboard.flat().find((button) => button.callback_data === "nav:main")!.callback_data!);
+      assert.match(telegram.edited.at(-1)!.text, /Оберіть розділ|Выберите раздел/u);
 
       await click("archive:page:potential:9999");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.empty));

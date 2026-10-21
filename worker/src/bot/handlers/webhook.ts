@@ -19,11 +19,10 @@ import {
   languageKeyboard,
   mainKeyboard,
   notificationKeyboard,
-  notificationToggleText,
-  persistentReplyKeyboard,
   sectionNavigationKeyboard,
   settingsKeyboard,
   settingsLanguageKeyboard,
+  replyKeyboardRemoval,
 } from "../keyboards/index.ts";
 
 function validTelegramId(value: unknown): value is number {
@@ -126,16 +125,6 @@ function notificationText(user: UserPreferences, language: Language): string {
   return `${t(language, "notificationsTitle")}\n\n${direct} ${t(language, "direct")}\n${potential} ${t(language, "potential")}`;
 }
 
-async function setKeyboard(
-  telegram: TelegramClient,
-  chatId: number,
-  language: Language,
-  keyboard: ReturnType<typeof mainKeyboard>,
-  text = t(language, "replyKeyboardReady"),
-): Promise<void> {
-  await telegram.sendMessage(chatId, text, keyboard);
-}
-
 async function showMain(
   telegram: TelegramClient,
   chatId: number,
@@ -146,10 +135,7 @@ async function showMain(
 ): Promise<void> {
   const body = `${prefix ? `${prefix}\n\n` : ""}${t(language, "mainMenu")}`;
   if (messageId === undefined) await telegram.sendMessage(chatId, body, mainKeyboard(language));
-  else {
-    await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, body, clearInlineKeyboard()));
-    await setKeyboard(telegram, chatId, language, mainKeyboard(language));
-  }
+  else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, body, mainKeyboard(language)));
 }
 
 async function showPublicationList(
@@ -164,7 +150,6 @@ async function showPublicationList(
   const screen = await timed(metrics, "publication_lookup_ms", () => publicationListScreen(publications, language, context));
   if (messageId === undefined) {
     await telegram.sendMessage(chatId, screen.text, screen.keyboard);
-    await setKeyboard(telegram, chatId, language, sectionNavigationKeyboard(language));
   } else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, screen.text, screen.keyboard));
 }
 
@@ -176,19 +161,13 @@ async function showSettings(
   metrics?: CallbackMetrics,
 ): Promise<void> {
   if (messageId === undefined) await telegram.sendMessage(chatId, t(language, "settingsTitle"), settingsKeyboard(language));
-  else {
-    await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, t(language, "settingsTitle"), clearInlineKeyboard()));
-    await setKeyboard(telegram, chatId, language, settingsKeyboard(language));
-  }
+  else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, t(language, "settingsTitle"), settingsKeyboard(language)));
 }
 
 async function showLanguageSettings(telegram: TelegramClient, chatId: number, language: Language, messageId?: number, metrics?: CallbackMetrics): Promise<void> {
   const body = t(language, "languageTitle");
   if (messageId === undefined) await telegram.sendMessage(chatId, body, settingsLanguageKeyboard(language));
-  else {
-    await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, body, clearInlineKeyboard()));
-    await setKeyboard(telegram, chatId, language, settingsLanguageKeyboard(language));
-  }
+  else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, body, settingsLanguageKeyboard(language)));
 }
 
 async function showNotificationSettings(
@@ -202,10 +181,7 @@ async function showNotificationSettings(
   const body = notificationText(user, language);
   const keyboard = notificationKeyboard(language, Boolean(user.notify_direct), Boolean(user.notify_potential));
   if (messageId === undefined) await telegram.sendMessage(chatId, body, keyboard);
-  else {
-    await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, body, clearInlineKeyboard()));
-    await setKeyboard(telegram, chatId, language, keyboard);
-  }
+  else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, body, keyboard));
 }
 
 async function showAbout(
@@ -221,29 +197,11 @@ async function showAbout(
   catch { /* Keep About available if metadata cannot be read. */ }
   const body = `${t(language, "aboutText")}\n\n${sourceStatusScreen(language, lastSuccessfulHoeringsportalenRun)}`;
   if (messageId === undefined) await telegram.sendMessage(chatId, body, sectionNavigationKeyboard(language));
-  else {
-    await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, body, clearInlineKeyboard()));
-    await setKeyboard(telegram, chatId, language, sectionNavigationKeyboard(language));
-  }
+  else await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(chatId, messageId, body, sectionNavigationKeyboard(language)));
 }
 
 function publicationStateContext(state: UserNavigationState): { kind: "news"; page: number } | { kind: "archive"; filter: ArchiveFilter; page: number } {
   return savedListContext(state);
-}
-
-function keyForText(text: string): string | null {
-  const keys = ["news", "archive", "settings", "about", "back", "main", "language", "notifications"] as const;
-  for (const key of keys) if (text === t("uk", key) || text === t("ru", key)) return key;
-  if (text === "Українська") return "lang_uk";
-  if (text === "Русский") return "lang_ru";
-  for (const language of ["uk", "ru"] as const) {
-    for (const preference of ["direct", "potential"] as const) {
-      for (const enabled of [false, true]) {
-        if (text === notificationToggleText(language, preference, enabled)) return `toggle_${preference}`;
-      }
-    }
-  }
-  return null;
 }
 
 async function renderNavigationState(
@@ -253,25 +211,30 @@ async function renderNavigationState(
   telegram: TelegramClient,
   publications?: PublicationRepository,
   sourceStatus?: SourceStatusRepository,
+  messageId?: number,
 ): Promise<void> {
   const language = user.language;
-  if (state.screen === "main") await showMain(telegram, chatId, language);
-  else if (state.screen === "settings") await showSettings(telegram, chatId, language);
-  else if (state.screen === "settings_language") await showLanguageSettings(telegram, chatId, language);
-  else if (state.screen === "settings_notifications") await showNotificationSettings(telegram, chatId, user);
-  else if (state.screen === "about") await showAbout(telegram, chatId, language, sourceStatus);
+  if (state.screen === "main") await showMain(telegram, chatId, language, messageId);
+  else if (state.screen === "settings") await showSettings(telegram, chatId, language, messageId);
+  else if (state.screen === "settings_language") await showLanguageSettings(telegram, chatId, language, messageId);
+  else if (state.screen === "settings_notifications") await showNotificationSettings(telegram, chatId, user, messageId);
+  else if (state.screen === "about") await showAbout(telegram, chatId, language, sourceStatus, messageId);
   else if (state.screen === "publication_detail") {
     const context = publicationStateContext(state);
     if (!publications) {
-      await telegram.sendMessage(chatId, t(language, "unavailable"), detailNavigationKeyboard(language));
+      const keyboard = detailNavigationKeyboard(language, context);
+      if (messageId === undefined) await telegram.sendMessage(chatId, t(language, "unavailable"), keyboard);
+      else await telegram.editMessage(chatId, messageId, t(language, "unavailable"), keyboard);
     } else {
       const screen = await publicationListScreen(publications, language, context);
-      await telegram.sendMessage(chatId, screen.text, screen.keyboard);
-      await setKeyboard(telegram, chatId, language, detailNavigationKeyboard(language));
+      if (messageId === undefined) await telegram.sendMessage(chatId, screen.text, screen.keyboard);
+      else await telegram.editMessage(chatId, messageId, screen.text, screen.keyboard);
     }
   } else if (!publications) {
-    await telegram.sendMessage(chatId, t(language, "unavailable"), sectionNavigationKeyboard(language));
-  } else await showPublicationList(telegram, publications, chatId, undefined, language, publicationStateContext(state));
+    const keyboard = sectionNavigationKeyboard(language);
+    if (messageId === undefined) await telegram.sendMessage(chatId, t(language, "unavailable"), keyboard);
+    else await telegram.editMessage(chatId, messageId, t(language, "unavailable"), keyboard);
+  } else await showPublicationList(telegram, publications, chatId, messageId, language, publicationStateContext(state));
 }
 
 async function handleStart(
@@ -284,6 +247,7 @@ async function handleStart(
   const user = await repository.find(message.from.id);
   if (user) {
     await writeNavigation(navigation, user.telegram_id, mainState());
+    await telegram.sendMessage(message.chat.id, t(user.language, "keyboardRemoved"), replyKeyboardRemoval());
     await showMain(telegram, message.chat.id, user.language);
   } else await telegram.sendMessage(message.chat.id, languageScreen("uk"), languageKeyboard("uk"));
 }
@@ -301,53 +265,13 @@ async function handleMessage(
   message: TelegramMessage,
   repository: UserRepository,
   telegram: TelegramClient,
-  publications?: PublicationRepository,
-  sourceStatus?: SourceStatusRepository,
   navigation?: NavigationStateRepository,
 ): Promise<void> {
   const text = message.text?.trim();
   const command = text?.split(/\s+/, 1)[0]?.split("@")[0].toLowerCase();
   if (command === "/start") return handleStart(message, repository, telegram, navigation);
   if (command === "/help") return handleHelp(message, repository, telegram, navigation);
-  if (!text || !message.from || !validTelegramId(message.from.id) || !validTelegramId(message.chat?.id)) return;
-
-  const user = await repository.find(message.from.id);
-  if (!user) {
-    if (keyForText(text)) await telegram.sendMessage(message.chat.id, languageScreen("uk"), languageKeyboard("uk"));
-    return;
-  }
-  const key = keyForText(text);
-  if (!key) return;
-  let state = await readNavigation(navigation, user.telegram_id);
-
-  if (key === "main") state = mainState();
-  else if (key === "back") state = previousState(state);
-  else if (key === "news" || key === "archive" || key === "settings" || key === "about") state = sectionState(key);
-  else if (state.screen === "settings" && key === "language") state = { ...sectionState("settings"), screen: "settings_language", parent_screen: "settings" };
-  else if (state.screen === "settings" && key === "notifications") state = { ...sectionState("settings"), screen: "settings_notifications", parent_screen: "settings" };
-  else if (state.screen === "settings_language" && (key === "lang_uk" || key === "lang_ru")) {
-    const language = key === "lang_uk" ? "uk" : "ru";
-    await repository.updateLanguage(user.telegram_id, language);
-    state = sectionState("settings");
-    await writeNavigation(navigation, user.telegram_id, state);
-    await showSettings(telegram, message.chat.id, language);
-    return;
-  } else if (state.screen === "settings_notifications" && (key === "toggle_direct" || key === "toggle_potential")) {
-    const preference = key === "toggle_direct" ? "direct" : "potential";
-    await repository.updateNotification(user.telegram_id, preference, !Boolean(user[preference === "direct" ? "notify_direct" : "notify_potential"]));
-    const updated = await repository.find(user.telegram_id);
-    if (!updated) return;
-    state = { ...state, screen: "settings_notifications", parent_screen: "settings" };
-    await writeNavigation(navigation, user.telegram_id, state);
-    await showNotificationSettings(telegram, message.chat.id, updated);
-    return;
-  } else {
-    // Missing, stale, or irrelevant navigation input safely returns to the root.
-    state = mainState();
-  }
-
-  await writeNavigation(navigation, user.telegram_id, state);
-  await renderNavigationState(state, user, message.chat.id, telegram, publications, sourceStatus);
+  // Navigation is callback-only. Free-form and old reply-keyboard text is ignored.
 }
 
 async function processCallback(
@@ -376,7 +300,7 @@ async function processCallback(
       const created = await repository.create(callback.from.id, language);
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, t(language, "languageSaved"), clearInlineKeyboard()));
       await writeNavigation(navigation, callback.from.id, mainState());
-      if (created) await telegram.sendMessage(message.chat.id, t(language, "firstTimeWelcome"), mainKeyboard(language));
+      if (created) await telegram.sendMessage(message.chat.id, t(language, "firstTimeWelcome"));
       await showMain(telegram, message.chat.id, language, undefined, undefined, metrics);
     }
     return;
@@ -391,9 +315,17 @@ async function processCallback(
   const current = await readNavigation(navigation, callback.from.id);
   const save = async (state: UserNavigationState) => writeNavigation(navigation, callback.from.id, state);
 
-  if (data === "nav:main") {
+  if (data === "notification:main") {
+    await save(mainState());
+    // Notification messages are immutable; this action posts a separate menu message.
+    await telegram.sendMessage(message.chat.id, t(language, "mainMenu"), mainKeyboard(language));
+  } else if (data === "nav:main") {
     await save(mainState());
     await showMain(telegram, message.chat.id, language, message.message_id, undefined, metrics);
+  } else if (data === "nav:back") {
+    const state = previousState(current);
+    await save(state);
+    await renderNavigationState(state, user, message.chat.id, telegram, publications, sourceStatus, message.message_id);
   } else if (data === "nav:settings" || data === "menu:settings") {
     await save(sectionState("settings"));
     await showSettings(telegram, message.chat.id, language, message.message_id, metrics);
@@ -401,6 +333,11 @@ async function processCallback(
     const state: UserNavigationState = { ...sectionState("settings"), screen: "settings_language", parent_screen: "settings" };
     await save(state);
     await showLanguageSettings(telegram, message.chat.id, language, message.message_id, metrics);
+  } else if (data === "settings:language:uk" || data === "settings:language:ru") {
+    const nextLanguage = data.endsWith(":uk") ? "uk" : "ru";
+    await repository.updateLanguage(callback.from.id, nextLanguage);
+    await save(sectionState("settings"));
+    await showSettings(telegram, message.chat.id, nextLanguage, message.message_id, metrics);
   } else if (data === "settings:notifications") {
     const state: UserNavigationState = { ...sectionState("settings"), screen: "settings_notifications", parent_screen: "settings" };
     await save(state);
@@ -418,17 +355,14 @@ async function processCallback(
     await save(listState(context));
     if (!publications) {
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, t(language, "unavailable"), clearInlineKeyboard()));
-      await setKeyboard(telegram, message.chat.id, language, sectionNavigationKeyboard(language));
     } else {
       await showPublicationList(telegram, publications, message.chat.id, message.message_id, language, context, metrics);
-      await setKeyboard(telegram, message.chat.id, language, sectionNavigationKeyboard(language));
     }
   } else if (/^(?:news:page:|archive:|pub:)/u.test(data)) {
     if (!publications || new TextEncoder().encode(data).length > 64) {
       const state = current.screen === "publication_detail" ? current : sectionState("news");
       await save(state);
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, t(language, "publicationNotFound"), clearInlineKeyboard()));
-      await setKeyboard(telegram, message.chat.id, language, state.screen === "publication_detail" ? detailNavigationKeyboard(language) : sectionNavigationKeyboard(language));
       return;
     }
     const newsPage = /^news:page:(0|[1-9]\d{0,3})$/u.exec(data);
@@ -454,7 +388,6 @@ async function processCallback(
       await save(detailState(context));
       const screen = await timed(metrics, "publication_lookup_ms", () => publicationDetailScreen(publications, language, Number(detail[1]), context));
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, screen.text, screen.keyboard));
-      await setKeyboard(telegram, message.chat.id, language, detailNavigationKeyboard(language));
     } else {
       await save(current.screen === "publication_detail" ? current : sectionState("news"));
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, t(language, "publicationNotFound"), clearInlineKeyboard()));
@@ -504,7 +437,7 @@ export async function handleTelegramUpdate(
   navigation?: NavigationStateRepository,
 ): Promise<void> {
   if (update.message) {
-    await handleMessage(update.message, repository, telegram, publications, sourceStatus, navigation);
+    await handleMessage(update.message, repository, telegram, navigation);
     return;
   }
   if (update.callback_query) await handleCallback(update.callback_query, repository, telegram, publications, sourceStatus, navigation);
