@@ -950,7 +950,7 @@ class BackupPocSafetyTests(unittest.TestCase):
                     "base_snapshot": context["identity"],
                     "target_snapshot": {"backup_sha256": "b" * 64, "backup_finish_date": new_finish,
                                         "schema_fingerprint": "a" * 64},
-                    "snapshot_advanced": True,
+                    "snapshot_advanced": True, "snapshot_generation": 2,
                 },
             }
             with mock.patch.object(POC, "run_candidate_extraction", return_value=complete) as extract:
@@ -982,6 +982,53 @@ class BackupPocSafetyTests(unittest.TestCase):
                         github_repository="Alexandra-St/DenmarkTgBot", github_run_id="12345",
                     )
             self.assertEqual(mismatch.exception.category, "snapshot_incremental_client_result_invalid")
+
+    def test_newer_zero_candidate_snapshot_commits_and_promotes_manifest(self) -> None:
+        from collectors.snapshot_ingestion_client import ingest_snapshot_candidates
+
+        old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            empty_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=empty_rows)
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=empty_rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            bundle = self._candidate_bundle([])
+            run_id = POC.snapshot_incremental_run_id("Alexandra-St/DenmarkTgBot", "12345")
+            committed = {
+                "dry_run": False, "mode": "incremental", "state_kind": "snapshot",
+                "collection_complete": True, "submission_eligible": True, "status": "COMMITTED",
+                "snapshot_advanced": True, "run_id": run_id, "base_snapshot": context["identity"],
+                "target_snapshot": {
+                    "backup_sha256": "b" * 64,
+                    "backup_finish_date": new_finish,
+                    "schema_fingerprint": "a" * 64,
+                },
+                "records": 0, "batches": 1,
+                "relevance_counts": {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0},
+                "snapshot_generation": 2,
+            }
+            with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=bundle), \
+                 mock.patch("collectors.snapshot_ingestion_client.ingest_snapshot_candidates",
+                            return_value=committed) as worker_client:
+                result = POC.run_snapshot_incremental_live(
+                    context, target, SimpleNamespace(), root,
+                    endpoint="https://worker.invalid/internal/ingest", token="private",
+                    github_repository="Alexandra-St/DenmarkTgBot", github_run_id="12345",
+                )
+            worker_client.assert_called_once()
+            self.assertEqual(worker_client.call_args.args[0]["cases"], [])
+            self.assertEqual(worker_client.call_args.kwargs["dry_run"], False)
+            self.assertEqual(worker_client.call_args.kwargs["mode"], "incremental")
+            self.assertEqual(result["snapshot_client_status"], "COMMITTED")
+            self.assertTrue(result["snapshot_advanced"])
+            self.assertEqual(result["snapshot_generation"], 2)
+            self.assertTrue(result["promote_manifest"])
+            self.assertEqual(result["prepared_record_count"], 0)
+            self.assertEqual(result["batch_count"], 1)
 
     def test_snapshot_incremental_live_same_snapshot_is_noop_and_ingestion_failure_blocks_promotion(self) -> None:
         stamp = "2026-10-20 02:00:40.000"

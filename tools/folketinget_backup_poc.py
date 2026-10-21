@@ -1583,17 +1583,24 @@ def run_snapshot_incremental_live(
         raise PocError("snapshot_incremental_client_result_invalid")
     client_status = client.get("status")
     is_committed = client_status == "COMMITTED"
-    if client_status not in {"COMMITTED", "NO_CANDIDATES"}:
+    if not is_committed:
         raise PocError("snapshot_incremental_client_result_invalid")
-    if client_status == "NO_CANDIDATES" and (result["candidate_case_count"] + result["tombstone_count"] != 0
-                                               or client.get("records") != 0 or client.get("batches") != 0):
-        raise PocError("snapshot_incremental_client_result_invalid")
-    if is_committed and (client.get("snapshot_advanced") is not True
-                         or client.get("base_snapshot") != context["base_snapshot"]
-                         or client.get("target_snapshot") != context["target_snapshot"]):
+    generation = client.get("snapshot_generation")
+    if (client.get("snapshot_advanced") is not True
+            or client.get("base_snapshot") != context["base_snapshot"]
+            or client.get("target_snapshot") != context["target_snapshot"]
+            or isinstance(generation, bool) or not isinstance(generation, int) or generation < 2):
         raise PocError("snapshot_incremental_commit_contract_mismatch")
     counts = client.get("relevance_counts")
-    if not isinstance(counts, dict) or set(counts) != {"DIRECT", "POTENTIAL", "IRRELEVANT"}:
+    records = client.get("records")
+    batches = client.get("batches")
+    if (not isinstance(counts, dict) or set(counts) != {"DIRECT", "POTENTIAL", "IRRELEVANT"}
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                   for value in counts.values())
+            or isinstance(records, bool) or not isinstance(records, int)
+            or records != result["candidate_case_count"] + result["tombstone_count"]
+            or isinstance(batches, bool) or not isinstance(batches, int) or not 1 <= batches <= 200
+            or sum(counts.values()) != result["candidate_case_count"]):
         raise PocError("snapshot_incremental_client_result_invalid")
     return {
         "status": "PASS", "snapshot_change": "CHANGED",
@@ -1601,8 +1608,9 @@ def run_snapshot_incremental_live(
         "diff_totals": dict(diff_totals), "affected_case_count": result["affected_case_count"],
         "hydrated_case_count": result["hydrated_case_count"], "tombstone_count": result["tombstone_count"],
         "DIRECT": counts["DIRECT"], "POTENTIAL": counts["POTENTIAL"], "IRRELEVANT": counts["IRRELEVANT"],
-        "prepared_record_count": client.get("records", 0), "batch_count": client.get("batches", 0),
+        "prepared_record_count": records, "batch_count": batches,
         "snapshot_client_status": client_status, "snapshot_advanced": is_committed,
+        "snapshot_generation": generation,
         "promote_manifest": is_committed,
     }
 
@@ -2252,62 +2260,56 @@ def run_candidate_extraction(
                 raise PocError("snapshot_live_contract_missing")
             if result["complete"] is not True or clean_diagnostics:
                 raise PocError("snapshot_incremental_extraction_incomplete")
-            if result["candidate_case_count"] + tombstone_count == 0:
-                result["snapshot_ingestion_live"] = {
-                    "status": "NO_CANDIDATES", "records": 0, "batches": 0,
-                    "relevance_counts": {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0},
-                    "base_snapshot": base_snapshot, "target_snapshot": target_snapshot,
-                    "snapshot_advanced": False,
-                }
-            else:
-                try:
-                    from collectors.snapshot_ingestion_client import (
-                        SnapshotIngestionError,
-                        ingest_snapshot_candidates,
-                    )
-                    live_result = ingest_snapshot_candidates(
-                        persisted_bundle,
-                        mode="incremental",
-                        base_snapshot=base_snapshot,
-                        target_snapshot=target_snapshot,
-                        endpoint=ingestion_endpoint,
-                        token=ingestion_token,
-                        run_id=ingestion_run_id,
-                        dry_run=False,
-                    )
-                except SnapshotIngestionError as error:
-                    if re.fullmatch(r"[a-z0-9_]{1,80}", error.code):
-                        raise PocError(error.code) from None
-                    raise PocError("snapshot_incremental_ingestion_failed") from None
-                except Exception:
-                    raise PocError("snapshot_incremental_ingestion_failed") from None
-                counts = live_result.get("relevance_counts")
-                records_count = live_result.get("records")
-                batches_count = live_result.get("batches")
-                if (live_result.get("dry_run") is not False
-                        or live_result.get("mode") != "incremental"
-                        or live_result.get("state_kind") != "snapshot"
-                        or live_result.get("collection_complete") is not True
-                        or live_result.get("submission_eligible") is not True
-                        or live_result.get("status") != "COMMITTED"
-                        or live_result.get("snapshot_advanced") is not True
-                        or live_result.get("run_id") != ingestion_run_id
-                        or live_result.get("base_snapshot") != base_snapshot
-                        or live_result.get("target_snapshot") != target_snapshot
-                        or isinstance(records_count, bool) or not isinstance(records_count, int)
-                        or records_count != result["candidate_case_count"] + tombstone_count
-                        or isinstance(batches_count, bool) or not isinstance(batches_count, int)
-                        or not 1 <= batches_count <= 200
-                        or not isinstance(counts, dict) or set(counts) != {"DIRECT", "POTENTIAL", "IRRELEVANT"}
-                        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts.values())
-                        or sum(counts.values()) != result["candidate_case_count"]):
-                    raise PocError("snapshot_incremental_commit_contract_mismatch")
-                result["snapshot_ingestion_live"] = {
-                    "status": "COMMITTED", "records": records_count, "batches": batches_count,
-                    "relevance_counts": counts, "base_snapshot": base_snapshot,
-                    "target_snapshot": target_snapshot, "snapshot_advanced": True,
-                    "snapshot_generation": live_result.get("snapshot_generation"),
-                }
+            try:
+                from collectors.snapshot_ingestion_client import (
+                    SnapshotIngestionError,
+                    ingest_snapshot_candidates,
+                )
+                live_result = ingest_snapshot_candidates(
+                    persisted_bundle,
+                    mode="incremental",
+                    base_snapshot=base_snapshot,
+                    target_snapshot=target_snapshot,
+                    endpoint=ingestion_endpoint,
+                    token=ingestion_token,
+                    run_id=ingestion_run_id,
+                    dry_run=False,
+                )
+            except SnapshotIngestionError as error:
+                if re.fullmatch(r"[a-z0-9_]{1,80}", error.code):
+                    raise PocError(error.code) from None
+                raise PocError("snapshot_incremental_ingestion_failed") from None
+            except Exception:
+                raise PocError("snapshot_incremental_ingestion_failed") from None
+            counts = live_result.get("relevance_counts")
+            records_count = live_result.get("records")
+            batches_count = live_result.get("batches")
+            generation = live_result.get("snapshot_generation")
+            if (live_result.get("dry_run") is not False
+                    or live_result.get("mode") != "incremental"
+                    or live_result.get("state_kind") != "snapshot"
+                    or live_result.get("collection_complete") is not True
+                    or live_result.get("submission_eligible") is not True
+                    or live_result.get("status") != "COMMITTED"
+                    or live_result.get("snapshot_advanced") is not True
+                    or live_result.get("run_id") != ingestion_run_id
+                    or live_result.get("base_snapshot") != base_snapshot
+                    or live_result.get("target_snapshot") != target_snapshot
+                    or isinstance(records_count, bool) or not isinstance(records_count, int)
+                    or records_count != result["candidate_case_count"] + tombstone_count
+                    or isinstance(batches_count, bool) or not isinstance(batches_count, int)
+                    or not 1 <= batches_count <= 200
+                    or isinstance(generation, bool) or not isinstance(generation, int) or generation < 2
+                    or not isinstance(counts, dict) or set(counts) != {"DIRECT", "POTENTIAL", "IRRELEVANT"}
+                    or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts.values())
+                    or sum(counts.values()) != result["candidate_case_count"]):
+                raise PocError("snapshot_incremental_commit_contract_mismatch")
+            result["snapshot_ingestion_live"] = {
+                "status": "COMMITTED", "records": records_count, "batches": batches_count,
+                "relevance_counts": counts, "base_snapshot": base_snapshot,
+                "target_snapshot": target_snapshot, "snapshot_advanced": True,
+                "snapshot_generation": generation,
+            }
         return result
     finally:
         cleanup_candidate_bundle(bundle_path, runner_temp)
