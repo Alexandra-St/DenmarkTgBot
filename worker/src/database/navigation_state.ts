@@ -23,6 +23,8 @@ export interface UserNavigationState {
 export interface NavigationStateRepository {
   get(telegramId: number): Promise<UserNavigationState | null>;
   set(telegramId: number, state: UserNavigationState): Promise<void>;
+  getScreenMessageId(telegramId: number): Promise<number | null>;
+  replaceScreen(telegramId: number, expectedMessageId: number | null, state: UserNavigationState, nextMessageId: number): Promise<boolean>;
 }
 
 export const MAIN_NAVIGATION_STATE: UserNavigationState = {
@@ -107,5 +109,49 @@ export class D1NavigationStateRepository implements NavigationStateRepository {
       state.page,
       new Date().toISOString(),
     ).run();
+  }
+
+  async getScreenMessageId(telegramId: number): Promise<number | null> {
+    const row = await this.db.prepare(
+      "SELECT last_screen_message_id FROM user_navigation_state WHERE telegram_id = ?",
+    ).bind(telegramId).first<{ last_screen_message_id?: unknown }>();
+    const value = row?.last_screen_message_id;
+    return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+
+  async replaceScreen(
+    telegramId: number,
+    expectedMessageId: number | null,
+    state: UserNavigationState,
+    nextMessageId: number,
+  ): Promise<boolean> {
+    if (!isUserNavigationState(state) || !Number.isSafeInteger(nextMessageId) || nextMessageId <= 0) {
+      throw new TypeError("Invalid navigation screen");
+    }
+    const result = await this.db.prepare(`
+      INSERT INTO user_navigation_state
+        (telegram_id, screen, parent_screen, publication_kind, archive_filter, page, updated_at, last_screen_message_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (telegram_id) DO UPDATE SET
+        screen = excluded.screen,
+        parent_screen = excluded.parent_screen,
+        publication_kind = excluded.publication_kind,
+        archive_filter = excluded.archive_filter,
+        page = excluded.page,
+        updated_at = excluded.updated_at,
+        last_screen_message_id = excluded.last_screen_message_id
+      WHERE user_navigation_state.last_screen_message_id IS ?
+    `).bind(
+      telegramId,
+      state.screen,
+      state.parent_screen,
+      state.publication_kind,
+      state.archive_filter,
+      state.page,
+      new Date().toISOString(),
+      nextMessageId,
+      expectedMessageId,
+    ).run();
+    return result.meta?.changes === 1;
   }
 }

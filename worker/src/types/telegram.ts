@@ -4,6 +4,7 @@ export interface TelegramUser {
 
 export interface TelegramChat {
   id: number;
+  type?: "private" | "group" | "supergroup" | "channel";
 }
 
 export interface TelegramMessage {
@@ -41,4 +42,13 @@ export interface ReplyKeyboardRemove {
   selective?: boolean;
 }
 
-export type TelegramReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardRemove;
+export interface ReplyKeyboardMarkup {
+  keyboard: string[][];
+  is_persistent?: boolean;
+  resize_keyboard?: boolean;
+  one_time_keyboard?: boolean;
+  input_field_placeholder?: string;
+  selective?: boolean;
+}
+
+export type TelegramReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove;

@@ -1,6 +1,6 @@
 import type { Language } from "../../database/users.ts";
 import { t } from "../../localization/index.ts";
-import type { InlineKeyboardMarkup, ReplyKeyboardRemove } from "../../types/telegram.ts";
+import type { InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove } from "../../types/telegram.ts";
 import type { ArchiveFilter, PublicationRecord } from "../../database/publications.ts";
 
 export type PublicationListContext =
@@ -11,6 +11,12 @@ const keyboard = (...rows: InlineKeyboardMarkup["inline_keyboard"]): InlineKeybo
   inline_keyboard: rows,
 });
 
+const replyKeyboard = (...rows: string[][]): ReplyKeyboardMarkup => ({
+  keyboard: rows,
+  is_persistent: true,
+  resize_keyboard: true,
+});
+
 export function languageKeyboard(language: Language): InlineKeyboardMarkup {
   return keyboard(
     [{ text: "Українська", callback_data: "lang:uk" }],
@@ -18,17 +24,10 @@ export function languageKeyboard(language: Language): InlineKeyboardMarkup {
   );
 }
 
-export function settingsLanguageKeyboard(language: Language): InlineKeyboardMarkup {
-  return keyboard(
-    [{ text: "Українська", callback_data: "settings:language:uk" }, { text: "Русский", callback_data: "settings:language:ru" }],
-    [{ text: t(language, "back"), callback_data: "nav:back" }, { text: t(language, "main"), callback_data: "nav:main" }],
-  );
-}
-
-export function mainKeyboard(language: Language): InlineKeyboardMarkup {
-  return keyboard(
-    [{ text: t(language, "news"), callback_data: "menu:news" }, { text: t(language, "archive"), callback_data: "menu:archive" }],
-    [{ text: t(language, "settings"), callback_data: "menu:settings" }, { text: t(language, "about"), callback_data: "menu:about" }],
+export function mainKeyboard(language: Language): ReplyKeyboardMarkup {
+  return replyKeyboard(
+    [t(language, "news"), t(language, "archive")],
+    [t(language, "settings"), t(language, "about")],
   );
 }
 
@@ -36,29 +35,33 @@ export function replyKeyboardRemoval(): ReplyKeyboardRemove {
   return { remove_keyboard: true };
 }
 
-export function sectionNavigationKeyboard(language: Language): InlineKeyboardMarkup {
-  return keyboard([{ text: t(language, "back"), callback_data: "nav:main" }]);
+export function sectionNavigationKeyboard(language: Language): ReplyKeyboardMarkup {
+  return replyKeyboard([t(language, "back")]);
 }
 
-export function detailNavigationKeyboard(language: Language, context: PublicationListContext): InlineKeyboardMarkup {
-  const back = context.kind === "news"
-    ? `news:page:${context.page}`
-    : `archive:page:${context.filter}:${context.page}`;
-  return keyboard([{ text: t(language, "back"), callback_data: back }, { text: t(language, "main"), callback_data: "nav:main" }]);
+export function detailReplyKeyboard(language: Language): ReplyKeyboardMarkup {
+  return replyKeyboard([t(language, "back"), t(language, "main")]);
 }
 
-export function settingsKeyboard(language: Language): InlineKeyboardMarkup {
-  return keyboard(
-    [{ text: t(language, "language"), callback_data: "settings:language" }, { text: t(language, "notifications"), callback_data: "settings:notifications" }],
-    [{ text: t(language, "back"), callback_data: "nav:main" }],
+export function settingsKeyboard(language: Language): ReplyKeyboardMarkup {
+  return replyKeyboard(
+    [t(language, "language"), t(language, "notifications")],
+    [t(language, "back")],
   );
 }
 
-export function notificationKeyboard(language: Language, direct: boolean, potential: boolean): InlineKeyboardMarkup {
-  return keyboard(
-    [{ text: `${direct ? "✅" : "⬜"} ${t(language, "directShort")}`, callback_data: `notify:direct:set:${direct ? "0" : "1"}` }],
-    [{ text: `${potential ? "✅" : "⬜"} ${t(language, "potentialShort")}`, callback_data: `notify:potential:set:${potential ? "0" : "1"}` }],
-    [{ text: t(language, "back"), callback_data: "nav:back" }, { text: t(language, "main"), callback_data: "nav:main" }],
+export function settingsLanguageKeyboard(language: Language): ReplyKeyboardMarkup {
+  return replyKeyboard(
+    ["Українська", "Русский"],
+    [t(language, "back"), t(language, "main")],
+  );
+}
+
+export function notificationKeyboard(language: Language, direct: boolean, potential: boolean): ReplyKeyboardMarkup {
+  return replyKeyboard(
+    [`${direct ? "✅" : "⬜"} ${t(language, "directShort")}`],
+    [`${potential ? "✅" : "⬜"} ${t(language, "potentialShort")}`],
+    [t(language, "back"), t(language, "main")],
   );
 }
 
@@ -103,18 +106,14 @@ export function publicationListKeyboard(
     ? { text: t(language, "next"), callback_data: context.kind === "news" ? `news:page:${context.page + 1}` : `archive:page:${context.filter}:${context.page + 1}` }
     : undefined;
   if (previous || next) rows.push([...(previous ? [previous] : []), ...(next ? [next] : [])]);
-  rows.push([{ text: t(language, "back"), callback_data: "nav:main" }]);
-
   return keyboard(...rows);
 }
 
 export function publicationDetailKeyboard(
   language: Language,
-  context: PublicationListContext,
   officialUrl?: string,
 ): InlineKeyboardMarkup {
   const rows: InlineKeyboardMarkup["inline_keyboard"] = [];
   if (officialUrl) rows.push([{ text: t(language, "openOfficialSource"), url: officialUrl }]);
-  rows.push(...detailNavigationKeyboard(language, context).inline_keyboard);
   return keyboard(...rows);
 }

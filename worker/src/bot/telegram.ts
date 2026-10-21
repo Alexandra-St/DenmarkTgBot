@@ -2,7 +2,9 @@ import type { InlineKeyboardMarkup, TelegramReplyMarkup } from "../types/telegra
 
 export interface TelegramClient {
   sendMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<void>;
+  sendScreenMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<{ message_id: number }>;
   editMessage(chatId: number, messageId: number, text: string, keyboard?: InlineKeyboardMarkup): Promise<void>;
+  deleteMessage(chatId: number, messageId: number): Promise<void>;
   answerCallback(callbackId: string): Promise<void>;
 }
 
@@ -25,7 +27,7 @@ export class TelegramApi implements TelegramClient {
     this.token = token;
   }
 
-  private async call(method: string, payload: Record<string, unknown>): Promise<void> {
+  private async call(method: string, payload: Record<string, unknown>): Promise<unknown> {
     if (!this.token) throw new Error("Telegram bot token is not configured");
     const response = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
       method: "POST",
@@ -48,6 +50,7 @@ export class TelegramApi implements TelegramClient {
         result.description ?? `HTTP ${response.status}`,
       );
     }
+    return (result as { result?: unknown }).result;
   }
 
   async sendMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<void> {
@@ -56,6 +59,22 @@ export class TelegramApi implements TelegramClient {
       text,
       ...(keyboard ? { reply_markup: keyboard } : {}),
     });
+  }
+
+  async sendScreenMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<{ message_id: number }> {
+    const result = await this.call("sendMessage", {
+      chat_id: chatId,
+      text,
+      ...(keyboard ? { reply_markup: keyboard } : {}),
+    });
+    if (!result || typeof result !== "object" || !Number.isSafeInteger((result as { message_id?: unknown }).message_id) || (result as { message_id: number }).message_id <= 0) {
+      throw new Error("Telegram sendMessage returned an invalid message");
+    }
+    return { message_id: (result as { message_id: number }).message_id };
+  }
+
+  async deleteMessage(chatId: number, messageId: number): Promise<void> {
+    await this.call("deleteMessage", { chat_id: chatId, message_id: messageId });
   }
 
   async editMessage(

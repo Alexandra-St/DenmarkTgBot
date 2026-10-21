@@ -12,8 +12,15 @@ import { validatedOfficialUrl } from "../src/bot/publications.ts";
 class CaptureTelegram implements TelegramClient {
   readonly edited: Array<{ text: string; keyboard?: unknown }> = [];
   readonly sent: Array<{ text: string; keyboard?: unknown }> = [];
+  readonly deleted: number[] = [];
+  private nextMessageId = 200;
   async sendMessage(_chatId: number, text: string, keyboard?: unknown): Promise<void> { this.sent.push({ text, keyboard }); }
+  async sendScreenMessage(chatId: number, text: string, keyboard?: unknown): Promise<{ message_id: number }> {
+    await this.sendMessage(chatId, text, keyboard);
+    return { message_id: this.nextMessageId++ };
+  }
   async answerCallback(): Promise<void> {}
+  async deleteMessage(_chatId: number, messageId: number): Promise<void> { this.deleted.push(messageId); }
   async editMessage(_chatId: number, _messageId: number, text: string, keyboard?: unknown): Promise<void> {
     this.edited.push({ text, keyboard });
   }
@@ -48,14 +55,14 @@ const callback = (data: string, userId = 9001) => ({
     id: `news-${data}`,
     from: { id: userId },
     data,
-    message: { message_id: 1, chat: { id: userId } },
+    message: { message_id: 1, chat: { id: userId, type: "private" as const } },
   },
 });
 
 test("News and Archive read only complete relevant records from local D1", async () => {
   const db = new LocalD1Fixture();
   try {
-    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql", "0008_source_deletions.sql", "0009_user_navigation_state.sql"]) {
+    for (const migration of ["0001_initial_schema.sql", "0002_ingestion.sql", "0003_ingestion_safety.sql", "0004_historical_baseline_gate.sql", "0005_notification_delivery_claim.sql", "0006_notification_canary_once.sql", "0008_source_deletions.sql", "0009_user_navigation_state.sql", "0010_navigation_screen_message.sql"]) {
       db.exec(await readFile(new URL(`../migrations/${migration}`, import.meta.url), "utf8"));
     }
     await new D1UserRepository(db).create(9001, "uk");
@@ -105,8 +112,13 @@ test("News and Archive read only complete relevant records from local D1", async
     const navState = new D1NavigationStateRepository(db);
     const savedArchiveState = { screen: "archive" as const, parent_screen: "main" as const, publication_kind: "archive" as const, archive_filter: "potential" as const, page: 2 };
     await navState.set(9002, savedArchiveState);
+    assert.equal(await navState.getScreenMessageId(9002), null);
+    assert.equal(await navState.replaceScreen(9002, null, savedArchiveState, 321), true);
     const restartedRepository = new D1NavigationStateRepository(db);
     assert.deepEqual({ ...await restartedRepository.get(9002)! }, savedArchiveState, "a new repository instance restores the saved navigation context");
+    assert.equal(await restartedRepository.getScreenMessageId(9002), 321, "a new repository instance restores the active screen ID");
+    assert.equal(await restartedRepository.replaceScreen(9002, null, savedArchiveState, 322), false, "stale sends cannot replace a newer active screen");
+    assert.equal(await restartedRepository.getScreenMessageId(9002), 321);
     assert.equal(await restartedRepository.get(9001), null, "missing navigation state is not guessed");
     await db.prepare("UPDATE user_navigation_state SET screen = 'publication_detail', parent_screen = 'settings', publication_kind = 'news' WHERE telegram_id = ?")
       .bind(9002).run();
@@ -114,6 +126,10 @@ test("News and Archive read only complete relevant records from local D1", async
     for (const fixture of localized) {
       const telegram = new CaptureTelegram();
       const click = (data: string) => handleTelegramUpdate(callback(data, fixture.id), users, telegram, repo, undefined, new D1NavigationStateRepository(db));
+      let replyId = 50;
+      const pressReply = (text: string) => handleTelegramUpdate({ message: {
+        message_id: replyId++, chat: { id: fixture.id, type: "private" }, from: { id: fixture.id }, text,
+      } }, users, telegram, repo, undefined, new D1NavigationStateRepository(db));
 
       await click("menu:news");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.newsHeading));
@@ -139,19 +155,22 @@ test("News and Archive read only complete relevant records from local D1", async
       assert.match(telegram.edited.at(-1)!.text, /а не юридична консультація|а не юридическая консультация/u);
       const detailMarkup = telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> };
       assert.ok(detailMarkup.inline_keyboard.flat().some((button) => button.url?.startsWith("https://hoeringsportalen.dk/")));
-      assert.deepEqual(detailMarkup.inline_keyboard.flat().filter((button) => button.callback_data).map((button) => button.callback_data), ["news:page:1", "nav:main"]);
-      await click(detailMarkup.inline_keyboard.flat().find((button) => button.callback_data === "news:page:1")!.callback_data!);
+      assert.deepEqual(detailMarkup.inline_keyboard.flat().filter((button) => button.callback_data).map((button) => button.callback_data), [], "detail navigation remains in the Reply Keyboard");
+      await pressReply("⬅️ Назад");
       assert.equal(telegram.edited.at(-1)!.text, pageOneNews, "detail Back returns to the same News page after repository recreation");
+      const editCountBeforeInvalidUrl = telegram.edited.length;
       await click("pub:d:1:news:all:1");
-      assert.equal((telegram.edited.at(-1)!.keyboard as { inline_keyboard: Array<Array<{ url?: string }>> }).inline_keyboard.flat().some((button) => button.url), false, "non-official URL is never exposed");
+      assert.match(telegram.sent.at(-1)!.text, /Danish title 1/u);
+      assert.equal(telegram.edited.length, editCountBeforeInvalidUrl, "an invalid/non-official URL adds no inline source link");
       await click("news:page:9999");
       assert.match(telegram.edited.at(-1)!.text, /Наразі немає публікацій для показу|Сейчас нет публикаций для показа/u);
       assert.match(telegram.edited.at(-1)!.text, /датою оновлення джерелом|дате обновления источником/u);
       assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
       await click("news:page:1");
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
-      await click(markup.inline_keyboard.flat().find((button) => button.callback_data === "nav:main")!.callback_data!);
-      assert.match(telegram.edited.at(-1)!.text, /Оберіть розділ|Выберите раздел/u);
+      assert.ok(!markup.inline_keyboard.flat().some((button) => button.callback_data === "nav:main"), "section navigation is not duplicated inline");
+      await pressReply("⬅️ Назад");
+      assert.match(telegram.sent.at(-1)!.text, /Оберіть розділ|Выберите раздел/u);
 
       await click("menu:archive");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.archiveHeading));
@@ -180,11 +199,15 @@ test("News and Archive read only complete relevant records from local D1", async
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
       const archiveDetail = markup.inline_keyboard.flat().find((button) => button.callback_data?.startsWith("pub:d:"))!.callback_data!;
       await click(archiveDetail);
-      await click("archive:page:all:1");
+      const detailScreen = telegram.sent.at(-1)!;
+      assert.deepEqual((detailScreen.keyboard as { keyboard: string[][] }).keyboard, [["⬅️ Назад", fixture.language === "uk" ? "🏠 Головне меню" : "🏠 Главное меню"]]);
+      assert.deepEqual(telegram.edited.at(-1)!.keyboard && (telegram.edited.at(-1)!.keyboard as { inline_keyboard: unknown[] }).inline_keyboard.length, 1,
+        "card keeps only its official-source inline button; navigation uses Reply Keyboard");
+      await pressReply("⬅️ Назад");
       assert.equal(telegram.edited.at(-1)!.text, pageOneArchive, "detail Back returns to the same Archive filter and page");
       markup = telegram.edited.at(-1)!.keyboard as typeof markup;
-      await click(markup.inline_keyboard.flat().find((button) => button.callback_data === "nav:main")!.callback_data!);
-      assert.match(telegram.edited.at(-1)!.text, /Оберіть розділ|Выберите раздел/u);
+      await pressReply("⬅️ Назад");
+      assert.match(telegram.sent.at(-1)!.text, /Оберіть розділ|Выберите раздел/u);
 
       await click("archive:page:potential:9999");
       assert.match(telegram.edited.at(-1)!.text, new RegExp(fixture.empty));
@@ -192,9 +215,9 @@ test("News and Archive read only complete relevant records from local D1", async
       assert.match(telegram.edited.at(-1)!.text, /🟡 POTENTIAL/u);
       assert.match(telegram.edited.at(-1)!.text, /моніторинг і сповіщення ще не ввімкнено|мониторинг и уведомления ещё не включены/u);
       await click("pub:d:999:news:all:0");
-      assert.match(telegram.edited.at(-1)!.text, /більше не знайдено|больше не найдена/u);
+      assert.match(telegram.sent.at(-1)!.text, /більше не знайдено|больше не найдена/u);
       await click("pub:d:2:archive:potential:0");
-      assert.match(telegram.edited.at(-1)!.text, /більше не знайдено|больше не найдена/u);
+      assert.match(telegram.sent.at(-1)!.text, /більше не знайдено|больше не найдена/u);
       await click("archive:page:all:10000");
       assert.match(telegram.edited.at(-1)!.text, /більше не знайдено|больше не найдена/u);
       await click(`pub:${"x".repeat(80)}`);
