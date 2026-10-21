@@ -19,6 +19,8 @@ export const uk = {
   disablePotential: "Вимкнути сповіщення про потенційні зміни",
   enabled: "✅",
   disabled: "⬜",
+  enabledState: "увімкнено",
+  disabledState: "вимкнено",
   settingsTitle: "⚙️ Налаштування",
   notificationsTitle: "🔔 Налаштування сповіщень",
   languageTitle: "Оберіть мову:",

@@ -21,6 +21,8 @@ export const ru: Record<TranslationKey, string> = {
   disablePotential: "Выключить уведомления о потенциальных изменениях",
   enabled: "✅",
   disabled: "⬜",
+  enabledState: "включено",
+  disabledState: "выключено",
   settingsTitle: "⚙️ Настройки",
   notificationsTitle: "🔔 Настройки уведомлений",
   languageTitle: "Выберите язык:",
