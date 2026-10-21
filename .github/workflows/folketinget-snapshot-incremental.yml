@@ -1,0 +1,165 @@
+name: Folketinget snapshot incremental
+run-name: Folketinget snapshot incremental / ${{ github.event_name == 'schedule' && 'production_ingest' || inputs.mode }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run is production read-only; production_ingest needs an explicit confirmation"
+        required: true
+        type: choice
+        options:
+          - dry_run
+          - production_ingest
+        default: dry_run
+      confirm_restore:
+        description: "Confirm temporary restore of the official Folketinget backup"
+        required: true
+        type: boolean
+        default: false
+      confirm_production:
+        description: "Confirm live Folketinget ingestion (production_ingest only)"
+        required: true
+        type: boolean
+        default: false
+      bootstrap_manifest_run_id:
+        description: "One-time bootstrap only: successful CREATE_MANIFEST_BASELINE run ID; the existing anchor may expire"
+        required: false
+        type: string
+        default: "39353715697"
+  schedule:
+    # Run after the official nightly backup normally completes around 02:00 UTC.
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: folketinget-snapshot-incremental
+  cancel-in-progress: false
+
+jobs:
+  incremental:
+    # A missing, false, or non-exact value skips the scheduled production job.
+    if: github.event_name != 'schedule' || vars.FOLKETINGET_AUTOMATION_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Validate execution authorization
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+          CONFIRM_RESTORE: ${{ github.event_name == 'schedule' && 'true' || inputs.confirm_restore }}
+          CONFIRM_PRODUCTION: ${{ github.event_name == 'schedule' && 'true' || inputs.confirm_production }}
+          FOLKETINGET_AUTOMATION_ENABLED: ${{ vars.FOLKETINGET_AUTOMATION_ENABLED }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            [[ "$FOLKETINGET_AUTOMATION_ENABLED" == "true" ]] || { echo "incremental=FAIL category=folketinget_automation_disabled"; exit 2; }
+            [[ "$CONFIRM_RESTORE" == "true" && "$CONFIRM_PRODUCTION" == "true" ]] || { echo "incremental=FAIL category=scheduled_authorization_invalid"; exit 2; }
+          else
+            [[ "$CONFIRM_RESTORE" == "true" ]] || { echo "incremental=FAIL category=manual_confirmation_required"; exit 2; }
+            if [[ "$MODE" == "production_ingest" ]]; then
+              [[ "$CONFIRM_PRODUCTION" == "true" ]] || { echo "incremental=FAIL category=production_confirmation_required"; exit 2; }
+            elif [[ "$MODE" != "dry_run" ]]; then
+              echo "incremental=FAIL category=workflow_mode_invalid"
+              exit 2
+            fi
+          fi
+
+      - name: Select the bootstrap or latest committed base
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BOOTSTRAP_MANIFEST_RUN_ID: ${{ inputs.bootstrap_manifest_run_id || '39353715697' }}
+        run: python3 tools/folketinget_snapshot_workflow.py select-base
+
+      - name: Download selected manifest artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.base.outputs.artifact_name }}
+          path: ${{ runner.temp }}/folketinget-base-manifest-${{ steps.base.outputs.run_id }}
+          run-id: ${{ steps.base.outputs.run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Verify backup and run snapshot incremental pipeline
+        id: run-incremental
+        env:
+          INPUT_MODE: ${{ github.event_name == 'schedule' && 'SNAPSHOT_INCREMENTAL_LIVE' || (inputs.mode == 'production_ingest' && 'SNAPSHOT_INCREMENTAL_LIVE' || 'SNAPSHOT_INCREMENTAL_DRY_RUN') }}
+          INPUT_CONFIRM_RESTORE: ${{ github.event_name == 'schedule' && 'true' || inputs.confirm_restore }}
+          INPUT_CONFIRM_PRODUCTION: ${{ github.event_name == 'schedule' && 'true' || inputs.confirm_production }}
+          INPUT_BASE_MANIFEST_RUN_ID: ${{ steps.base.outputs.run_id }}
+          BASE_MANIFEST_PATH: ${{ runner.temp }}/folketinget-base-manifest-${{ steps.base.outputs.run_id }}
+          ODA_BACKUP_USERNAME: ${{ secrets.ODA_BACKUP_USERNAME }}
+          ODA_BACKUP_PASSWORD: ${{ secrets.ODA_BACKUP_PASSWORD }}
+          INGEST_API_URL: ${{ (github.event_name == 'schedule' || inputs.mode == 'production_ingest') && vars.INGEST_API_URL || '' }}
+          INGEST_API_TOKEN: ${{ (github.event_name == 'schedule' || inputs.mode == 'production_ingest') && secrets.INGEST_API_TOKEN || '' }}
+          FOLKETINGET_AUTOMATION_ENABLED: ${{ vars.FOLKETINGET_AUTOMATION_ENABLED }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python3 tools/folketinget_backup_poc.py
+
+      - name: Promote target manifest only after COMMITTED
+        if: success() && steps.run-incremental.outputs.promote_manifest == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: folketinget-snapshot-incremental-${{ github.run_id }}
+          path: ${{ runner.temp }}/denmarkbot-folketinget-manifest-incremental/manifest.sqlite
+          if-no-files-found: error
+          # One month keeps the predecessor available across a missed day without unbounded retention.
+          retention-days: 30
+
+      - name: Record successful live no-op without advancing the base
+        if: success() && steps.run-incremental.outputs.incremental_outcome == 'no_commit'
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          printf 'NO_COMMIT\n' > "$RUNNER_TEMP/folketinget-no-commit-$GITHUB_RUN_ID.txt"
+
+      - name: Preserve no-op marker so later runs keep the last committed base
+        if: success() && steps.run-incremental.outputs.incremental_outcome == 'no_commit'
+        uses: actions/upload-artifact@v7
+        with:
+          name: folketinget-snapshot-no-commit-${{ github.run_id }}
+          path: ${{ runner.temp }}/folketinget-no-commit-${{ github.run_id }}.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary target manifest
+        if: always()
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/denmarkbot-folketinget-manifest-incremental"
+          if [ "$(dirname "$target")" = "$RUNNER_TEMP" ] && [ -d "$target" ] && [ ! -L "$target" ]; then
+            rm -rf -- "$target"
+          fi
+
+      - name: Remove temporary no-op marker
+        if: always()
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: rm -f -- "$RUNNER_TEMP/folketinget-no-commit-$GITHUB_RUN_ID.txt"
+
+      - name: Remove downloaded base manifest
+        if: always() && steps.base.outputs.run_id != ''
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          BASE_RUN_ID: ${{ steps.base.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/folketinget-base-manifest-$BASE_RUN_ID"
+          if [[ "$BASE_RUN_ID" =~ ^[0-9]+$ ]] && [ "$(dirname "$target")" = "$RUNNER_TEMP" ] && [ -d "$target" ] && [ ! -L "$target" ]; then
+            rm -rf -- "$target"
+          fi

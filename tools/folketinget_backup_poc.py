@@ -66,6 +66,7 @@ CLASSIFY_SNAPSHOT_CANDIDATES = "CLASSIFY_SNAPSHOT_CANDIDATES"
 PREPARE_SNAPSHOT_INGESTION = "PREPARE_SNAPSHOT_INGESTION"
 SNAPSHOT_INGESTION_DRY_RUN = "SNAPSHOT_INGESTION_DRY_RUN"
 SNAPSHOT_INCREMENTAL_DRY_RUN = "SNAPSHOT_INCREMENTAL_DRY_RUN"
+SNAPSHOT_INCREMENTAL_LIVE = "SNAPSHOT_INCREMENTAL_LIVE"
 HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN = "HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN"
 HISTORICAL_SNAPSHOT_BASELINE_LIVE = "HISTORICAL_SNAPSHOT_BASELINE_LIVE"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
@@ -98,6 +99,33 @@ def validate_confirmation(value: str) -> None:
         raise PocError("manual_confirmation_required")
 
 
+def validate_snapshot_incremental_live_gate(
+    event_name: str, confirm_restore: str, confirm_production: str, automation_enabled: str
+) -> None:
+    """Fail closed before collection unless live ingestion is explicitly authorized."""
+    if confirm_restore != "true":
+        raise PocError("manual_confirmation_required")
+    if event_name == "schedule":
+        if automation_enabled != "true":
+            raise PocError("folketinget_automation_disabled")
+        return
+    if event_name != "workflow_dispatch":
+        raise PocError("incremental_live_event_unsupported")
+    if confirm_production != "true":
+        raise PocError("production_confirmation_required")
+
+
+def snapshot_incremental_run_id(github_repository: str, github_run_id: str) -> str:
+    """Derive a stable idempotency key for retries of the same Actions run."""
+    import uuid
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", github_repository or ""):
+        raise PocError("snapshot_incremental_run_id_invalid")
+    if not re.fullmatch(r"[0-9]+", github_run_id or ""):
+        raise PocError("snapshot_incremental_run_id_invalid")
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/{github_repository}/actions/runs/{github_run_id}"))
+
+
 def validate_mode(value: str) -> str:
     if value not in {
         RESTORE_VALIDATE,
@@ -108,6 +136,7 @@ def validate_mode(value: str) -> str:
         PREPARE_SNAPSHOT_INGESTION,
         SNAPSHOT_INGESTION_DRY_RUN,
         SNAPSHOT_INCREMENTAL_DRY_RUN,
+        SNAPSHOT_INCREMENTAL_LIVE,
         HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
         HISTORICAL_SNAPSHOT_BASELINE_LIVE,
     }:
@@ -1522,6 +1551,75 @@ def run_snapshot_incremental_dry_run(
     }
 
 
+def run_snapshot_incremental_live(
+    base_context: dict[str, Any], target_manifest: Path, provider: Any, runner_temp: Path,
+    *, endpoint: str, token: str, github_repository: str, github_run_id: str,
+) -> dict[str, Any]:
+    """Submit a complete newer snapshot diff and require confirmed Worker commit."""
+    context = validate_snapshot_incremental_pair(base_context, target_manifest)
+    diff_totals = context["report"]["totals"]
+    if context["same_snapshot"]:
+        return {
+            "status": "PASS", "snapshot_change": "SAME_SNAPSHOT",
+            "base_finish": context["old_finish"], "target_finish": context["new_finish"],
+            "diff_totals": dict(diff_totals), "affected_case_count": 0, "hydrated_case_count": 0,
+            "tombstone_count": 0, "DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0,
+            "prepared_record_count": 0, "batch_count": 0,
+            "snapshot_client_status": "NOT_REQUIRED", "snapshot_advanced": False,
+            "promote_manifest": False,
+        }
+    run_id = snapshot_incremental_run_id(github_repository, github_run_id)
+    result = run_candidate_extraction(
+        context["old_path"], context["new_path"], provider, runner_temp,
+        context["old_finish"], context["new_finish"],
+        base_snapshot=context["base_snapshot"], target_snapshot=context["target_snapshot"],
+        snapshot_ingestion_live=True, ingestion_endpoint=endpoint, ingestion_token=token,
+        ingestion_run_id=run_id,
+    )
+    if result.get("diff_totals") != diff_totals or result.get("complete") is not True:
+        raise PocError("snapshot_incremental_extraction_incomplete")
+    client = result.get("snapshot_ingestion_live")
+    if not isinstance(client, dict):
+        raise PocError("snapshot_incremental_client_result_invalid")
+    client_status = client.get("status")
+    is_committed = client_status == "COMMITTED"
+    if client_status not in {"COMMITTED", "NO_CANDIDATES"}:
+        raise PocError("snapshot_incremental_client_result_invalid")
+    if client_status == "NO_CANDIDATES" and (result["candidate_case_count"] + result["tombstone_count"] != 0
+                                               or client.get("records") != 0 or client.get("batches") != 0):
+        raise PocError("snapshot_incremental_client_result_invalid")
+    if is_committed and (client.get("snapshot_advanced") is not True
+                         or client.get("base_snapshot") != context["base_snapshot"]
+                         or client.get("target_snapshot") != context["target_snapshot"]):
+        raise PocError("snapshot_incremental_commit_contract_mismatch")
+    counts = client.get("relevance_counts")
+    if not isinstance(counts, dict) or set(counts) != {"DIRECT", "POTENTIAL", "IRRELEVANT"}:
+        raise PocError("snapshot_incremental_client_result_invalid")
+    return {
+        "status": "PASS", "snapshot_change": "CHANGED",
+        "base_finish": context["old_finish"], "target_finish": context["new_finish"],
+        "diff_totals": dict(diff_totals), "affected_case_count": result["affected_case_count"],
+        "hydrated_case_count": result["hydrated_case_count"], "tombstone_count": result["tombstone_count"],
+        "DIRECT": counts["DIRECT"], "POTENTIAL": counts["POTENTIAL"], "IRRELEVANT": counts["IRRELEVANT"],
+        "prepared_record_count": client.get("records", 0), "batch_count": client.get("batches", 0),
+        "snapshot_client_status": client_status, "snapshot_advanced": is_committed,
+        "promote_manifest": is_committed,
+    }
+
+
+def write_incremental_promotion_output(enabled: bool) -> None:
+    """Set a GitHub output only after the full live path returned COMMITTED."""
+    output = os.environ.get("GITHUB_OUTPUT")
+    if not output:
+        return
+    try:
+        with open(output, "a", encoding="utf-8") as target:
+            target.write(f"promote_manifest={str(enabled).lower()}\n")
+            target.write(f"incremental_outcome={'committed' if enabled else 'no_commit'}\n")
+    except OSError:
+        raise PocError("snapshot_incremental_output_write_failed") from None
+
+
 def discover_candidate_provider_schema(
     password: str, entities: dict[str, Any], *, error_category: str = "candidate_schema_mismatch"
 ) -> tuple[str, dict[str, dict[str, Any]]]:
@@ -1977,6 +2075,10 @@ def run_candidate_extraction(
     snapshot_ingestion_dry_run: bool = False,
     base_snapshot: dict[str, str] | None = None,
     target_snapshot: dict[str, str] | None = None,
+    snapshot_ingestion_live: bool = False,
+    ingestion_endpoint: str = "",
+    ingestion_token: str = "",
+    ingestion_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the established extractor and return only validated aggregate data."""
     bundle_path: Path | None = None
@@ -2144,6 +2246,67 @@ def run_candidate_extraction(
                     "target_finish": target_snapshot["backup_finish_date"],
                     "schema_equal": base_snapshot["schema_fingerprint"] == target_snapshot["schema_fingerprint"],
                     "extraction_diagnostics": clean_diagnostics,
+                }
+        if snapshot_ingestion_live:
+            if base_snapshot is None or target_snapshot is None or not ingestion_run_id:
+                raise PocError("snapshot_live_contract_missing")
+            if result["complete"] is not True or clean_diagnostics:
+                raise PocError("snapshot_incremental_extraction_incomplete")
+            if result["candidate_case_count"] + tombstone_count == 0:
+                result["snapshot_ingestion_live"] = {
+                    "status": "NO_CANDIDATES", "records": 0, "batches": 0,
+                    "relevance_counts": {"DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0},
+                    "base_snapshot": base_snapshot, "target_snapshot": target_snapshot,
+                    "snapshot_advanced": False,
+                }
+            else:
+                try:
+                    from collectors.snapshot_ingestion_client import (
+                        SnapshotIngestionError,
+                        ingest_snapshot_candidates,
+                    )
+                    live_result = ingest_snapshot_candidates(
+                        persisted_bundle,
+                        mode="incremental",
+                        base_snapshot=base_snapshot,
+                        target_snapshot=target_snapshot,
+                        endpoint=ingestion_endpoint,
+                        token=ingestion_token,
+                        run_id=ingestion_run_id,
+                        dry_run=False,
+                    )
+                except SnapshotIngestionError as error:
+                    if re.fullmatch(r"[a-z0-9_]{1,80}", error.code):
+                        raise PocError(error.code) from None
+                    raise PocError("snapshot_incremental_ingestion_failed") from None
+                except Exception:
+                    raise PocError("snapshot_incremental_ingestion_failed") from None
+                counts = live_result.get("relevance_counts")
+                records_count = live_result.get("records")
+                batches_count = live_result.get("batches")
+                if (live_result.get("dry_run") is not False
+                        or live_result.get("mode") != "incremental"
+                        or live_result.get("state_kind") != "snapshot"
+                        or live_result.get("collection_complete") is not True
+                        or live_result.get("submission_eligible") is not True
+                        or live_result.get("status") != "COMMITTED"
+                        or live_result.get("snapshot_advanced") is not True
+                        or live_result.get("run_id") != ingestion_run_id
+                        or live_result.get("base_snapshot") != base_snapshot
+                        or live_result.get("target_snapshot") != target_snapshot
+                        or isinstance(records_count, bool) or not isinstance(records_count, int)
+                        or records_count != result["candidate_case_count"] + tombstone_count
+                        or isinstance(batches_count, bool) or not isinstance(batches_count, int)
+                        or not 1 <= batches_count <= 200
+                        or not isinstance(counts, dict) or set(counts) != {"DIRECT", "POTENTIAL", "IRRELEVANT"}
+                        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts.values())
+                        or sum(counts.values()) != result["candidate_case_count"]):
+                    raise PocError("snapshot_incremental_commit_contract_mismatch")
+                result["snapshot_ingestion_live"] = {
+                    "status": "COMMITTED", "records": records_count, "batches": batches_count,
+                    "relevance_counts": counts, "base_snapshot": base_snapshot,
+                    "target_snapshot": target_snapshot, "snapshot_advanced": True,
+                    "snapshot_generation": live_result.get("snapshot_generation"),
                 }
         return result
     finally:
@@ -2518,6 +2681,36 @@ def write_snapshot_incremental_summary(summary: dict[str, Any]) -> None:
     print(text, end="")
 
 
+def write_snapshot_incremental_live_summary(summary: dict[str, Any]) -> None:
+    """Emit aggregate-only production outcome without record or run identifiers."""
+    diff = summary["diff_totals"]
+    lines = [
+        f"Folketinget snapshot incremental production: {summary['status']}", "",
+        f"- base backup finish: {summary['base_finish']}",
+        f"- target backup finish: {summary['target_finish']}",
+        f"- snapshot comparison: {summary['snapshot_change']}",
+        f"- added: {diff['added']}", f"- removed: {diff['removed']}",
+        f"- changed: {diff['changed']}", f"- technical_only: {diff['technical_only']}",
+        f"- affected Sag count: {summary['affected_case_count']}",
+        f"- hydrated Sag count: {summary['hydrated_case_count']}",
+        f"- DIRECT: {summary['DIRECT']}", f"- POTENTIAL: {summary['POTENTIAL']}",
+        f"- IRRELEVANT: {summary['IRRELEVANT']}",
+        f"- prepared record count: {summary['prepared_record_count']}",
+        f"- batch count: {summary['batch_count']}",
+        f"- Worker ingestion status: {summary['snapshot_client_status']}",
+        f"- snapshot advanced: {str(summary['snapshot_advanced']).lower()}",
+    ]
+    text = "\n".join(lines) + "\n"
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as output:
+                output.write(text)
+        except OSError:
+            raise PocError("snapshot_incremental_summary_write_failed") from None
+    print(text, end="")
+
+
 def write_historical_baseline_summary(summary: dict[str, Any]) -> None:
     """Write only the documented aggregate fields for historical baseline dry-run."""
     import folketinget_candidate_extraction as candidate_extraction
@@ -2805,6 +2998,7 @@ def main() -> int:
     incremental_base_context: dict[str, Any] | None = None
     mode: str | None = None
     historical_live_summary_written = False
+    incremental_manifest_promotable = False
     try:
         mode = validate_mode(os.environ.get("INPUT_MODE", RESTORE_VALIDATE))
         validate_confirmation(os.environ.get("INPUT_CONFIRM_RESTORE", ""))
@@ -2814,7 +3008,17 @@ def main() -> int:
             PREPARE_SNAPSHOT_INGESTION,
             SNAPSHOT_INGESTION_DRY_RUN,
         }
-        incremental_mode = mode == SNAPSHOT_INCREMENTAL_DRY_RUN
+        incremental_mode = mode in {SNAPSHOT_INCREMENTAL_DRY_RUN, SNAPSHOT_INCREMENTAL_LIVE}
+        incremental_live_mode = mode == SNAPSHOT_INCREMENTAL_LIVE
+        if incremental_live_mode:
+            validate_snapshot_incremental_live_gate(
+                os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"),
+                os.environ.get("INPUT_CONFIRM_RESTORE", ""),
+                os.environ.get("INPUT_CONFIRM_PRODUCTION", ""),
+                os.environ.get("FOLKETINGET_AUTOMATION_ENABLED", ""),
+            )
+            if not os.environ.get("INGEST_API_URL") or not os.environ.get("INGEST_API_TOKEN"):
+                raise PocError("ingestion_configuration_missing")
         historical_mode = mode in {
             HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
             HISTORICAL_SNAPSHOT_BASELINE_LIVE,
@@ -2848,6 +3052,7 @@ def main() -> int:
             HISTORICAL_SNAPSHOT_BASELINE_DRY_RUN,
             HISTORICAL_SNAPSHOT_BASELINE_LIVE,
             SNAPSHOT_INCREMENTAL_DRY_RUN,
+            SNAPSHOT_INCREMENTAL_LIVE,
         }
         if mode not in quiet_modes:
             print(f"runner_arch=x64 ubuntu={release} free_disk_before_install_bytes={initial_free}")
@@ -2966,7 +3171,7 @@ def main() -> int:
                     print("restore_validation=FAIL")
                     return 2
             print("restore_validation=PASS")
-        elif mode == SNAPSHOT_INCREMENTAL_DRY_RUN:
+        elif mode in {SNAPSHOT_INCREMENTAL_DRY_RUN, SNAPSHOT_INCREMENTAL_LIVE}:
             if incremental_base_context is None:
                 raise PocError("snapshot_incremental_base_context_missing")
             print("progress=snapshot_incremental_schema_discovery")
@@ -2988,10 +3193,22 @@ def main() -> int:
                 raise PocError("snapshot_incremental_schema_changed")
             provider = create_candidate_sql_provider(password, entities, _provider_schemas)
             print("progress=snapshot_incremental_diff")
-            incremental_summary = run_snapshot_incremental_dry_run(
-                incremental_base_context, current_manifest, provider, runner_temp
-            )
-            write_snapshot_incremental_summary(incremental_summary)
+            if mode == SNAPSHOT_INCREMENTAL_DRY_RUN:
+                incremental_summary = run_snapshot_incremental_dry_run(
+                    incremental_base_context, current_manifest, provider, runner_temp
+                )
+                write_snapshot_incremental_summary(incremental_summary)
+            else:
+                incremental_summary = run_snapshot_incremental_live(
+                    incremental_base_context, current_manifest, provider, runner_temp,
+                    endpoint=os.environ.get("INGEST_API_URL", ""),
+                    token=os.environ.get("INGEST_API_TOKEN", ""),
+                    github_repository=os.environ.get("GITHUB_REPOSITORY", ""),
+                    github_run_id=os.environ.get("GITHUB_RUN_ID", ""),
+                )
+                write_snapshot_incremental_live_summary(incremental_summary)
+                incremental_manifest_promotable = incremental_summary.get("promote_manifest") is True
+                write_incremental_promotion_output(incremental_manifest_promotable)
             if incremental_summary["status"] != "PASS":
                 print("restore_validation=INCOMPLETE")
                 return 2
@@ -3134,7 +3351,8 @@ def main() -> int:
         os.environ.pop("ODA_BACKUP_PASSWORD", None)
         os.environ.pop("INGEST_API_TOKEN", None)
         try:
-            if incremental_manifest_dir is not None and runner_temp is not None:
+            if (incremental_manifest_dir is not None and runner_temp is not None
+                    and not incremental_manifest_promotable):
                 cleanup_incremental_manifest(incremental_manifest_dir, runner_temp)
         except PocError as exc:
             print(f"cleanup=FAIL category={exc.category}", file=sys.stderr)

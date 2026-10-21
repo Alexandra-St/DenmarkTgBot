@@ -502,6 +502,7 @@ class BackupPocSafetyTests(unittest.TestCase):
     def test_snapshot_client_mode_and_existing_manual_modes_remain(self) -> None:
         self.assertEqual(POC.validate_mode("SNAPSHOT_INGESTION_DRY_RUN"), "SNAPSHOT_INGESTION_DRY_RUN")
         self.assertEqual(POC.validate_mode("SNAPSHOT_INCREMENTAL_DRY_RUN"), "SNAPSHOT_INCREMENTAL_DRY_RUN")
+        self.assertEqual(POC.validate_mode("SNAPSHOT_INCREMENTAL_LIVE"), "SNAPSHOT_INCREMENTAL_LIVE")
         for mode in ("RESTORE_VALIDATE", "VALIDATE_SQL_PROVIDER", "CREATE_MANIFEST_BASELINE",
                      "EXTRACT_SNAPSHOT_CANDIDATES", "CLASSIFY_SNAPSHOT_CANDIDATES",
                      "PREPARE_SNAPSHOT_INGESTION", "HISTORICAL_SNAPSHOT_BASELINE_LIVE"):
@@ -904,6 +905,213 @@ class BackupPocSafetyTests(unittest.TestCase):
             self.assertEqual(result["prepared_record_count"], 0)
             self.assertEqual(result["snapshot_client_dry_run"], "PASS")
             self.assertFalse(result["submission_eligible"])
+
+    def test_snapshot_incremental_live_gate_is_exact_and_fail_closed(self) -> None:
+        POC.validate_snapshot_incremental_live_gate("workflow_dispatch", "true", "true", "false")
+        POC.validate_snapshot_incremental_live_gate("schedule", "true", "false", "true")
+        for args, category in [
+            (("workflow_dispatch", "true", "false", "true"), "production_confirmation_required"),
+            (("schedule", "true", "true", "TRUE"), "folketinget_automation_disabled"),
+            (("schedule", "false", "true", "true"), "manual_confirmation_required"),
+            (("repository_dispatch", "true", "true", "true"), "incremental_live_event_unsupported"),
+        ]:
+            with self.subTest(args=args), self.assertRaises(POC.PocError) as error:
+                POC.validate_snapshot_incremental_live_gate(*args)
+            self.assertEqual(error.exception.category, category)
+
+    def test_snapshot_incremental_run_id_is_stable_for_same_actions_run(self) -> None:
+        first = POC.snapshot_incremental_run_id("Alexandra-St/DenmarkTgBot", "12345")
+        self.assertEqual(first, POC.snapshot_incremental_run_id("Alexandra-St/DenmarkTgBot", "12345"))
+        self.assertNotEqual(first, POC.snapshot_incremental_run_id("Alexandra-St/DenmarkTgBot", "12346"))
+        with self.assertRaises(POC.PocError):
+            POC.snapshot_incremental_run_id("bad/repo", "not-a-run")
+
+    def test_snapshot_incremental_live_promotes_only_exact_committed_result(self) -> None:
+        old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            old_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            new_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            old_rows["Sag"] = [(42, b"f" * 32, b"s" * 32, {"statusid": None})]
+            new_rows["Sag"] = [(42, b"g" * 32, b"t" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=old_rows)
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            complete = {
+                "complete": True,
+                "diff_totals": {"added": 0, "removed": 0, "changed": 1, "technical_only": 0, "unchanged": 0},
+                "affected_case_count": 1, "hydrated_case_count": 1, "candidate_case_count": 1, "tombstone_count": 0,
+                "snapshot_ingestion_live": {
+                    "status": "COMMITTED", "records": 1, "batches": 1,
+                    "relevance_counts": {"DIRECT": 1, "POTENTIAL": 0, "IRRELEVANT": 0},
+                    "base_snapshot": context["identity"],
+                    "target_snapshot": {"backup_sha256": "b" * 64, "backup_finish_date": new_finish,
+                                        "schema_fingerprint": "a" * 64},
+                    "snapshot_advanced": True,
+                },
+            }
+            with mock.patch.object(POC, "run_candidate_extraction", return_value=complete) as extract:
+                result = POC.run_snapshot_incremental_live(
+                    context, target, SimpleNamespace(), root, endpoint="https://worker.invalid/internal/ingest",
+                    token="private", github_repository="Alexandra-St/DenmarkTgBot", github_run_id="12345",
+                )
+            self.assertTrue(result["promote_manifest"])
+            self.assertEqual(result["snapshot_client_status"], "COMMITTED")
+            kwargs = extract.call_args.kwargs
+            self.assertEqual(kwargs["base_snapshot"], context["identity"])
+            self.assertEqual(kwargs["target_snapshot"], complete["snapshot_ingestion_live"]["target_snapshot"])
+            self.assertTrue(kwargs["snapshot_ingestion_live"])
+            self.assertEqual(kwargs["ingestion_run_id"], POC.snapshot_incremental_run_id(
+                "Alexandra-St/DenmarkTgBot", "12345"))
+
+            no_commit = {**complete, "snapshot_ingestion_live": {
+                **complete["snapshot_ingestion_live"], "status": "NO_CANDIDATES",
+                "snapshot_advanced": False,
+            }}
+            no_commit["snapshot_ingestion_live"]["records"] = 0
+            no_commit["snapshot_ingestion_live"]["batches"] = 0
+            no_commit["snapshot_ingestion_live"]["relevance_counts"] = {
+                "DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0}
+            with mock.patch.object(POC, "run_candidate_extraction", return_value=no_commit):
+                with self.assertRaises(POC.PocError) as mismatch:
+                    POC.run_snapshot_incremental_live(
+                        context, target, SimpleNamespace(), root, endpoint="", token="",
+                        github_repository="Alexandra-St/DenmarkTgBot", github_run_id="12345",
+                    )
+            self.assertEqual(mismatch.exception.category, "snapshot_incremental_client_result_invalid")
+
+    def test_snapshot_incremental_live_same_snapshot_is_noop_and_ingestion_failure_blocks_promotion(self) -> None:
+        stamp = "2026-10-20 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            rows["Sag"] = [(42, b"f" * 32, b"s" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(base, backup="a", finish=stamp, rows=rows)
+            create_v2_candidate_manifest(target, backup="a", finish=stamp, rows=rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            with mock.patch.object(POC, "run_candidate_extraction") as extract:
+                result = POC.run_snapshot_incremental_live(
+                    context, target, SimpleNamespace(), root, endpoint="", token="",
+                    github_repository="Alexandra-St/DenmarkTgBot", github_run_id="12345",
+                )
+            extract.assert_not_called()
+            self.assertFalse(result["promote_manifest"])
+            self.assertEqual(result["snapshot_client_status"], "NOT_REQUIRED")
+
+            new_finish = "2026-10-21 02:00:40.000"
+            changed = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            changed["Sag"] = [(42, b"g" * 32, b"t" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=changed)
+            with mock.patch.object(POC, "run_candidate_extraction", side_effect=POC.PocError("worker_request_failed")):
+                with self.assertRaises(POC.PocError) as failed:
+                    POC.run_snapshot_incremental_live(
+                        context, target, SimpleNamespace(), root, endpoint="", token="",
+                        github_repository="Alexandra-St/DenmarkTgBot", github_run_id="12345",
+                    )
+            self.assertEqual(failed.exception.category, "worker_request_failed")
+
+    def test_snapshot_incremental_live_rejects_regression_schema_change_and_incomplete_extraction(self) -> None:
+        old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            base_dir = root / "folketinget-base-manifest-39433055408"
+            base_dir.mkdir()
+            base, target = base_dir / "manifest.sqlite", root / "current.sqlite"
+            old_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            new_rows = {entity: [] for entity in POC.REQUIRED_ENTITIES}
+            old_rows["Sag"] = [(42, b"f" * 32, b"s" * 32, {"statusid": None})]
+            new_rows["Sag"] = [(42, b"g" * 32, b"t" * 32, {"statusid": None})]
+            create_v2_candidate_manifest(base, backup="a", finish=old_finish, rows=old_rows)
+            context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
+            create_v2_candidate_manifest(target, backup="b", finish="2026-10-19 02:00:40.000", rows=new_rows)
+            with self.assertRaises(POC.PocError) as regression:
+                POC.run_snapshot_incremental_live(
+                    context, target, SimpleNamespace(), root, endpoint="", token="",
+                    github_repository="Alexandra-St/DenmarkTgBot", github_run_id="1",
+                )
+            self.assertEqual(regression.exception.category, "snapshot_incremental_target_not_newer")
+
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows,
+                                         schema_fingerprint="c" * 64)
+            with self.assertRaises(POC.PocError) as schema:
+                POC.run_snapshot_incremental_live(
+                    context, target, SimpleNamespace(), root, endpoint="", token="",
+                    github_repository="Alexandra-St/DenmarkTgBot", github_run_id="1",
+                )
+            self.assertEqual(schema.exception.category, "snapshot_incremental_schema_changed")
+
+            create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
+            incomplete = {
+                "complete": False,
+                "diff_totals": {"added": 0, "removed": 0, "changed": 1, "technical_only": 0, "unchanged": 0},
+                "affected_case_count": 1, "hydrated_case_count": 0, "candidate_case_count": 0,
+                "tombstone_count": 0,
+            }
+            with mock.patch.object(POC, "run_candidate_extraction", return_value=incomplete) as extract:
+                with self.assertRaises(POC.PocError) as extraction:
+                    POC.run_snapshot_incremental_live(
+                        context, target, SimpleNamespace(), root, endpoint="", token="",
+                        github_repository="Alexandra-St/DenmarkTgBot", github_run_id="1",
+                    )
+            extract.assert_called_once()
+            self.assertEqual(extraction.exception.category, "snapshot_incremental_extraction_incomplete")
+
+    def test_snapshot_incremental_live_invokes_client_only_for_complete_bundle_and_requires_commit(self) -> None:
+        from collectors.snapshot_ingestion_client import SnapshotIngestionError
+
+        stamp = "2026-10-21T02:00:00Z"
+        old, new = pathlib.Path("/tmp/old-manifest.sqlite"), pathlib.Path("/tmp/new-manifest.sqlite")
+        bundle = self._candidate_bundle([{"synthetic": True}], complete=True)
+        bundle["candidate_case_count"] = 1
+        bundle["diff"]["totals"]["changed"] = 1
+        bundle["diff"]["entities"]["Sag"]["changed"] = 1
+        base_snapshot = {"backup_sha256": "a" * 64, "backup_finish_date": "2026-10-20T02:00:00Z",
+                         "schema_fingerprint": "b" * 64}
+        target_snapshot = {"backup_sha256": "c" * 64, "backup_finish_date": stamp,
+                           "schema_fingerprint": "b" * 64}
+        run_id = "123e4567-e89b-42d3-a456-426614174000"
+        committed = {
+            "dry_run": False, "mode": "incremental", "state_kind": "snapshot",
+            "collection_complete": True, "submission_eligible": True, "status": "COMMITTED",
+            "snapshot_advanced": True, "run_id": run_id, "base_snapshot": base_snapshot,
+            "target_snapshot": target_snapshot, "records": 1, "batches": 1,
+            "relevance_counts": {"DIRECT": 1, "POTENTIAL": 0, "IRRELEVANT": 0},
+            "snapshot_generation": 2,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=bundle):
+                with mock.patch("collectors.snapshot_ingestion_client.ingest_snapshot_candidates",
+                                return_value=committed) as client:
+                    result = POC.run_candidate_extraction(
+                        old, new, SimpleNamespace(), root, "2026-10-20T02:00:00Z", stamp,
+                        base_snapshot=base_snapshot, target_snapshot=target_snapshot,
+                        snapshot_ingestion_live=True, ingestion_endpoint="https://worker.invalid/internal/ingest",
+                        ingestion_token="do-not-log", ingestion_run_id=run_id,
+                    )
+            self.assertEqual(result["snapshot_ingestion_live"]["status"], "COMMITTED")
+            self.assertEqual(client.call_args.kwargs["dry_run"], False)
+            self.assertEqual(client.call_args.kwargs["run_id"], run_id)
+            self.assertEqual(client.call_args.kwargs["base_snapshot"], base_snapshot)
+            self.assertEqual(client.call_args.kwargs["target_snapshot"], target_snapshot)
+
+            with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=bundle):
+                with mock.patch("collectors.snapshot_ingestion_client.ingest_snapshot_candidates",
+                                side_effect=SnapshotIngestionError("worker_request_failed")):
+                    with self.assertRaises(POC.PocError) as error:
+                        POC.run_candidate_extraction(
+                            old, new, SimpleNamespace(), root, "2026-10-20T02:00:00Z", stamp,
+                            base_snapshot=base_snapshot, target_snapshot=target_snapshot,
+                            snapshot_ingestion_live=True, ingestion_endpoint="", ingestion_token="private",
+                            ingestion_run_id=run_id,
+                        )
+            self.assertEqual(error.exception.category, "worker_request_failed")
 
     def test_snapshot_incremental_changed_snapshot_uses_exact_identities_and_dry_run_only(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider
