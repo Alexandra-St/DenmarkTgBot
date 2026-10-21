@@ -23,8 +23,13 @@ export interface UserNavigationState {
 export interface NavigationStateRepository {
   get(telegramId: number): Promise<UserNavigationState | null>;
   set(telegramId: number, state: UserNavigationState): Promise<void>;
-  getScreenMessageId(telegramId: number): Promise<number | null>;
-  replaceScreen(telegramId: number, expectedMessageId: number | null, state: UserNavigationState, nextMessageId: number): Promise<boolean>;
+  getScreenMessageIds(telegramId: number): Promise<{ keyboard: number | null; screen: number | null }>;
+  replaceScreens(
+    telegramId: number,
+    expected: { keyboard: number | null; screen: number | null },
+    state: UserNavigationState,
+    next: { keyboard: number | null; screen: number | null },
+  ): Promise<boolean>;
 }
 
 export const MAIN_NAVIGATION_STATE: UserNavigationState = {
@@ -111,27 +116,28 @@ export class D1NavigationStateRepository implements NavigationStateRepository {
     ).run();
   }
 
-  async getScreenMessageId(telegramId: number): Promise<number | null> {
+  async getScreenMessageIds(telegramId: number): Promise<{ keyboard: number | null; screen: number | null }> {
     const row = await this.db.prepare(
-      "SELECT last_screen_message_id FROM user_navigation_state WHERE telegram_id = ?",
-    ).bind(telegramId).first<{ last_screen_message_id?: unknown }>();
-    const value = row?.last_screen_message_id;
-    return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+      "SELECT last_screen_message_id, last_keyboard_message_id FROM user_navigation_state WHERE telegram_id = ?",
+    ).bind(telegramId).first<{ last_screen_message_id?: unknown; last_keyboard_message_id?: unknown }>();
+    const valid = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+    return { keyboard: valid(row?.last_keyboard_message_id), screen: valid(row?.last_screen_message_id) };
   }
 
-  async replaceScreen(
+  async replaceScreens(
     telegramId: number,
-    expectedMessageId: number | null,
+    expected: { keyboard: number | null; screen: number | null },
     state: UserNavigationState,
-    nextMessageId: number,
+    next: { keyboard: number | null; screen: number | null },
   ): Promise<boolean> {
-    if (!isUserNavigationState(state) || !Number.isSafeInteger(nextMessageId) || nextMessageId <= 0) {
+    const validId = (value: number | null) => value === null || (Number.isSafeInteger(value) && value > 0);
+    if (!isUserNavigationState(state) || !validId(next.keyboard) || !validId(next.screen)) {
       throw new TypeError("Invalid navigation screen");
     }
     const result = await this.db.prepare(`
       INSERT INTO user_navigation_state
-        (telegram_id, screen, parent_screen, publication_kind, archive_filter, page, updated_at, last_screen_message_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (telegram_id, screen, parent_screen, publication_kind, archive_filter, page, updated_at, last_screen_message_id, last_keyboard_message_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (telegram_id) DO UPDATE SET
         screen = excluded.screen,
         parent_screen = excluded.parent_screen,
@@ -139,8 +145,10 @@ export class D1NavigationStateRepository implements NavigationStateRepository {
         archive_filter = excluded.archive_filter,
         page = excluded.page,
         updated_at = excluded.updated_at,
-        last_screen_message_id = excluded.last_screen_message_id
+        last_screen_message_id = excluded.last_screen_message_id,
+        last_keyboard_message_id = excluded.last_keyboard_message_id
       WHERE user_navigation_state.last_screen_message_id IS ?
+        AND user_navigation_state.last_keyboard_message_id IS ?
     `).bind(
       telegramId,
       state.screen,
@@ -149,8 +157,10 @@ export class D1NavigationStateRepository implements NavigationStateRepository {
       state.archive_filter,
       state.page,
       new Date().toISOString(),
-      nextMessageId,
-      expectedMessageId,
+      next.screen,
+      next.keyboard,
+      expected.screen,
+      expected.keyboard,
     ).run();
     return result.meta?.changes === 1;
   }

@@ -1,6 +1,6 @@
 import type { Language, UserPreferences, UserRepository } from "../../database/users.ts";
 import { t } from "../../localization/index.ts";
-import type { InlineKeyboardMarkup, TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "../../types/telegram.ts";
+import type { InlineKeyboardMarkup, ReplyKeyboardMarkup, TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "../../types/telegram.ts";
 import type { TelegramClient } from "../telegram.ts";
 import type { PublicationRepository, ArchiveFilter } from "../../database/publications.ts";
 import { MAX_PUBLICATION_PAGE } from "../../database/publications.ts";
@@ -56,17 +56,14 @@ async function readNavigation(repository: NavigationStateRepository | undefined,
   }
 }
 
-async function writeNavigation(repository: NavigationStateRepository | undefined, telegramId: number, state: UserNavigationState): Promise<void> {
-  if (!repository) return;
-  await repository.set(telegramId, state);
-}
-
-async function readScreenMessageId(repository: NavigationStateRepository | undefined, telegramId: number): Promise<number | null> {
+async function readScreenMessageIds(repository: NavigationStateRepository | undefined, telegramId: number): Promise<{ keyboard: number | null; screen: number | null }> {
   try {
-    const messageId = await repository?.getScreenMessageId(telegramId);
-    return typeof messageId === "number" && Number.isSafeInteger(messageId) && messageId > 0 ? messageId : null;
+    const ids = await repository?.getScreenMessageIds(telegramId);
+    if (!ids) return { keyboard: null, screen: null };
+    const valid = (value: number | null) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+    return { keyboard: valid(ids.keyboard), screen: valid(ids.screen) };
   } catch {
-    return null;
+    return { keyboard: null, screen: null };
   }
 }
 
@@ -76,45 +73,51 @@ async function safeDeleteMessage(telegram: TelegramClient, chatId: number, messa
   catch { /* Deletion is best-effort and is never retried. */ }
 }
 
-/** Send first, atomically claim the new D1 screen, then remove only the prior tracked screen. */
+/** Reply and inline keyboards belong on separate messages. Claim both IDs atomically before cleaning old screens. */
 async function sendTrackedScreen(
   telegram: TelegramClient,
   navigation: NavigationStateRepository | undefined,
   telegramId: number,
   chatId: number,
+  language: Language,
   state: UserNavigationState,
   text: string,
-  markup: Parameters<TelegramClient["sendScreenMessage"]>[2],
+  markup: ReplyKeyboardMarkup,
   inlineMarkup?: InlineKeyboardMarkup,
 ): Promise<boolean> {
-  const previousMessageId = await readScreenMessageId(navigation, telegramId);
-  const sent = await telegram.sendScreenMessage(chatId, text, markup);
-  if (inlineMarkup) {
-    try { await telegram.editMessage(chatId, sent.message_id, text, inlineMarkup); }
-    catch (error) {
-      await safeDeleteMessage(telegram, chatId, sent.message_id);
-      throw error;
-    }
+  const previous = await readScreenMessageIds(navigation, telegramId);
+  let keyboard: { message_id: number } | undefined;
+  let screen: { message_id: number } | undefined;
+  try {
+    keyboard = await telegram.sendScreenMessage(chatId, t(language, "navigationKeyboardActive"), markup);
+    screen = await telegram.sendScreenMessage(chatId, text, inlineMarkup);
+  } catch (error) {
+    await safeDeleteMessage(telegram, chatId, screen?.message_id);
+    await safeDeleteMessage(telegram, chatId, keyboard?.message_id);
+    throw error;
   }
   if (!navigation) return true;
 
   let claimed = false;
   try {
-    claimed = await navigation.replaceScreen(telegramId, previousMessageId, state, sent.message_id);
+    claimed = await navigation.replaceScreens(telegramId, previous, state, { keyboard: keyboard.message_id, screen: screen.message_id });
   } catch (error) {
-    await safeDeleteMessage(telegram, chatId, sent.message_id);
+    await safeDeleteMessage(telegram, chatId, screen.message_id);
+    await safeDeleteMessage(telegram, chatId, keyboard.message_id);
     throw error;
   }
   if (!claimed) {
-    // A faster request already claimed a newer screen. Remove only this unclaimed send.
-    await safeDeleteMessage(telegram, chatId, sent.message_id);
+    // A faster request already claimed a newer pair. Remove only this unclaimed pair.
+    await safeDeleteMessage(telegram, chatId, screen.message_id);
+    await safeDeleteMessage(telegram, chatId, keyboard.message_id);
     return false;
   }
-  if (previousMessageId !== sent.message_id) await safeDeleteMessage(telegram, chatId, previousMessageId);
+  if (previous.screen !== screen.message_id) await safeDeleteMessage(telegram, chatId, previous.screen);
+  if (previous.keyboard !== keyboard.message_id) await safeDeleteMessage(telegram, chatId, previous.keyboard);
   return true;
 }
 
-async function editTrackedScreen(
+async function replaceTrackedInlineScreen(
   telegram: TelegramClient,
   navigation: NavigationStateRepository | undefined,
   telegramId: number,
@@ -124,11 +127,22 @@ async function editTrackedScreen(
   text: string,
   inlineMarkup: InlineKeyboardMarkup,
 ): Promise<void> {
-  const previousMessageId = await readScreenMessageId(navigation, telegramId);
-  await telegram.editMessage(chatId, messageId, text, inlineMarkup);
+  const previous = await readScreenMessageIds(navigation, telegramId);
+  if (navigation && previous.screen !== messageId) return;
+  const sent = await telegram.sendScreenMessage(chatId, text, inlineMarkup);
   if (!navigation) return;
-  const claimed = await navigation.replaceScreen(telegramId, previousMessageId, state, messageId);
-  if (claimed && previousMessageId !== messageId) await safeDeleteMessage(telegram, chatId, previousMessageId);
+  let claimed = false;
+  try {
+    claimed = await navigation.replaceScreens(telegramId, previous, state, { keyboard: previous.keyboard, screen: sent.message_id });
+  } catch (error) {
+    await safeDeleteMessage(telegram, chatId, sent.message_id);
+    throw error;
+  }
+  if (!claimed) {
+    await safeDeleteMessage(telegram, chatId, sent.message_id);
+    return;
+  }
+  await safeDeleteMessage(telegram, chatId, previous.screen);
 }
 
 function mainState(): UserNavigationState { return { ...MAIN_NAVIGATION_STATE }; }
@@ -203,7 +217,7 @@ async function showMain(
   prefix?: string,
 ): Promise<void> {
   const body = `${prefix ? `${prefix}\n\n` : ""}${t(language, "mainMenu")}`;
-  await sendTrackedScreen(telegram, navigation, telegramId, chatId, mainState(), body, mainKeyboard(language));
+  await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, mainState(), body, mainKeyboard(language));
 }
 
 async function showPublicationList(
@@ -219,8 +233,8 @@ async function showPublicationList(
 ): Promise<void> {
   const screen = await timed(metrics, "publication_lookup_ms", () => publicationListScreen(publications, language, context));
   if (messageId === undefined) {
-    await sendTrackedScreen(telegram, navigation, telegramId, chatId, listState(context), screen.text, sectionNavigationKeyboard(language), screen.keyboard);
-  } else await timed(metrics, "telegram_edit_ms", () => editTrackedScreen(telegram, navigation, telegramId, chatId, messageId, listState(context), screen.text, screen.keyboard));
+    await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, listState(context), screen.text, sectionNavigationKeyboard(language), screen.keyboard);
+  } else await timed(metrics, "telegram_edit_ms", () => replaceTrackedInlineScreen(telegram, navigation, telegramId, chatId, messageId, listState(context), screen.text, screen.keyboard));
 }
 
 async function showSettings(
@@ -230,13 +244,13 @@ async function showSettings(
   chatId: number,
   language: Language,
 ): Promise<void> {
-  await sendTrackedScreen(telegram, navigation, telegramId, chatId, sectionState("settings"), t(language, "settingsTitle"), settingsKeyboard(language));
+  await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, sectionState("settings"), t(language, "settingsTitle"), settingsKeyboard(language));
 }
 
 async function showLanguageSettings(telegram: TelegramClient, navigation: NavigationStateRepository | undefined, telegramId: number, chatId: number, language: Language): Promise<void> {
   const body = t(language, "languageTitle");
   const state: UserNavigationState = { ...sectionState("settings"), screen: "settings_language", parent_screen: "settings" };
-  await sendTrackedScreen(telegram, navigation, telegramId, chatId, state, body, settingsLanguageKeyboard(language));
+  await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, state, body, settingsLanguageKeyboard(language));
 }
 
 async function showNotificationSettings(
@@ -250,7 +264,7 @@ async function showNotificationSettings(
   const body = notificationText(user, language);
   const keyboard = notificationKeyboard(language, Boolean(user.notify_direct), Boolean(user.notify_potential));
   const state: UserNavigationState = { ...sectionState("settings"), screen: "settings_notifications", parent_screen: "settings" };
-  await sendTrackedScreen(telegram, navigation, telegramId, chatId, state, body, keyboard);
+  await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, state, body, keyboard);
 }
 
 async function showAbout(
@@ -265,7 +279,7 @@ async function showAbout(
   try { lastSuccessfulHoeringsportalenRun = await sourceStatus?.lastSuccessfulHoeringsportalenRun() ?? null; }
   catch { /* Keep About available if metadata cannot be read. */ }
   const body = `${t(language, "aboutText")}\n\n${sourceStatusScreen(language, lastSuccessfulHoeringsportalenRun)}`;
-  await sendTrackedScreen(telegram, navigation, telegramId, chatId, sectionState("about"), body, sectionNavigationKeyboard(language));
+  await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, sectionState("about"), body, sectionNavigationKeyboard(language));
 }
 
 function publicationStateContext(state: UserNavigationState): { kind: "news"; page: number } | { kind: "archive"; filter: ArchiveFilter; page: number } {
@@ -291,14 +305,14 @@ async function renderNavigationState(
   else if (state.screen === "publication_detail") {
     const context = publicationStateContext(state);
     const body = publications ? (await publicationListScreen(publications, language, context)).text : t(language, "unavailable");
-    await sendTrackedScreen(telegram, navigation, telegramId, chatId, state, body, detailReplyKeyboard(language));
+    await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, state, body, detailReplyKeyboard(language));
   } else if (!publications) {
     const keyboard = sectionNavigationKeyboard(language);
-    await sendTrackedScreen(telegram, navigation, telegramId, chatId, state, t(language, "unavailable"), keyboard);
+    await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, state, t(language, "unavailable"), keyboard);
   } else {
     const context = publicationStateContext(state);
     const screen = await publicationListScreen(publications, language, context);
-    await sendTrackedScreen(telegram, navigation, telegramId, chatId, state, screen.text, sectionNavigationKeyboard(language), screen.keyboard);
+    await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, state, screen.text, sectionNavigationKeyboard(language), screen.keyboard);
   }
 }
 
@@ -311,7 +325,6 @@ async function handleStart(
   if (message.chat.type !== "private" || !message.from || !validTelegramId(message.from.id) || !validTelegramId(message.chat?.id)) return;
   const user = await repository.find(message.from.id);
   if (user) {
-    await writeNavigation(navigation, user.telegram_id, mainState());
     await showMain(telegram, navigation, user.telegram_id, message.chat.id, user.language);
   } else await telegram.sendMessage(message.chat.id, languageScreen("uk"), languageKeyboard("uk"));
 }
@@ -320,9 +333,8 @@ async function handleHelp(message: TelegramMessage, repository: UserRepository, 
   if (message.chat.type !== "private" || !message.from || !validTelegramId(message.from.id) || !validTelegramId(message.chat?.id)) return;
   const user = await repository.find(message.from.id);
   if (user) {
-    await writeNavigation(navigation, user.telegram_id, mainState());
     await sendTrackedScreen(
-      telegram, navigation, user.telegram_id, message.chat.id, mainState(),
+      telegram, navigation, user.telegram_id, message.chat.id, user.language, mainState(),
       `${t(user.language, "firstTimeWelcome")}\n\n${t(user.language, "mainMenu")}`,
       mainKeyboard(user.language),
     );
@@ -397,10 +409,10 @@ async function handleReplyAction(
     const state = listState(context);
     if (sameNavigationState(current, state)) return;
     if (!publications) {
-      await sendTrackedScreen(telegram, navigation, id, chatId, state, t(user.language, "unavailable"), sectionNavigationKeyboard(user.language));
+      await sendTrackedScreen(telegram, navigation, id, chatId, user.language, state, t(user.language, "unavailable"), sectionNavigationKeyboard(user.language));
     } else {
       const screen = await publicationListScreen(publications, user.language, context);
-      await sendTrackedScreen(telegram, navigation, id, chatId, state, screen.text, screen.keyboard);
+      await sendTrackedScreen(telegram, navigation, id, chatId, user.language, state, screen.text, sectionNavigationKeyboard(user.language), screen.keyboard);
     }
     return;
   }
@@ -494,15 +506,13 @@ async function processCallback(
     if (existing) {
       await repository.updateLanguage(callback.from.id, language);
       const state = sectionState("settings");
-      await writeNavigation(navigation, callback.from.id, state);
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, t(language, "languageSaved"), clearInlineKeyboard()));
       await showSettings(telegram, navigation, callback.from.id, message.chat.id, language);
     } else {
       const created = await repository.create(callback.from.id, language);
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, t(language, "languageSaved"), clearInlineKeyboard()));
-      await writeNavigation(navigation, callback.from.id, mainState());
-      if (created) await telegram.sendMessage(message.chat.id, t(language, "firstTimeWelcome"));
-      await showMain(telegram, navigation, callback.from.id, message.chat.id, language);
+      await showMain(telegram, navigation, callback.from.id, message.chat.id, language, created ? t(language, "firstTimeWelcome") : undefined);
+      if (created) await safeDeleteMessage(telegram, message.chat.id, message.message_id);
     }
     return;
   }
@@ -514,17 +524,16 @@ async function processCallback(
   }
   const language = user.language;
   const current = await readNavigation(navigation, callback.from.id);
-  const save = async (state: UserNavigationState) => writeNavigation(navigation, callback.from.id, state);
+  const savedMessageIds = await readScreenMessageIds(navigation, callback.from.id);
+  if (navigation && savedMessageIds.screen !== null && message.message_id !== savedMessageIds.screen && data !== "notification:main") return;
 
   if (data === "notification:main") {
-    await save(mainState());
     // Notification messages are immutable; this action posts a separate menu message.
     await showMain(telegram, navigation, callback.from.id, message.chat.id, language);
   } else if (data === "nav:main") {
     await showMain(telegram, navigation, callback.from.id, message.chat.id, language);
   } else if (data === "nav:back") {
     const state = previousState(current);
-    await save(state);
     await renderNavigationState(state, user, navigation, message.chat.id, callback.from.id, telegram, publications, sourceStatus);
   } else if (data === "nav:settings" || data === "menu:settings") {
     await showSettings(telegram, navigation, callback.from.id, message.chat.id, language);
@@ -544,16 +553,14 @@ async function processCallback(
     await showNotificationSettings(telegram, navigation, callback.from.id, message.chat.id, updated);
   } else if (data === "menu:news" || data === "menu:archive") {
     const context = data === "menu:news" ? { kind: "news" as const, page: 0 } : { kind: "archive" as const, filter: "all" as const, page: 0 };
-    await save(listState(context));
     if (!publications) {
-      await sendTrackedScreen(telegram, navigation, callback.from.id, message.chat.id, listState(context), t(language, "unavailable"), sectionNavigationKeyboard(language));
+      await sendTrackedScreen(telegram, navigation, callback.from.id, message.chat.id, language, listState(context), t(language, "unavailable"), sectionNavigationKeyboard(language));
     } else {
       await showPublicationList(telegram, publications, navigation, callback.from.id, message.chat.id, undefined, language, context, metrics);
     }
   } else if (/^(?:news:page:|archive:|pub:)/u.test(data)) {
     if (!publications || new TextEncoder().encode(data).length > 64) {
       const state = current.screen === "publication_detail" ? current : sectionState("news");
-      await save(state);
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, t(language, "publicationNotFound"), clearInlineKeyboard()));
       return;
     }
@@ -563,15 +570,12 @@ async function processCallback(
     const detail = /^pub:d:([1-9]\d{0,15}):(news|archive):(all|direct|potential):(0|[1-9]\d{0,3})$/u.exec(data);
     if (newsPage && Number(newsPage[1]) <= MAX_PUBLICATION_PAGE) {
       const context = { kind: "news" as const, page: Number(newsPage[1]) };
-      await save(listState(context));
       await showPublicationList(telegram, publications, navigation, callback.from.id, message.chat.id, message.message_id, language, context, metrics);
     } else if (archiveFilter) {
       const context = { kind: "archive" as const, filter: parseArchiveFilter(archiveFilter[1])!, page: 0 };
-      await save(listState(context));
       await showPublicationList(telegram, publications, navigation, callback.from.id, message.chat.id, message.message_id, language, context, metrics);
     } else if (archivePage && Number(archivePage[2]) <= MAX_PUBLICATION_PAGE) {
       const context = { kind: "archive" as const, filter: parseArchiveFilter(archivePage[1])!, page: Number(archivePage[2]) };
-      await save(listState(context));
       await showPublicationList(telegram, publications, navigation, callback.from.id, message.chat.id, message.message_id, language, context, metrics);
     } else if (detail && Number.isSafeInteger(Number(detail[1])) && Number(detail[4]) <= MAX_PUBLICATION_PAGE && (detail[2] !== "news" || detail[3] === "all")) {
       const context = detail[2] === "news"
@@ -579,12 +583,11 @@ async function processCallback(
         : { kind: "archive" as const, filter: parseArchiveFilter(detail[3])!, page: Number(detail[4]) };
       const screen = await timed(metrics, "publication_lookup_ms", () => publicationDetailScreen(publications, language, Number(detail[1]), context));
       await sendTrackedScreen(
-        telegram, navigation, callback.from.id, message.chat.id, detailState(context), screen.text,
+        telegram, navigation, callback.from.id, message.chat.id, language, detailState(context), screen.text,
         detailReplyKeyboard(language),
         screen.keyboard.inline_keyboard.length ? screen.keyboard : undefined,
       );
     } else {
-      await save(current.screen === "publication_detail" ? current : sectionState("news"));
       await timed(metrics, "telegram_edit_ms", () => telegram.editMessage(message.chat.id, message.message_id, t(language, "publicationNotFound"), clearInlineKeyboard()));
     }
   } else if (data === "menu:about") {
