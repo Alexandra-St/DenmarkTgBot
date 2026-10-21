@@ -23,10 +23,10 @@ on:
         type: boolean
         default: false
       bootstrap_manifest_run_id:
-        description: "One-time bootstrap only: successful CREATE_MANIFEST_BASELINE run ID; the existing anchor may expire"
+        description: "One-time bootstrap: validated v2 CREATE_MANIFEST_BASELINE run ID"
         required: false
         type: string
-        default: "39353715697"
+        default: "39433055408"
   schedule:
     # Run after the official nightly backup normally completes around 02:00 UTC.
     - cron: "17 4 * * *"
@@ -51,21 +51,22 @@ jobs:
 
       - name: Validate execution authorization
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          MODE: ${{ inputs.mode }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
           CONFIRM_RESTORE: ${{ github.event_name == 'schedule' && 'true' || inputs.confirm_restore }}
           CONFIRM_PRODUCTION: ${{ github.event_name == 'schedule' && 'true' || inputs.confirm_production }}
           FOLKETINGET_AUTOMATION_ENABLED: ${{ vars.FOLKETINGET_AUTOMATION_ENABLED }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "schedule" ]]; then
+          python3 tools/folketinget_snapshot_workflow.py validate-production-ref
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
             [[ "$FOLKETINGET_AUTOMATION_ENABLED" == "true" ]] || { echo "incremental=FAIL category=folketinget_automation_disabled"; exit 2; }
             [[ "$CONFIRM_RESTORE" == "true" && "$CONFIRM_PRODUCTION" == "true" ]] || { echo "incremental=FAIL category=scheduled_authorization_invalid"; exit 2; }
           else
             [[ "$CONFIRM_RESTORE" == "true" ]] || { echo "incremental=FAIL category=manual_confirmation_required"; exit 2; }
-            if [[ "$MODE" == "production_ingest" ]]; then
+            if [[ "$INPUT_MODE" == "production_ingest" ]]; then
               [[ "$CONFIRM_PRODUCTION" == "true" ]] || { echo "incremental=FAIL category=production_confirmation_required"; exit 2; }
-            elif [[ "$MODE" != "dry_run" ]]; then
+            elif [[ "$INPUT_MODE" != "dry_run" ]]; then
               echo "incremental=FAIL category=workflow_mode_invalid"
               exit 2
             fi
@@ -76,7 +77,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          BOOTSTRAP_MANIFEST_RUN_ID: ${{ inputs.bootstrap_manifest_run_id || '39353715697' }}
+          BOOTSTRAP_MANIFEST_RUN_ID: ${{ inputs.bootstrap_manifest_run_id || '39433055408' }}
         run: python3 tools/folketinget_snapshot_workflow.py select-base
 
       - name: Download selected manifest artifact

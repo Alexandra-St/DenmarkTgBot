@@ -26,6 +26,15 @@ class WorkflowError(Exception):
         super().__init__(category)
 
 
+def validate_production_ref(event_name: str, mode: str, git_ref: str) -> None:
+    """Allow production snapshot ingestion only from the main branch ref."""
+    production = event_name == "schedule" or (
+        event_name == "workflow_dispatch" and mode == "production_ingest"
+    )
+    if production and git_ref != "refs/heads/main":
+        raise WorkflowError("production_branch_invalid")
+
+
 def validate_artifact(artifacts: object, expected_name: str) -> dict[str, Any]:
     if not isinstance(artifacts, list):
         raise WorkflowError("manifest_artifact_missing_or_ambiguous")
@@ -58,17 +67,22 @@ def validate_run(run: object, *, requested_id: str, workflow_id: int,
     return run
 
 
-def successful_production_runs(runs: object, workflow_id: int) -> list[dict[str, Any]]:
+def production_runs(
+    runs: object, workflow_id: int, *, current_run_id: str | None = None
+) -> list[dict[str, Any]]:
     if not isinstance(runs, list):
         raise WorkflowError("manifest_base_not_found")
+    if current_run_id is not None and not re.fullmatch(r"[0-9]+", current_run_id):
+        raise WorkflowError("current_workflow_run_id_invalid")
     live_runs = [run for run in runs if isinstance(run, dict)
                  and run.get("workflow_id") == workflow_id
-                 and run.get("status") == "completed"
-                 and run.get("conclusion") == "success"
                  and run.get("event") in {"schedule", "workflow_dispatch"}
-                 and run.get("display_title") == PRODUCTION_TITLE]
+                 and run.get("display_title") == PRODUCTION_TITLE
+                 and run.get("head_branch") == "main"
+                 and str(run.get("id", "")) != current_run_id]
     for run in live_runs:
-        if (isinstance(run.get("run_number"), bool) or not isinstance(run.get("run_number"), int)
+        if (not re.fullmatch(r"[0-9]+", str(run.get("id", "")))
+                or isinstance(run.get("run_number"), bool) or not isinstance(run.get("run_number"), int)
                 or run["run_number"] < 1):
             raise WorkflowError("manifest_run_not_successful")
     return sorted(live_runs, key=lambda item: item["run_number"], reverse=True)
@@ -83,12 +97,15 @@ def choose_base(
     incremental_runs: object,
     incremental_workflow_id: int,
     artifact_lookup: Any,
+    current_run_id: str | None = None,
 ) -> tuple[str, str]:
-    """Use a bootstrap once; otherwise require the latest successful live run's artifact."""
+    """Select the newest durable production outcome without crossing ambiguity."""
     if not isinstance(incremental_runs, list):
         raise WorkflowError("manifest_base_not_found")
 
-    live_runs = successful_production_runs(incremental_runs, incremental_workflow_id)
+    live_runs = production_runs(
+        incremental_runs, incremental_workflow_id, current_run_id=current_run_id
+    )
 
     for latest in live_runs:
         run_id = str(latest.get("id", ""))
@@ -111,9 +128,9 @@ def choose_base(
         if has_noop:
             validate_artifact(artifacts, noop_name)
             continue
-        # A successful production run with neither proof is ambiguous (e.g.
-        # artifact upload failed after COMMITTED), so never fall back silently.
-        raise WorkflowError("manifest_artifact_missing_or_ambiguous")
+        # The Worker may have committed before a later workflow failure. Without
+        # either durable proof, an older base is unsafe regardless of conclusion.
+        raise WorkflowError("ambiguous_previous_production_run")
 
     if not re.fullmatch(r"[0-9]+", bootstrap_run_id or ""):
         raise WorkflowError("manifest_run_id_invalid")
@@ -191,15 +208,17 @@ class GitHubApi:
         return collected
 
 
-def select_base(api: GitHubApi, bootstrap_run_id: str) -> tuple[str, str]:
+def select_base(
+    api: GitHubApi, bootstrap_run_id: str, *, current_run_id: str | None = None
+) -> tuple[str, str]:
     incremental_id = api.workflow_id(INCREMENTAL_WORKFLOW)
     runs = api.recent_runs(incremental_id)
-    live_runs = successful_production_runs(runs, incremental_id)
+    live_runs = production_runs(runs, incremental_id, current_run_id=current_run_id)
     if live_runs:
         return choose_base(
             bootstrap_run_id=bootstrap_run_id, bootstrap_run=None, bootstrap_artifacts=None,
             poc_workflow_id=-1, incremental_runs=live_runs, incremental_workflow_id=incremental_id,
-            artifact_lookup=api.artifacts,
+            artifact_lookup=api.artifacts, current_run_id=current_run_id,
         )
 
     if not re.fullmatch(r"[0-9]+", bootstrap_run_id or ""):
@@ -210,18 +229,29 @@ def select_base(api: GitHubApi, bootstrap_run_id: str) -> tuple[str, str]:
     return choose_base(
         bootstrap_run_id=bootstrap_run_id, bootstrap_run=run, bootstrap_artifacts=artifacts,
         poc_workflow_id=poc_id, incremental_runs=[], incremental_workflow_id=incremental_id,
-        artifact_lookup=api.artifacts,
+        artifact_lookup=api.artifacts, current_run_id=current_run_id,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["select-base"])
+    parser.add_argument("command", choices=["select-base", "validate-production-ref"])
     args = parser.parse_args(argv)
-    del args
     try:
+        if args.command == "validate-production-ref":
+            validate_production_ref(
+                os.environ.get("GITHUB_EVENT_NAME", ""),
+                os.environ.get("INPUT_MODE", ""),
+                os.environ.get("GITHUB_REF", ""),
+            )
+            print("production_branch_validation=PASS")
+            return 0
         api = GitHubApi(os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GH_TOKEN", ""))
-        run_id, artifact_name = select_base(api, os.environ.get("BOOTSTRAP_MANIFEST_RUN_ID", ""))
+        run_id, artifact_name = select_base(
+            api,
+            os.environ.get("BOOTSTRAP_MANIFEST_RUN_ID", ""),
+            current_run_id=os.environ.get("GITHUB_RUN_ID") or None,
+        )
         output = os.environ.get("GITHUB_OUTPUT")
         if not output:
             raise WorkflowError("github_output_missing")
@@ -229,7 +259,9 @@ def main(argv: list[str] | None = None) -> int:
             target.write(f"run_id={run_id}\nartifact_name={artifact_name}\n")
         print("snapshot_base_selection=PASS")
     except WorkflowError as error:
-        print(f"snapshot_base_selection=FAIL category={error.category}", file=sys.stderr)
+        operation = ("production_branch_validation" if args.command == "validate-production-ref"
+                     else "snapshot_base_selection")
+        print(f"{operation}=FAIL category={error.category}", file=sys.stderr)
         return 2
     return 0
 

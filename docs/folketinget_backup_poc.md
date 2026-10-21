@@ -33,6 +33,12 @@ python3 tools/folketinget_snapshot_diff.py --old /path/to/older/manifest.sqlite 
 
 No restore, source request, ingestion, Worker/D1 call, or notification occurs in `DIFF_MANIFESTS` mode.
 
+## Snapshot incremental workflow
+
+The separate `folketinget-snapshot-incremental.yml` workflow uses validated v2 manifest run `39433055408` as its bootstrap base. A manual `dry_run` may be launched from another branch, while manual `production_ingest` and scheduled production execution require `refs/heads/main`. Scheduled execution additionally remains disabled unless `FOLKETINGET_AUTOMATION_ENABLED` is exactly `true`.
+
+For later production runs, base selection examines main-branch production runs newest first. A valid promoted manifest is authoritative even if a later cleanup step made the overall run fail. A valid `NO_COMMIT` marker proves that the run did not advance snapshot state and may be skipped. Any prior production run with neither durable proof stops selection with `ambiguous_previous_production_run`; the workflow never falls back past it to an older manifest.
+
 ## Limits and risks before authorizing a run
 
 - The backup has not yet been downloaded or restored by this PoC. Its SQL Server source version, actual database size, restore duration, table layout, and entity completeness remain unverified.
