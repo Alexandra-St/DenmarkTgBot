@@ -159,7 +159,8 @@ class SnapshotIngestionClientTests(unittest.TestCase):
 
                 if expected_code == "candidate_record_too_large":
                     prepared = ingestion_client.prepare_records({"cases": data["cases"]}, "folketinget", "incremental")
-                    record = prepared[0]
+                    from collectors.folketinget_relationship_summary import compact_folketinget_record
+                    record = compact_folketinget_record(prepared[0])
                     encoded = lambda value: len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
                     details = caught.exception.details
                     self.assertEqual(details["oversized_record_count"], 1)
@@ -167,9 +168,10 @@ class SnapshotIngestionClientTests(unittest.TestCase):
                     self.assertEqual(details["max_snapshot_bytes"], encoded(record["normalized_snapshot"]))
                     self.assertEqual(details["max_source_metadata_bytes"], encoded(record["source_metadata"]))
                     self.assertEqual(details["max_diagnostics_bytes"], encoded(record["diagnostics"]))
-                    self.assertEqual(details["max_document_count"], len(record["normalized_snapshot"]["documents"]))
-                    self.assertEqual(details["max_stage_count"], len(record["normalized_snapshot"]["stages"]))
-                    self.assertEqual(details["max_vote_count"], len(record["normalized_snapshot"]["votes"]))
+                    summary = record["normalized_snapshot"]["relationship_summary"]
+                    self.assertEqual(details["max_document_count"], summary["documents"]["count"])
+                    self.assertEqual(details["max_stage_count"], summary["stages"]["count"])
+                    self.assertEqual(details["max_vote_count"], summary["votes"]["count"])
                     self.assertEqual(details["worker_snapshot_limit_exceeded_count"], 1)
                     self.assertEqual(details["worker_request_limit_exceeded_count"], 1)
 
@@ -198,6 +200,44 @@ class SnapshotIngestionClientTests(unittest.TestCase):
         self.assertNotIn("title", diagnostic)
         self.assertNotIn("url", diagnostic)
         self.assertNotIn("PRIVATE", stderr.getvalue())
+
+    def test_1230_documents_are_classified_full_then_compacted_below_limits(self) -> None:
+        data = bundle()
+        case = data["cases"][0]
+        case["documents"] = [
+            {
+                "id": index,
+                "link_id": 10_000 + index,
+                "title": "Bilag om fordrevne fra Ukraine " + ("X" * 300),
+                "date_raw": "2026-10-20",
+                "released_at_raw": "2026-10-20",
+                "document_released_at_raw": "2026-10-20",
+                "source_updated_at_raw": "2026-10-21T00:00:00",
+                "updated_at_utc": None,
+                "link_source_updated_at_raw": "2026-10-21T00:00:00",
+                "link_updated_at_utc": None,
+            }
+            for index in range(1, 1231)
+        ]
+        full_record = ingestion_client.prepare_records({"cases": [case]}, "folketinget", "incremental")[0]
+        full_bytes = len(json.dumps(full_record, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self.assertGreater(full_bytes, 585_000)
+
+        result = ingest_snapshot_candidates(data, mode="incremental", base_snapshot=BASE,
+                                            target_snapshot=TARGET, dry_run=True)
+        self.assertEqual((result["records"], result["batches"]), (1, 1))
+        self.assertTrue(result["submission_eligible"])
+
+        from collectors.folketinget_relationship_summary import compact_folketinget_record
+        compact = compact_folketinget_record(full_record)
+        request_bytes = len(json.dumps({"records": [compact]}, ensure_ascii=False,
+                                       separators=(",", ":")).encode("utf-8"))
+        snapshot_bytes = len(json.dumps(compact["normalized_snapshot"], ensure_ascii=False,
+                                        separators=(",", ":")).encode("utf-8"))
+        self.assertLess(request_bytes, ingestion_client.MAX_BATCH_BYTES)
+        self.assertLess(snapshot_bytes, 128 * 1024)
+        self.assertEqual(compact["normalized_snapshot"]["relationship_summary"]["documents"]["count"], 1230)
+        self.assertNotIn("documents", compact["normalized_snapshot"])
 
     def test_unknown_candidate_preparation_error_does_not_leak_details(self) -> None:
         private_error = "PRIVATE-ID-998 PRIVATE TITLE https://private.example/source/998"

@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from collectors import ingestion_client
+from collectors.folketinget_relationship_summary import compact_folketinget_record, validate_relationship_summaries
 from collectors.relevance import DIRECT, POTENTIAL, RULESET_VERSION
 
 USER_AGENT = "DenmarkTgBot-SnapshotIngestionClient/1.0"
@@ -134,7 +135,12 @@ def _oversized_record_diagnostics(records: list[dict[str, Any]]) -> dict[str, in
     def relationship_count(record: Mapping[str, Any], field: str) -> int:
         snapshot = record.get("normalized_snapshot")
         value = snapshot.get(field) if isinstance(snapshot, Mapping) else None
-        return len(value) if isinstance(value, list) else 0
+        if isinstance(value, list):
+            return len(value)
+        summary = snapshot.get("relationship_summary") if isinstance(snapshot, Mapping) else None
+        item = summary.get(field) if isinstance(summary, Mapping) else None
+        count = item.get("count") if isinstance(item, Mapping) else None
+        return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else 0
 
     return {
         "oversized_record_count": len(oversized),
@@ -280,12 +286,21 @@ def _validate_prepared_historical_record(value: object) -> dict[str, Any]:
     if (not isinstance(snapshot, Mapping) or snapshot.get("title") != title
             or snapshot.get("content_text") is not None and not isinstance(snapshot.get("content_text"), str)
             or snapshot.get("status") is not None and not isinstance(snapshot.get("status"), str)
-            or snapshot.get("publication_type") is not None and not isinstance(snapshot.get("publication_type"), str)
-            or not all(isinstance(snapshot.get(name), list) for name in ("documents", "stages", "votes"))):
+            or snapshot.get("publication_type") is not None and not isinstance(snapshot.get("publication_type"), str)):
         raise SnapshotIngestionError("prepared_record_invalid")
-    for name in ("documents", "stages", "votes"):
-        if any(not isinstance(item, Mapping) for item in snapshot[name]):
+    if "relationship_summary" in snapshot:
+        try:
+            validate_relationship_summaries(snapshot["relationship_summary"])
+        except ValueError:
             raise SnapshotIngestionError("prepared_record_invalid")
+        if any(name in snapshot for name in ("documents", "stages", "votes")):
+            raise SnapshotIngestionError("prepared_record_invalid")
+    else:
+        if not all(isinstance(snapshot.get(name), list) for name in ("documents", "stages", "votes")):
+            raise SnapshotIngestionError("prepared_record_invalid")
+        for name in ("documents", "stages", "votes"):
+            if any(not isinstance(item, Mapping) for item in snapshot[name]):
+                raise SnapshotIngestionError("prepared_record_invalid")
     return record
 
 
@@ -337,7 +352,7 @@ def _prepare_historical_records(
     if not isinstance(records, list) or len(records) > MAX_HISTORICAL_SELECTED_RECORDS:
         raise SnapshotIngestionError("prepared_record_limit_exceeded")
     try:
-        prepared = [_validate_prepared_historical_record(item) for item in records]
+        prepared = [compact_folketinget_record(_validate_prepared_historical_record(item)) for item in records]
         encoded_size = len(json.dumps(prepared, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         if encoded_size > MAX_HISTORICAL_SELECTED_BYTES:
             raise SnapshotIngestionError("prepared_record_limit_exceeded")
@@ -724,7 +739,10 @@ def ingest_snapshot_candidates(
     if mode == "incremental" and not dry_run and not complete:
         raise SnapshotIngestionError("incomplete_candidates", run_id)
     try:
-        records = ingestion_client.prepare_records({"cases": cases}, source="folketinget", mode=mode)
+        records = [
+            compact_folketinget_record(record)
+            for record in ingestion_client.prepare_records({"cases": cases}, source="folketinget", mode=mode)
+        ]
     except ingestion_client.IngestionError as error:
         raise SnapshotIngestionError(
             _safe_candidate_ingestion_error(error, stage="prepare"), run_id, "prepare"

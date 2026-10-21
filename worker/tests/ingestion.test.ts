@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import { after, before, test } from "node:test";
+import { semanticRelationshipSummary } from "../src/ingestion.ts";
 
 const token = "local-test-ingestion-token-only";
 const wrangler = new URL("../node_modules/wrangler/bin/wrangler.js", import.meta.url).pathname;
@@ -61,6 +63,17 @@ function publication(overrides: Record<string, unknown> = {}): Record<string, un
     ...overrides,
   };
 }
+
+test("Python and Worker relationship summary fixture is identical", async () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../tests/fixtures/folketinget_relationship_summary.json", import.meta.url), "utf8"));
+  for (const kind of ["documents", "stages", "votes"] as const) {
+    assert.deepEqual(await semanticRelationshipSummary(fixture.relationships[kind], kind), fixture.expected[kind]);
+    assert.deepEqual(await semanticRelationshipSummary([...fixture.relationships[kind]].reverse(), kind), fixture.expected[kind]);
+  }
+  assert.deepEqual(await semanticRelationshipSummary([], "documents"), {
+    count: 0, sha256: "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  });
+});
 
 async function start(runId: string, options: { mode?: string; expected?: number; proposed?: Record<string, unknown>; source?: string } = {}) {
   return request("/internal/ingest", "POST", {
@@ -830,6 +843,47 @@ test("snapshot ingestion API initializes, progresses, retries, and never advance
   assert.equal((await commit(recordHistoryRun)).body.snapshot_generation, 1);
   assert.equal((await query("SELECT historical FROM publications WHERE source_id=4 AND external_id='44'"))[0]?.historical, 1);
   assert.equal((await query("SELECT baseline_run_id FROM source_ingestion_baselines WHERE source_id=4"))[0]?.baseline_run_id, existingBaselineRun);
+
+  // A compact snapshot compares semantically against the legacy stored arrays.
+  const legacy = publication({ historical: true, external_id: "44" });
+  const legacySnapshot = legacy.normalized_snapshot as Record<string, any>;
+  const relationship_summary = Object.fromEntries(await Promise.all(
+    (["documents", "stages", "votes"] as const).map(async (kind) => [kind, await semanticRelationshipSummary(legacySnapshot[kind], kind)]),
+  ));
+  const compactSnapshot = {
+    title: legacySnapshot.title, content_text: legacySnapshot.content_text, status: legacySnapshot.status,
+    publication_type: legacySnapshot.publication_type, relevance: legacySnapshot.relevance, relationship_summary,
+  };
+  const compactTarget = testSnapshot("7".repeat(64), "2026-10-20 02:01:05.000");
+  const compactRun = "00000000-0000-4000-8000-000000000162";
+  assert.equal((await snapshotStart(compactRun, "incremental", recordSnapshot, compactTarget)).status, 201);
+  const malformedCompact = publication({ external_id: "44", normalized_snapshot: {
+    ...compactSnapshot, relationship_summary: { ...relationship_summary, documents: { count: -1, sha256: "x".repeat(64) } },
+  } });
+  assert.equal((await batch(compactRun, [malformedCompact])).body.error, "invalid_snapshot");
+  assert.equal((await batch(compactRun, [publication({ external_id: "44", normalized_snapshot: compactSnapshot })])).status, 201);
+  assert.equal((await commit(compactRun)).body.status, "COMMITTED");
+  let compactEvents = await query("SELECT event_type FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=4 AND p.external_id='44' ORDER BY e.id");
+  assert.deepEqual(compactEvents.map((row) => row.event_type), ["FIRST_SEEN"]);
+  const compactStored = JSON.parse((await query("SELECT normalized_snapshot_json FROM publications WHERE source_id=4 AND external_id='44'"))[0].normalized_snapshot_json);
+  assert.deepEqual(compactStored.relationship_summary, relationship_summary);
+  assert.equal(compactStored.documents, undefined);
+
+  const changedTarget = testSnapshot("8".repeat(64), "2026-10-21 02:01:05.000");
+  const changedRun = "00000000-0000-4000-8000-000000000163";
+  assert.equal((await snapshotStart(changedRun, "incremental", compactTarget, changedTarget)).status, 201);
+  const changedSummary = {
+    ...relationship_summary,
+    documents: { count: 1230, sha256: "f".repeat(64) },
+  };
+  assert.equal((await batch(changedRun, [publication({ external_id: "44", normalized_snapshot: {
+    ...compactSnapshot, relationship_summary: changedSummary,
+  } })])).status, 201);
+  assert.equal((await commit(changedRun)).body.status, "COMMITTED");
+  compactEvents = await query("SELECT event_type FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=4 AND p.external_id='44' ORDER BY e.id");
+  assert.deepEqual(compactEvents.map((row) => row.event_type), ["FIRST_SEEN", "DOCUMENTS_CHANGED"]);
+  const relationshipEvent = JSON.parse((await query("SELECT change_snapshot_json FROM publication_events e JOIN publications p ON p.id=e.publication_id WHERE p.source_id=4 AND p.external_id='44' AND e.event_type='DOCUMENTS_CHANGED'"))[0].change_snapshot_json);
+  assert.deepEqual(relationshipEvent, { previous: relationship_summary.documents, current: changedSummary.documents });
 
   const checkpointRun = "00000000-0000-4000-8000-000000000160";
   await query(`INSERT INTO ingestion_runs (run_id, source_id, mode, expected_batches, collection_complete, status, proposed_checkpoints_json, base_checkpoints_json, start_request_hash, created_at, updated_at) VALUES (${sqlText(checkpointRun)}, 3, 'incremental', 1, 1, 'OPEN', '{}', '{}', 'test-tombstone-checkpoint', ${sqlText(now)}, ${sqlText(now)});`);

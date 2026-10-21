@@ -18,6 +18,7 @@ if TOOLS_DIRECTORY not in sys.path:
     sys.path.insert(0, TOOLS_DIRECTORY)
 
 from collectors import ingestion_client
+from collectors.folketinget_relationship_summary import compact_folketinget_record
 from collectors.relevance import DIRECT, IRRELEVANT, POTENTIAL, RULESET_VERSION
 import folketinget_candidate_extraction as candidate_extraction
 import folketinget_snapshot_diff as snapshot_diff
@@ -252,8 +253,9 @@ def _run_historical_baseline(
                     diagnostics["selected_record_contract_invalid"] += 1
                     continue
                 try:
+                    compact_record = compact_folketinget_record(record)
                     record_bytes = len(json.dumps(
-                        record, ensure_ascii=False, separators=(",", ":")
+                        compact_record, ensure_ascii=False, separators=(",", ":")
                     ).encode("utf-8"))
                 except (TypeError, ValueError, UnicodeEncodeError):
                     diagnostics["selected_record_contract_invalid"] += 1
@@ -262,7 +264,7 @@ def _run_historical_baseline(
                         or selected_record_bytes + record_bytes > MAX_SELECTED_RECORD_BYTES_IN_MEMORY):
                     selected_memory_limit_exceeded = True
                 elif not selected_memory_limit_exceeded:
-                    selected_records.append(record)
+                    selected_records.append(compact_record)
                     selected_record_bytes += record_bytes
         if progress_callback is not None:
             try:

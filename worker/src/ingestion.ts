@@ -186,7 +186,45 @@ function relationships(value: unknown, kind: "documents" | "stages" | "votes"): 
   return rows;
 }
 
-function validatePublication(raw: unknown, source: SourceCode, mode: "historical" | "incremental"): PublicationInput {
+const RELATIONSHIP_KINDS = ["documents", "stages", "votes"] as const;
+type RelationshipKind = typeof RELATIONSHIP_KINDS[number];
+const RELATIONSHIP_FIELDS: Record<RelationshipKind, readonly string[]> = {
+  documents: ["id", "link_id", "title", "date_raw", "released_at_raw", "document_released_at_raw"],
+  stages: ["id", "title", "date_raw", "type_id", "status_id"],
+  votes: ["id", "stage_id", "number", "approved", "conclusion", "comment"],
+};
+
+function compactRelationshipSummary(value: unknown): JsonObject {
+  if (!object(value) || Object.keys(value).sort().join(",") !== "count,sha256"
+      || !integer(value.count) || typeof value.sha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(value.sha256)) throw new RequestError(400, "invalid_snapshot");
+  return { count: value.count, sha256: value.sha256 };
+}
+
+function compactRelationshipSummaries(value: unknown): JsonObject {
+  if (!object(value) || Object.keys(value).sort().join(",") !== "documents,stages,votes") {
+    throw new RequestError(400, "invalid_snapshot");
+  }
+  return Object.fromEntries(RELATIONSHIP_KINDS.map((kind) => [kind, compactRelationshipSummary(value[kind])]));
+}
+
+export async function semanticRelationshipSummary(value: unknown, kind: RelationshipKind): Promise<JsonObject> {
+  if (object(value) && Object.keys(value).sort().join(",") === "count,sha256") {
+    return compactRelationshipSummary(value);
+  }
+  if (!Array.isArray(value) || value.some((row) => !object(row))) throw new RequestError(400, "invalid_snapshot");
+  const rows = value.map((row) => Object.fromEntries(
+    RELATIONSHIP_FIELDS[kind].filter((field) => field in row).map((field) => [field, row[field]]),
+  ));
+  rows.sort((a, b) => {
+    const left = canonical(a);
+    const right = canonical(b);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  return { count: rows.length, sha256: await sha256(canonical(rows)) };
+}
+
+function validatePublication(raw: unknown, source: SourceCode, mode: "historical" | "incremental", stateKind: "checkpoint" | "snapshot"): PublicationInput {
   if (!object(raw)) throw new RequestError(400, "invalid_publication");
   if (raw.source !== source || typeof raw.external_id !== "string" || !/^\d{1,20}$/.test(raw.external_id)) throw new RequestError(400, "invalid_publication_id");
   if (!string(raw.title, 4000) || !officialUrl(source, raw.url)) throw new RequestError(400, "invalid_publication_fields");
@@ -201,12 +239,24 @@ function validatePublication(raw: unknown, source: SourceCode, mode: "historical
   if (typeof raw.notification_blocked !== "boolean" || typeof raw.complete !== "boolean") throw new RequestError(400, "invalid_completeness");
   if (!Array.isArray(raw.diagnostics) || raw.diagnostics.length > 100 || !object(raw.source_metadata)) throw new RequestError(400, "invalid_source_metadata");
   if (!object(raw.normalized_snapshot) || raw.normalized_snapshot.title !== raw.title) throw new RequestError(400, "invalid_snapshot");
-  const documents = relationships(raw.normalized_snapshot.documents, "documents");
-  const stages = relationships(raw.normalized_snapshot.stages, "stages");
-  const votes = relationships(raw.normalized_snapshot.votes, "votes");
-  if (source === "hoeringsportalen" && (documents.length || stages.length || votes.length)) throw new RequestError(400, "invalid_snapshot");
-  if (raw.normalized_snapshot.content_text !== undefined && raw.normalized_snapshot.content_text !== null && !string(raw.normalized_snapshot.content_text, 100_000, true)) throw new RequestError(400, "invalid_snapshot");
-  const snapshot: JsonObject = { title: raw.title, content_text: raw.normalized_snapshot.content_text ?? null, status: raw.status, publication_type: raw.publication_type, relevance: raw.relevance, documents, stages, votes };
+  const normalized = raw.normalized_snapshot;
+  const compact = Object.hasOwn(normalized, "relationship_summary");
+  let relationshipSnapshot: JsonObject;
+  if (compact) {
+    if (source !== "folketinget" || stateKind !== "snapshot") throw new RequestError(400, "invalid_snapshot");
+    if (RELATIONSHIP_KINDS.some((kind) => Object.hasOwn(normalized, kind))) throw new RequestError(400, "invalid_snapshot");
+    relationshipSnapshot = compactRelationshipSummaries(normalized.relationship_summary);
+  } else {
+    if (Object.hasOwn(normalized, "relationship_summary")) throw new RequestError(400, "invalid_snapshot");
+    const documents = relationships(normalized.documents, "documents");
+    const stages = relationships(normalized.stages, "stages");
+    const votes = relationships(normalized.votes, "votes");
+    if (source === "hoeringsportalen" && (documents.length || stages.length || votes.length)) throw new RequestError(400, "invalid_snapshot");
+    relationshipSnapshot = { documents, stages, votes };
+  }
+  if (normalized.content_text !== undefined && normalized.content_text !== null && !string(normalized.content_text, 100_000, true)) throw new RequestError(400, "invalid_snapshot");
+  const snapshot: JsonObject = { title: raw.title, content_text: normalized.content_text ?? null, status: raw.status, publication_type: raw.publication_type, relevance: raw.relevance,
+    ...(compact ? { relationship_summary: relationshipSnapshot } : relationshipSnapshot) };
   if (canonical(raw.source_metadata).length > 64 * 1024 || canonical(raw.diagnostics).length > 64 * 1024 || canonical(snapshot).length > 128 * 1024) throw new RequestError(413, "publication_too_large");
   return {
     source, external_id: raw.external_id, title: raw.title, url: raw.url, relevance: raw.relevance,
@@ -231,7 +281,7 @@ function validateSourceDelete(raw: unknown, source: SourceCode, mode: "historica
 
 function validateStagedInput(raw: unknown, source: SourceCode, mode: "historical" | "incremental", stateKind: "checkpoint" | "snapshot"): StagedInput {
   if (object(raw) && Object.hasOwn(raw, "operation")) return validateSourceDelete(raw, source, mode, stateKind);
-  return validatePublication(raw, source, mode);
+  return validatePublication(raw, source, mode, stateKind);
 }
 
 function failure(error: unknown): Response {
@@ -440,7 +490,7 @@ async function submitBatch(body: JsonObject, db: D1Database): Promise<Response> 
   return json({ accepted: true, run_id: body.run_id, batch_index: body.batch_index, accepted_records: newlyStaged, idempotent: false }, 201);
 }
 
-function eventChanges(previous: JsonObject | null, incoming: PublicationInput): Array<{ type: string; previousStatus: string | null; newStatus: string | null; snapshot: JsonObject }> {
+async function eventChanges(previous: JsonObject | null, incoming: PublicationInput): Promise<Array<{ type: string; previousStatus: string | null; newStatus: string | null; snapshot: JsonObject }>> {
   const next = incoming.normalized_snapshot;
   if (!previous) return [{ type: "FIRST_SEEN", previousStatus: null, newStatus: incoming.status, snapshot: { current: next } }];
   const changes: Array<{ type: string; previousStatus: string | null; newStatus: string | null; snapshot: JsonObject }> = [];
@@ -449,23 +499,18 @@ function eventChanges(previous: JsonObject | null, incoming: PublicationInput): 
   };
   const oldStatus = typeof previous.status === "string" ? previous.status : null;
   const newStatus = typeof next.status === "string" ? next.status : null;
-  const semanticRows = (value: unknown, fields: string[]): JsonObject[] => Array.isArray(value)
-    ? value.filter(object).map((item) => Object.fromEntries(fields.filter((field) => field in item).map((field) => [field, item[field]])))
-    : [];
   compare("TITLE_CHANGED", previous.title, next.title);
   compare("CONTENT_CHANGED", previous.content_text, next.content_text);
   compare("STATUS_CHANGED", previous.status, next.status, oldStatus, newStatus);
   compare("PUBLICATION_TYPE_CHANGED", previous.publication_type, next.publication_type);
   // Preserve source timestamps in normalized snapshots, but compare only content fields.
-  compare("DOCUMENTS_CHANGED",
-    semanticRows(previous.documents, ["id", "link_id", "title", "date_raw", "released_at_raw", "document_released_at_raw"]),
-    semanticRows(next.documents, ["id", "link_id", "title", "date_raw", "released_at_raw", "document_released_at_raw"]));
-  compare("STAGES_CHANGED",
-    semanticRows(previous.stages, ["id", "title", "date_raw", "type_id", "status_id"]),
-    semanticRows(next.stages, ["id", "title", "date_raw", "type_id", "status_id"]));
-  compare("VOTES_CHANGED",
-    semanticRows(previous.votes, ["id", "stage_id", "number", "approved", "conclusion", "comment"]),
-    semanticRows(next.votes, ["id", "stage_id", "number", "approved", "conclusion", "comment"]));
+  const previousSummary = object(previous.relationship_summary) ? previous.relationship_summary : previous;
+  const nextSummary = object(next.relationship_summary) ? next.relationship_summary : next;
+  for (const kind of RELATIONSHIP_KINDS) {
+    compare(kind === "documents" ? "DOCUMENTS_CHANGED" : kind === "stages" ? "STAGES_CHANGED" : "VOTES_CHANGED",
+      await semanticRelationshipSummary(previousSummary[kind], kind),
+      await semanticRelationshipSummary(nextSummary[kind], kind));
+  }
   compare("RECLASSIFIED", previous.relevance, next.relevance);
   return changes;
 }
@@ -490,7 +535,9 @@ async function processStaged(db: D1Database, runId: string, sourceId: number, mo
   if (!incoming.complete) {
     const statements: D1PreparedStatement[] = [];
     if (!old) {
-      const related = canonical({ documents: incoming.normalized_snapshot.documents, stages: incoming.normalized_snapshot.stages, votes: incoming.normalized_snapshot.votes });
+      const related = canonical(object(incoming.normalized_snapshot.relationship_summary)
+        ? incoming.normalized_snapshot.relationship_summary
+        : { documents: incoming.normalized_snapshot.documents, stages: incoming.normalized_snapshot.stages, votes: incoming.normalized_snapshot.votes });
       statements.push(db.prepare("INSERT INTO publications (source_id, external_id, external_url, original_title, publication_type, relevance, relevance_reason, current_status, published_at, source_updated_at, discovered_at, updated_at, source_metadata_json, normalized_snapshot_json, relationship_snapshot_json, ruleset_version, source_complete, historical, diagnostics_json) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ? WHERE EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
         .bind(sourceId, incoming.external_id, incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, now, now, canonical(incoming.source_metadata), canonical(incoming.normalized_snapshot), related, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), runId, sourceId, incoming.external_id));
     }
@@ -506,14 +553,12 @@ async function processStaged(db: D1Database, runId: string, sourceId: number, mo
     try { oldSnapshot = JSON.parse(old.normalized_snapshot_json) as JsonObject; }
     catch { throw new RequestError(500, "stored_snapshot_corrupt"); }
   }
-  const changes = eventChanges(oldSnapshot, incoming);
+  const changes = await eventChanges(oldSnapshot, incoming);
   const meaningful = !old || old.source_complete !== 1 || changes.length > 0;
   const normalizedJson = canonical(incoming.normalized_snapshot);
-  const relationshipsJson = canonical({
-    documents: incoming.normalized_snapshot.documents,
-    stages: incoming.normalized_snapshot.stages,
-    votes: incoming.normalized_snapshot.votes,
-  });
+  const relationshipsJson = canonical(object(incoming.normalized_snapshot.relationship_summary)
+    ? incoming.normalized_snapshot.relationship_summary
+    : { documents: incoming.normalized_snapshot.documents, stages: incoming.normalized_snapshot.stages, votes: incoming.normalized_snapshot.votes });
   const writePublication = old
     ? db.prepare("UPDATE publications SET external_url = ?, original_title = ?, publication_type = ?, relevance = ?, relevance_reason = ?, current_status = ?, published_at = ?, source_updated_at = ?, updated_at = CASE WHEN ? = 1 THEN ? ELSE updated_at END, source_metadata_json = ?, normalized_snapshot_json = ?, relationship_snapshot_json = ?, ruleset_version = ?, source_complete = 1, historical = ?, diagnostics_json = ?, source_deleted = 0 WHERE id = ? AND EXISTS (SELECT 1 FROM ingestion_staging WHERE run_id = ? AND source_id = ? AND external_id = ? AND processed = 0)")
       .bind(incoming.url, incoming.title, incoming.publication_type, incoming.relevance, incoming.relevance_reason, incoming.status, incoming.published_at, incoming.source_updated_at, meaningful ? 1 : 0, now, canonical(incoming.source_metadata), normalizedJson, relationshipsJson, incoming.ruleset_version, incoming.historical ? 1 : 0, canonical(incoming.diagnostics), old.id, runId, sourceId, incoming.external_id)

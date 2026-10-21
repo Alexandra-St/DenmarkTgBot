@@ -1,0 +1,21 @@
+{
+  "relationships": {
+    "documents": [
+      {"id": 2, "link_id": 20, "title": "Ændring 🇩🇰", "date_raw": "2026-10-02", "released_at_raw": null, "document_released_at_raw": "2026-10-03", "source_updated_at_raw": "2026-10-21T00:00:00"},
+      {"id": 1, "link_id": 10, "title": "Bilag Україна", "date_raw": null, "released_at_raw": "2026-10-01", "document_released_at_raw": null, "source_updated_at_raw": "2026-10-20T00:00:00"}
+    ],
+    "stages": [
+      {"id": 4, "title": "2. behandling", "date_raw": "2026-10-05", "type_id": 2, "status_id": 3, "source_updated_at_raw": "x"},
+      {"id": 3, "title": "Fremsat", "date_raw": "2026-10-01", "type_id": 1, "status_id": 2}
+    ],
+    "votes": [
+      {"id": 6, "stage_id": 4, "number": 2, "approved": false, "conclusion": "Forkastet", "comment": null},
+      {"id": 5, "stage_id": 3, "number": 1, "approved": true, "conclusion": "Vedtaget", "comment": "Ingen"}
+    ]
+  },
+  "expected": {
+    "documents": {"count": 2, "sha256": "e211eb5ddc03bf645206b79d8550e45a0fe7c73df9f52aa0e9f5c9e898f9c7ed"},
+    "stages": {"count": 2, "sha256": "3473d7215c68e508cad630a9f400bdf5ad626b8f61092c44b4e9c8813f859b6a"},
+    "votes": {"count": 2, "sha256": "0198cfa48e3a75bddbca5860b8490284a3e5f0a7967ed9d132aee8c6996742a8"}
+  }
+}
