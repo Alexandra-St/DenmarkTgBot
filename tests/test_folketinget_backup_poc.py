@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest import mock
 import urllib.error
@@ -1159,6 +1159,71 @@ class BackupPocSafetyTests(unittest.TestCase):
                             ingestion_run_id=run_id,
                         )
             self.assertEqual(error.exception.category, "worker_request_failed")
+
+    def test_oversized_candidate_details_survive_poc_boundary_without_private_data(self) -> None:
+        from collectors.snapshot_ingestion_client import SnapshotIngestionError
+
+        stamp = "2026-10-21 02:00:00.000"
+        old_finish = "2026-10-20 02:00:00.000"
+        safe_details = {
+            field: index + 1 for index, field in enumerate(POC.OVERSIZED_CANDIDATE_DETAIL_FIELDS)
+        }
+        client_error = SnapshotIngestionError(
+            "candidate_record_too_large", stage="batch", details=safe_details
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            old, new = root / "old.sqlite", root / "new.sqlite"
+            create_candidate_manifest(old, backup="a", finish=old_finish, include_sag=False)
+            create_candidate_manifest(new, backup="b", finish=stamp, include_sag=False)
+            context = POC.validate_candidate_manifest_inputs(old, new, "100", "101", require_newer_snapshot=True)
+            bundle = self._candidate_bundle([self._ingestion_case(42, "Synthetic case")], complete=True)
+            with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=bundle), \
+                 mock.patch("collectors.snapshot_ingestion_client.ingest_snapshot_candidates",
+                            side_effect=client_error), \
+                 self.assertRaises(POC.PocError) as caught:
+                POC.run_candidate_extraction(
+                    old, new, SimpleNamespace(), root, context["old_finish"], context["new_finish"],
+                    snapshot_ingestion_dry_run=True,
+                    base_snapshot=context["base_snapshot"], target_snapshot=context["target_snapshot"],
+                )
+
+            self.assertEqual(caught.exception.category, "candidate_record_too_large")
+            self.assertEqual(caught.exception.details, safe_details)
+            stderr = StringIO()
+            summary_path = root / "summary.md"
+            with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary_path)}), redirect_stderr(stderr):
+                POC.report_poc_failure(caught.exception)
+            rendered = stderr.getvalue() + summary_path.read_text(encoding="utf-8")
+            for field, value in safe_details.items():
+                self.assertIn(f"{field}={value}", stderr.getvalue())
+                self.assertIn(f"{field}: {value}", rendered)
+            for private_value in ("PRIVATE", "title", "https://", "external_id", "payload"):
+                self.assertNotIn(private_value, rendered)
+
+    def test_oversized_candidate_detail_allowlist_rejects_private_and_non_integer_values(self) -> None:
+        error = SimpleNamespace(
+            code="candidate_record_too_large",
+            details={
+                "oversized_record_count": 2,
+                "title": "PRIVATE TITLE",
+                "url": "https://private.invalid",
+                "max_record_bytes": "PRIVATE PAYLOAD",
+                "max_snapshot_bytes": -1,
+                "max_document_count": True,
+            },
+        )
+        mapped = POC.snapshot_client_poc_error(error, "snapshot_ingestion_client_failed")
+        self.assertEqual(mapped.category, "candidate_record_too_large")
+        self.assertEqual(mapped.details, {"oversized_record_count": 2})
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            POC.report_poc_failure(mapped)
+        self.assertEqual(
+            stderr.getvalue(),
+            "restore_validation=FAIL category=candidate_record_too_large oversized_record_count=2\n",
+        )
+        self.assertNotIn("PRIVATE", stderr.getvalue())
 
     def test_snapshot_incremental_changed_snapshot_uses_exact_identities_and_dry_run_only(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider

@@ -72,6 +72,18 @@ HISTORICAL_SNAPSHOT_BASELINE_LIVE = "HISTORICAL_SNAPSHOT_BASELINE_LIVE"
 MIN_MANIFEST_COMPATIBILITY_LEVEL = 110
 SUPPORTED_COMPATIBILITY_LEVELS = frozenset({100, 110, 120, 130, 140, 150, 160, 170})
 SQL_PROVIDER_SMOKE_MAX_RELATION_ROWS = 1000
+OVERSIZED_CANDIDATE_DETAIL_FIELDS = (
+    "oversized_record_count",
+    "max_record_bytes",
+    "max_snapshot_bytes",
+    "max_source_metadata_bytes",
+    "max_diagnostics_bytes",
+    "max_document_count",
+    "max_stage_count",
+    "max_vote_count",
+    "worker_snapshot_limit_exceeded_count",
+    "worker_request_limit_exceeded_count",
+)
 
 
 class PocError(Exception):
@@ -84,6 +96,7 @@ class PocError(Exception):
         row_shape_category: str | None = None,
         line_length_bucket: str | None = None,
         separator_count_bucket: str | None = None,
+        details: dict[str, int] | None = None,
     ) -> None:
         self.category = category
         self.row_shape_category = row_shape_category if row_shape_category in CHUNK_ROW_SHAPES else None
@@ -91,7 +104,47 @@ class PocError(Exception):
         self.separator_count_bucket = (
             separator_count_bucket if separator_count_bucket in CHUNK_SEPARATOR_COUNT_BUCKETS else None
         )
+        self.details = {
+            key: value for key, value in (details or {}).items()
+            if key in OVERSIZED_CANDIDATE_DETAIL_FIELDS
+            and not isinstance(value, bool) and isinstance(value, int) and value >= 0
+        }
         super().__init__(category)
+
+
+def snapshot_client_poc_error(error: object, fallback: str) -> PocError:
+    """Preserve only a fixed client code and allowlisted aggregate integer details."""
+    code = getattr(error, "code", None)
+    if not isinstance(code, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", code):
+        return PocError(fallback)
+    details: dict[str, int] = {}
+    raw_details = getattr(error, "details", None)
+    if code == "candidate_record_too_large" and isinstance(raw_details, dict):
+        details = {
+            key: value for key, value in raw_details.items()
+            if key in OVERSIZED_CANDIDATE_DETAIL_FIELDS
+            and not isinstance(value, bool) and isinstance(value, int) and value >= 0
+        }
+    return PocError(code, details=details)
+
+
+def report_poc_failure(error: PocError) -> None:
+    safe_details = error.details if error.category == "candidate_record_too_large" else {}
+    fields = " ".join(f"{key}={safe_details[key]}" for key in OVERSIZED_CANDIDATE_DETAIL_FIELDS
+                      if key in safe_details)
+    suffix = f" {fields}" if fields else ""
+    print(f"restore_validation=FAIL category={error.category}{suffix}", file=sys.stderr)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path and safe_details:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as summary_file:
+                summary_file.write("Snapshot candidate preparation: FAIL\n\n")
+                summary_file.write("- category: `candidate_record_too_large`\n")
+                for key in OVERSIZED_CANDIDATE_DETAIL_FIELDS:
+                    if key in safe_details:
+                        summary_file.write(f"- {key}: {safe_details[key]}\n")
+        except OSError:
+            pass
 
 
 def validate_confirmation(value: str) -> None:
@@ -2213,9 +2266,7 @@ def run_candidate_extraction(
                         dry_run=True,
                     )
                 except SnapshotIngestionError as error:
-                    if re.fullmatch(r"[a-z0-9_]{1,80}", error.code):
-                        raise PocError(error.code) from None
-                    raise PocError("snapshot_ingestion_client_failed") from None
+                    raise snapshot_client_poc_error(error, "snapshot_ingestion_client_failed") from None
                 except Exception:
                     raise PocError("snapshot_ingestion_client_failed") from None
                 counts = client_result.get("relevance_counts")
@@ -2276,9 +2327,7 @@ def run_candidate_extraction(
                     dry_run=False,
                 )
             except SnapshotIngestionError as error:
-                if re.fullmatch(r"[a-z0-9_]{1,80}", error.code):
-                    raise PocError(error.code) from None
-                raise PocError("snapshot_incremental_ingestion_failed") from None
+                raise snapshot_client_poc_error(error, "snapshot_incremental_ingestion_failed") from None
             except Exception:
                 raise PocError("snapshot_incremental_ingestion_failed") from None
             counts = live_result.get("relevance_counts")
@@ -3331,7 +3380,7 @@ def main() -> int:
                 write_historical_baseline_live_summary(failure_summary)
             except PocError:
                 pass
-        print(f"restore_validation=FAIL category={exc.category}", file=sys.stderr)
+        report_poc_failure(exc)
         return_code = 2
     except Exception:
         if mode == HISTORICAL_SNAPSHOT_BASELINE_LIVE and not historical_live_summary_written:
