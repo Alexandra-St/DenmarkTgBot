@@ -70,6 +70,48 @@ class SnapshotWorkflowSelectionTests(unittest.TestCase):
                 )
             self.assertEqual(error.exception.category, "ambiguous_previous_production_run")
 
+    def test_gated_scheduled_skip_without_artifact_skips_to_previous_base(self) -> None:
+        skipped_schedule = run(14, number=14, event="schedule", conclusion="skipped")
+        selected = FLOW.choose_base(
+            bootstrap_run_id="90", bootstrap_run=None, bootstrap_artifacts=None,
+            poc_workflow_id=10,
+            incremental_runs=[skipped_schedule, run(13, number=13)],
+            incremental_workflow_id=20,
+            artifact_lookup=lambda chosen: [] if chosen == "14" else artifact(
+                f"folketinget-snapshot-incremental-{chosen}"),
+        )
+        self.assertEqual(selected, ("13", "folketinget-snapshot-incremental-13"))
+
+    def test_skipped_dispatch_and_failed_or_cancelled_schedule_remain_ambiguous(self) -> None:
+        cases = (
+            run(14, number=14, event="workflow_dispatch", conclusion="skipped"),
+            run(14, number=14, event="schedule", conclusion="failure"),
+            run(14, number=14, event="schedule", conclusion="cancelled"),
+            run(14, number=14, event="schedule", conclusion="neutral"),
+        )
+        for candidate in cases:
+            with self.subTest(event=candidate["event"], conclusion=candidate["conclusion"]):
+                with self.assertRaises(FLOW.WorkflowError) as error:
+                    FLOW.choose_base(
+                        bootstrap_run_id="90", bootstrap_run=None, bootstrap_artifacts=None,
+                        poc_workflow_id=10,
+                        incremental_runs=[candidate, run(13, number=13)],
+                        incremental_workflow_id=20,
+                        artifact_lookup=lambda chosen: [] if chosen == "14" else artifact(
+                            f"folketinget-snapshot-incremental-{chosen}"),
+                    )
+                self.assertEqual(error.exception.category, "ambiguous_previous_production_run")
+
+    def test_manifest_artifact_remains_authoritative_for_skipped_schedule_run(self) -> None:
+        skipped_with_manifest = run(14, number=14, event="schedule", conclusion="skipped")
+        selected = FLOW.choose_base(
+            bootstrap_run_id="90", bootstrap_run=None, bootstrap_artifacts=None,
+            poc_workflow_id=10, incremental_runs=[skipped_with_manifest],
+            incremental_workflow_id=20,
+            artifact_lookup=lambda chosen: artifact(f"folketinget-snapshot-incremental-{chosen}"),
+        )
+        self.assertEqual(selected, ("14", "folketinget-snapshot-incremental-14"))
+
     def test_failed_no_commit_marker_safely_skips_to_committed_base(self) -> None:
         selected = FLOW.choose_base(
             bootstrap_run_id="90", bootstrap_run=None, bootstrap_artifacts=None,
@@ -210,6 +252,10 @@ class SnapshotWorkflowSelectionTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("schedule:", workflow)
         self.assertIn("vars.FOLKETINGET_AUTOMATION_ENABLED == 'true'", workflow)
+        self.assertLess(
+            workflow.index("if: github.event_name != 'schedule' || vars.FOLKETINGET_AUTOMATION_ENABLED == 'true'"),
+            workflow.index("    steps:"),
+        )
         self.assertIn("inputs.mode == 'production_ingest'", workflow)
         self.assertIn('default: "39433055408"', workflow)
         self.assertIn("folketinget_snapshot_workflow.py validate-production-ref", workflow)

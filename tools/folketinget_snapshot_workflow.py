@@ -102,6 +102,21 @@ def is_proven_prewrite_incident(run: object) -> bool:
     )
 
 
+def is_gated_scheduled_skip(run: object, workflow_id: int) -> bool:
+    """Recognize only scheduled runs skipped by the workflow-level automation gate.
+
+    The incremental workflow has one job, guarded before its steps by the exact-true
+    automation variable. A skipped scheduled run on main therefore cannot have run
+    checkout, base selection, restore, or any Worker/D1 request.
+    """
+    return isinstance(run, dict) and (
+        run.get("workflow_id") == workflow_id
+        and run.get("event") == "schedule"
+        and run.get("conclusion") == "skipped"
+        and run.get("head_branch") == "main"
+    )
+
+
 def choose_base(
     *,
     bootstrap_run_id: str,
@@ -141,6 +156,8 @@ def choose_base(
             return run_id, name
         if has_noop:
             validate_artifact(artifacts, noop_name)
+            continue
+        if is_gated_scheduled_skip(latest, incremental_workflow_id):
             continue
         if is_proven_prewrite_incident(latest):
             continue
