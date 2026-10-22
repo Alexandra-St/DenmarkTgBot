@@ -26,7 +26,86 @@ def run(run_id: int, *, number: int, workflow_id: int = 20, conclusion: str = "s
             "event": event, "head_branch": head_branch, "head_sha": head_sha}
 
 
+class FakeApi:
+    def __init__(self, runs: list[dict[str, object]], bootstrap: dict[str, object],
+                 artifacts: dict[str, list[dict[str, object]]]) -> None:
+        self.runs = runs
+        self.bootstrap = bootstrap
+        self.artifact_map = artifacts
+        self.bootstrap_run_calls = 0
+
+    def workflow_id(self, workflow: str) -> int:
+        return 10 if workflow == FLOW.POC_WORKFLOW else 20
+
+    def recent_runs(self, workflow_id: int) -> list[dict[str, object]]:
+        return self.runs
+
+    def run(self, run_id: str) -> dict[str, object]:
+        self.bootstrap_run_calls += 1
+        return self.bootstrap
+
+    def artifacts(self, run_id: str) -> list[dict[str, object]]:
+        return self.artifact_map.get(run_id, [])
+
+
 class SnapshotWorkflowSelectionTests(unittest.TestCase):
+    def test_select_base_uses_bootstrap_when_no_production_runs_exist(self) -> None:
+        api = FakeApi(
+            [], run(90, number=9, workflow_id=10, title="CREATE_MANIFEST_BASELINE"),
+            {"90": artifact("folketinget-snapshot-manifest-90")},
+        )
+        self.assertEqual(FLOW.select_base(api, "90"), ("90", "folketinget-snapshot-manifest-90"))
+
+    def test_select_base_uses_bootstrap_after_only_safely_skipped_runs(self) -> None:
+        incident = run(
+            int(FLOW.RECOVERABLE_PREWRITE_RUN_ID), number=14, conclusion="failure",
+            head_sha=FLOW.RECOVERABLE_PREWRITE_HEAD_SHA,
+        )
+        api = FakeApi(
+            [run(15, number=15, event="schedule", conclusion="skipped"), incident],
+            run(90, number=9, workflow_id=10, title="CREATE_MANIFEST_BASELINE"),
+            {"90": artifact("folketinget-snapshot-manifest-90")},
+        )
+        self.assertEqual(FLOW.select_base(api, "90"), ("90", "folketinget-snapshot-manifest-90"))
+        self.assertEqual(api.bootstrap_run_calls, 1)
+
+    def test_select_base_prefers_valid_production_manifest_over_bootstrap(self) -> None:
+        api = FakeApi(
+            [run(15, number=15)],
+            run(90, number=9, workflow_id=10, title="CREATE_MANIFEST_BASELINE"),
+            {"15": artifact("folketinget-snapshot-incremental-15"),
+             "90": artifact("folketinget-snapshot-manifest-90")},
+        )
+        self.assertEqual(FLOW.select_base(api, "90"), ("15", "folketinget-snapshot-incremental-15"))
+        self.assertEqual(api.bootstrap_run_calls, 0)
+
+    def test_select_base_ambiguous_run_blocks_without_loading_bootstrap(self) -> None:
+        api = FakeApi(
+            [run(15, number=15, conclusion="failure")],
+            run(90, number=9, workflow_id=10, title="CREATE_MANIFEST_BASELINE"),
+            {"90": artifact("folketinget-snapshot-manifest-90")},
+        )
+        with self.assertRaises(FLOW.WorkflowError) as error:
+            FLOW.select_base(api, "90")
+        self.assertEqual(error.exception.category, "ambiguous_previous_production_run")
+        self.assertEqual(api.bootstrap_run_calls, 0)
+
+    def test_select_base_rejects_missing_or_invalid_bootstrap_after_safe_skips(self) -> None:
+        skipped = run(15, number=15, event="schedule", conclusion="skipped")
+        invalid_bootstrap = run(90, number=9, workflow_id=10, title="CREATE_MANIFEST_BASELINE",
+                                conclusion="cancelled")
+        api = FakeApi([skipped], invalid_bootstrap, {"90": artifact("folketinget-snapshot-manifest-90")})
+        with self.assertRaises(FLOW.WorkflowError) as error:
+            FLOW.select_base(api, "90")
+        self.assertEqual(error.exception.category, "manifest_run_not_successful")
+
+        missing_artifact = FakeApi(
+            [skipped], run(90, number=9, workflow_id=10, title="CREATE_MANIFEST_BASELINE"), {"90": []}
+        )
+        with self.assertRaises(FLOW.WorkflowError) as error:
+            FLOW.select_base(missing_artifact, "90")
+        self.assertEqual(error.exception.category, "manifest_artifact_missing_or_ambiguous")
+
     def test_production_branch_guard_allows_dry_run_but_requires_main_for_writes(self) -> None:
         FLOW.validate_production_ref("workflow_dispatch", "dry_run", "refs/heads/feature")
         FLOW.validate_production_ref("workflow_dispatch", "production_ingest", "refs/heads/main")

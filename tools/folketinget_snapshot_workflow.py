@@ -127,6 +127,7 @@ def choose_base(
     incremental_workflow_id: int,
     artifact_lookup: Any,
     current_run_id: str | None = None,
+    bootstrap_lookup: Any | None = None,
 ) -> tuple[str, str]:
     """Select the newest durable production outcome without crossing ambiguity."""
     if not isinstance(incremental_runs, list):
@@ -167,6 +168,8 @@ def choose_base(
 
     if not re.fullmatch(r"[0-9]+", bootstrap_run_id or ""):
         raise WorkflowError("manifest_run_id_invalid")
+    if bootstrap_lookup is not None:
+        poc_workflow_id, bootstrap_run, bootstrap_artifacts = bootstrap_lookup(bootstrap_run_id)
     validate_run(bootstrap_run, requested_id=bootstrap_run_id,
                  workflow_id=poc_workflow_id, allowed_events={"workflow_dispatch"})
     name = f"folketinget-snapshot-manifest-{bootstrap_run_id}"
@@ -248,10 +251,15 @@ def select_base(
     runs = api.recent_runs(incremental_id)
     live_runs = production_runs(runs, incremental_id, current_run_id=current_run_id)
     if live_runs:
+        def bootstrap_lookup(run_id: str) -> tuple[int, object, object]:
+            poc_id = api.workflow_id(POC_WORKFLOW)
+            return poc_id, api.run(run_id), api.artifacts(run_id)
+
         return choose_base(
             bootstrap_run_id=bootstrap_run_id, bootstrap_run=None, bootstrap_artifacts=None,
             poc_workflow_id=-1, incremental_runs=live_runs, incremental_workflow_id=incremental_id,
             artifact_lookup=api.artifacts, current_run_id=current_run_id,
+            bootstrap_lookup=bootstrap_lookup,
         )
 
     if not re.fullmatch(r"[0-9]+", bootstrap_run_id or ""):
