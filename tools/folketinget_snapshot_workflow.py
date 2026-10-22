@@ -18,6 +18,8 @@ INCREMENTAL_WORKFLOW = "folketinget-snapshot-incremental.yml"
 PRODUCTION_TITLE = "Folketinget snapshot incremental / production_ingest"
 NO_COMMIT_PREFIX = "folketinget-snapshot-no-commit-"
 USER_AGENT = "DenmarkTgBot-SnapshotWorkflow/1.0"
+RECOVERABLE_PREWRITE_RUN_ID = "39683128314"
+RECOVERABLE_PREWRITE_HEAD_SHA = "830ce7ccdd3ae532b6519d13d58be948eb7f2625"
 
 
 class WorkflowError(Exception):
@@ -77,8 +79,8 @@ def production_runs(
     live_runs = [run for run in runs if isinstance(run, dict)
                  and run.get("workflow_id") == workflow_id
                  and run.get("event") in {"schedule", "workflow_dispatch"}
-                 and run.get("display_title") == PRODUCTION_TITLE
-                 and run.get("head_branch") == "main"
+                 and ((run.get("display_title") == PRODUCTION_TITLE and run.get("head_branch") == "main")
+                      or str(run.get("id", "")) == RECOVERABLE_PREWRITE_RUN_ID)
                  and str(run.get("id", "")) != current_run_id]
     for run in live_runs:
         if (not re.fullmatch(r"[0-9]+", str(run.get("id", "")))
@@ -86,6 +88,18 @@ def production_runs(
                 or run["run_number"] < 1):
             raise WorkflowError("manifest_run_not_successful")
     return sorted(live_runs, key=lambda item: item["run_number"], reverse=True)
+
+
+def is_proven_prewrite_incident(run: object) -> bool:
+    """Recognize the single reviewed run that failed locally before its first Worker request."""
+    return isinstance(run, dict) and (
+        str(run.get("id")) == RECOVERABLE_PREWRITE_RUN_ID
+        and run.get("head_sha") == RECOVERABLE_PREWRITE_HEAD_SHA
+        and run.get("head_branch") == "main"
+        and run.get("display_title") == PRODUCTION_TITLE
+        and run.get("status") == "completed"
+        and run.get("conclusion") == "failure"
+    )
 
 
 def choose_base(
@@ -127,6 +141,8 @@ def choose_base(
             return run_id, name
         if has_noop:
             validate_artifact(artifacts, noop_name)
+            continue
+        if is_proven_prewrite_incident(latest):
             continue
         # The Worker may have committed before a later workflow failure. Without
         # either durable proof, an older base is unsafe regardless of conclusion.

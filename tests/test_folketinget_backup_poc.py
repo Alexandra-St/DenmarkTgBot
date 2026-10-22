@@ -24,6 +24,9 @@ POC = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(POC)
 
+TEST_REPOSITORY = "Alexandra-St/DenmarkTgBot"
+TEST_WORKFLOW_RUN_ID = "12345"
+
 
 def create_candidate_manifest(
     path: pathlib.Path, *, backup: str, finish: str, include_sag: bool,
@@ -897,7 +900,10 @@ class BackupPocSafetyTests(unittest.TestCase):
             create_v2_candidate_manifest(target, backup="a", finish=stamp, rows=rows)
             context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
             with mock.patch.object(POC, "run_candidate_extraction") as extract:
-                result = POC.run_snapshot_incremental_dry_run(context, target, SimpleNamespace(), root)
+                result = POC.run_snapshot_incremental_dry_run(
+                    context, target, SimpleNamespace(), root,
+                    github_repository=TEST_REPOSITORY, github_run_id=TEST_WORKFLOW_RUN_ID,
+                )
             extract.assert_not_called()
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["snapshot_change"], "SAME_SNAPSHOT")
@@ -923,8 +929,20 @@ class BackupPocSafetyTests(unittest.TestCase):
         first = POC.snapshot_incremental_run_id("Alexandra-St/DenmarkTgBot", "12345")
         self.assertEqual(first, POC.snapshot_incremental_run_id("Alexandra-St/DenmarkTgBot", "12345"))
         self.assertNotEqual(first, POC.snapshot_incremental_run_id("Alexandra-St/DenmarkTgBot", "12346"))
+        self.assertRegex(first, r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
         with self.assertRaises(POC.PocError):
             POC.snapshot_incremental_run_id("bad/repo", "not-a-run")
+
+    def test_snapshot_incremental_dry_run_validates_the_production_run_id(self) -> None:
+        from collectors import snapshot_ingestion_client
+
+        with mock.patch.object(
+            snapshot_ingestion_client, "validate_snapshot_run_id",
+            side_effect=snapshot_ingestion_client.SnapshotIngestionError("invalid_run_id"),
+        ):
+            with self.assertRaises(POC.PocError) as error:
+                POC.snapshot_incremental_run_id(TEST_REPOSITORY, TEST_WORKFLOW_RUN_ID)
+        self.assertEqual(error.exception.category, "snapshot_incremental_run_id_invalid")
 
     def test_snapshot_incremental_live_promotes_only_exact_committed_result(self) -> None:
         old_finish, new_finish = "2026-10-20 02:00:40.000", "2026-10-21 02:00:40.000"
@@ -1251,7 +1269,8 @@ class BackupPocSafetyTests(unittest.TestCase):
             with mock.patch.object(snapshot_ingestion_client, "_submit_prepared_records", side_effect=AssertionError("live path reached")):
                 with mock.patch.object(snapshot_ingestion_client, "ingest_snapshot_candidates", wraps=original) as client:
                     result = POC.run_snapshot_incremental_dry_run(
-                        context, target, InMemoryFolketingetProvider({"Sag": [sag]}), root
+                        context, target, InMemoryFolketingetProvider({"Sag": [sag]}), root,
+                        github_repository=TEST_REPOSITORY, github_run_id=TEST_WORKFLOW_RUN_ID,
                     )
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["snapshot_change"], "CHANGED")
@@ -1266,6 +1285,8 @@ class BackupPocSafetyTests(unittest.TestCase):
                 "schema_fingerprint": "a" * 64,
             })
             self.assertTrue(result["submission_eligible"])
+            self.assertEqual(client.call_args.kwargs["run_id"], POC.snapshot_incremental_run_id(
+                TEST_REPOSITORY, TEST_WORKFLOW_RUN_ID))
 
     def test_snapshot_incremental_removed_v2_relation_routes_through_full_dry_run(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider
@@ -1291,7 +1312,8 @@ class BackupPocSafetyTests(unittest.TestCase):
             create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
             context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
             result = POC.run_snapshot_incremental_dry_run(
-                context, target, InMemoryFolketingetProvider({"Sag": [sag]}), root
+                context, target, InMemoryFolketingetProvider({"Sag": [sag]}), root,
+                github_repository=TEST_REPOSITORY, github_run_id=TEST_WORKFLOW_RUN_ID,
             )
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["diff_totals"]["removed"], 1)
@@ -1321,7 +1343,8 @@ class BackupPocSafetyTests(unittest.TestCase):
             with mock.patch("folketinget_candidate_extraction.extract_candidates", return_value=incomplete):
                 with mock.patch.object(snapshot_ingestion_client, "ingest_snapshot_candidates") as client:
                     result = POC.run_snapshot_incremental_dry_run(
-                        context, target, InMemoryFolketingetProvider({}), root
+                        context, target, InMemoryFolketingetProvider({}), root,
+                        github_repository=TEST_REPOSITORY, github_run_id=TEST_WORKFLOW_RUN_ID,
                     )
             client.assert_not_called()
             self.assertEqual(result["status"], "INCOMPLETE")
@@ -1344,7 +1367,8 @@ class BackupPocSafetyTests(unittest.TestCase):
             create_v2_candidate_manifest(target, backup="b", finish=new_finish, rows=new_rows)
             context = POC.validate_snapshot_incremental_base_input(base_dir, "39433055408")
             result = POC.run_snapshot_incremental_dry_run(
-                context, target, InMemoryFolketingetProvider({}), root
+                context, target, InMemoryFolketingetProvider({}), root,
+                github_repository=TEST_REPOSITORY, github_run_id=TEST_WORKFLOW_RUN_ID,
             )
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["tombstone_count"], 1)
@@ -1383,7 +1407,10 @@ class BackupPocSafetyTests(unittest.TestCase):
             }
             with mock.patch.object(POC, "run_candidate_extraction", return_value=oversized):
                 with self.assertRaises(POC.PocError) as limit:
-                    POC.run_snapshot_incremental_dry_run(context, target, SimpleNamespace(), root)
+                    POC.run_snapshot_incremental_dry_run(
+                        context, target, SimpleNamespace(), root,
+                        github_repository=TEST_REPOSITORY, github_run_id=TEST_WORKFLOW_RUN_ID,
+                    )
             self.assertEqual(limit.exception.category, "snapshot_incremental_batch_limit_exceeded")
 
     def test_snapshot_incremental_summary_contains_only_aggregate_fields(self) -> None:

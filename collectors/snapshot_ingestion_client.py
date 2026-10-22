@@ -105,6 +105,17 @@ class SnapshotIngestionError(ValueError):
         super().__init__(code + suffix)
 
 
+def validate_snapshot_run_id(value: object) -> str:
+    """Validate the exact UUID-v4-shaped idempotency key accepted by the Worker."""
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        value,
+        re.IGNORECASE,
+    ):
+        raise SnapshotIngestionError("invalid_run_id")
+    return value
+
+
 def _safe_candidate_ingestion_error(error: ingestion_client.IngestionError, *, stage: str) -> str:
     """Map only exact local validation messages to fixed, non-sensitive categories."""
     message = error.args[0] if len(error.args) == 1 and isinstance(error.args[0], str) else None
@@ -689,10 +700,7 @@ def submit_prepared_historical_records(
     """Submit only a validated historical handoff from its dedicated workflow mode."""
     if activation_mode != HISTORICAL_LIVE_ACTIVATION_MODE:
         raise SnapshotIngestionError("historical_snapshot_submission_not_enabled", run_id)
-    if not isinstance(run_id, str) or not re.fullmatch(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", run_id, re.IGNORECASE
-    ):
-        raise SnapshotIngestionError("invalid_run_id")
+    validate_snapshot_run_id(run_id)
     prepared, batches, counts, target = _prepare_historical_records(
         records, mode=mode, state_kind=state_kind, base_snapshot=base_snapshot,
         target_snapshot=target_snapshot,
@@ -782,11 +790,11 @@ def ingest_snapshot_candidates(
     ):
         raise SnapshotIngestionError("prepared_batch_limit_exceeded", stage="prepare")
 
-    if run_id is not None and not isinstance(run_id, str):
-        raise SnapshotIngestionError("invalid_run_id")
     run_id = run_id or str(uuid.uuid4())
-    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", run_id, re.IGNORECASE):
-        raise SnapshotIngestionError("invalid_run_id", run_id)
+    try:
+        validate_snapshot_run_id(run_id)
+    except SnapshotIngestionError:
+        raise SnapshotIngestionError("invalid_run_id", run_id if isinstance(run_id, str) else None) from None
     eligible = mode == "incremental" and complete
     summary: dict[str, Any] = {
         "dry_run": dry_run,

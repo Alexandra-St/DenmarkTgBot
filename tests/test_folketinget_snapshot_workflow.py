@@ -20,10 +20,10 @@ def artifact(name: str, *, expired: bool = False, size: int = 123) -> list[dict[
 
 def run(run_id: int, *, number: int, workflow_id: int = 20, conclusion: str = "success",
         title: str = FLOW.PRODUCTION_TITLE, event: str = "workflow_dispatch",
-        status: str = "completed", head_branch: str = "main") -> dict[str, object]:
+        status: str = "completed", head_branch: str = "main", head_sha: str = "a" * 40) -> dict[str, object]:
     return {"id": run_id, "run_number": number, "workflow_id": workflow_id,
             "status": status, "conclusion": conclusion, "display_title": title,
-            "event": event, "head_branch": head_branch}
+            "event": event, "head_branch": head_branch, "head_sha": head_sha}
 
 
 class SnapshotWorkflowSelectionTests(unittest.TestCase):
@@ -82,6 +82,43 @@ class SnapshotWorkflowSelectionTests(unittest.TestCase):
             ),
         )
         self.assertEqual(selected, ("12", "folketinget-snapshot-incremental-12"))
+
+    def test_exact_reviewed_prewrite_incident_safely_skips_to_committed_base(self) -> None:
+        incident = run(
+            int(FLOW.RECOVERABLE_PREWRITE_RUN_ID), number=14, conclusion="failure",
+            head_sha=FLOW.RECOVERABLE_PREWRITE_HEAD_SHA,
+        )
+        selected = FLOW.choose_base(
+            bootstrap_run_id="90", bootstrap_run=None, bootstrap_artifacts=None,
+            poc_workflow_id=10, incremental_runs=[incident, run(12, number=12)],
+            incremental_workflow_id=20,
+            artifact_lookup=lambda chosen: [] if chosen == FLOW.RECOVERABLE_PREWRITE_RUN_ID else artifact(
+                f"folketinget-snapshot-incremental-{chosen}"),
+        )
+        self.assertEqual(selected, ("12", "folketinget-snapshot-incremental-12"))
+
+    def test_prewrite_incident_recovery_requires_every_exact_property(self) -> None:
+        exact = run(
+            int(FLOW.RECOVERABLE_PREWRITE_RUN_ID), number=14, conclusion="failure",
+            head_sha=FLOW.RECOVERABLE_PREWRITE_HEAD_SHA,
+        )
+        variants = {
+            "id": {**exact, "id": int(FLOW.RECOVERABLE_PREWRITE_RUN_ID) + 1},
+            "sha": {**exact, "head_sha": "b" * 40},
+            "branch": {**exact, "head_branch": "feature"},
+            "title": {**exact, "display_title": "different"},
+            "conclusion": {**exact, "conclusion": "cancelled"},
+        }
+        for field, candidate in variants.items():
+            with self.subTest(field=field), self.assertRaises(FLOW.WorkflowError) as error:
+                FLOW.choose_base(
+                    bootstrap_run_id="90", bootstrap_run=None, bootstrap_artifacts=None,
+                    poc_workflow_id=10, incremental_runs=[candidate, run(12, number=12)],
+                    incremental_workflow_id=20,
+                    artifact_lookup=lambda chosen: artifact(f"folketinget-snapshot-incremental-{chosen}")
+                    if chosen == "12" else [],
+                )
+            self.assertEqual(error.exception.category, "ambiguous_previous_production_run")
 
     def test_current_in_progress_run_is_ignored(self) -> None:
         selected = FLOW.choose_base(

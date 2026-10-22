@@ -170,13 +170,21 @@ def validate_snapshot_incremental_live_gate(
 
 def snapshot_incremental_run_id(github_repository: str, github_run_id: str) -> str:
     """Derive a stable idempotency key for retries of the same Actions run."""
-    import uuid
-
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", github_repository or ""):
         raise PocError("snapshot_incremental_run_id_invalid")
     if not re.fullmatch(r"[0-9]+", github_run_id or ""):
         raise PocError("snapshot_incremental_run_id_invalid")
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/{github_repository}/actions/runs/{github_run_id}"))
+    value = bytearray(hashlib.sha256(
+        f"DenmarkTgBot:Folketinget:incremental:{github_repository}:{github_run_id}".encode()
+    ).digest()[:16])
+    value[6] = (value[6] & 0x0F) | 0x40
+    value[8] = (value[8] & 0x3F) | 0x80
+    generated = str(uuid.UUID(bytes=bytes(value)))
+    try:
+        from collectors.snapshot_ingestion_client import validate_snapshot_run_id
+        return validate_snapshot_run_id(generated)
+    except Exception:
+        raise PocError("snapshot_incremental_run_id_invalid") from None
 
 
 def validate_mode(value: str) -> str:
@@ -1557,9 +1565,11 @@ def validate_snapshot_incremental_pair(
 
 
 def run_snapshot_incremental_dry_run(
-    base_context: dict[str, Any], target_manifest: Path, provider: Any, runner_temp: Path
+    base_context: dict[str, Any], target_manifest: Path, provider: Any, runner_temp: Path,
+    *, github_repository: str, github_run_id: str,
 ) -> dict[str, Any]:
     """Run extraction, classification and snapshot-client validation without HTTP."""
+    run_id = snapshot_incremental_run_id(github_repository, github_run_id)
     context = validate_snapshot_incremental_pair(base_context, target_manifest)
     diff_totals = context["report"]["totals"]
     if context["same_snapshot"]:
@@ -1576,6 +1586,7 @@ def run_snapshot_incremental_dry_run(
         context["old_finish"], context["new_finish"],
         snapshot_ingestion_dry_run=True,
         base_snapshot=context["base_snapshot"], target_snapshot=context["target_snapshot"],
+        ingestion_run_id=run_id,
     )
     if result.get("diff_totals") != diff_totals:
         raise PocError("snapshot_incremental_diff_contract_mismatch")
@@ -2263,6 +2274,7 @@ def run_candidate_extraction(
                         mode="incremental",
                         base_snapshot=base_snapshot,
                         target_snapshot=target_snapshot,
+                        run_id=ingestion_run_id,
                         dry_run=True,
                     )
                 except SnapshotIngestionError as error:
@@ -3246,7 +3258,9 @@ def main() -> int:
             print("progress=snapshot_incremental_diff")
             if mode == SNAPSHOT_INCREMENTAL_DRY_RUN:
                 incremental_summary = run_snapshot_incremental_dry_run(
-                    incremental_base_context, current_manifest, provider, runner_temp
+                    incremental_base_context, current_manifest, provider, runner_temp,
+                    github_repository=os.environ.get("GITHUB_REPOSITORY", ""),
+                    github_run_id=os.environ.get("GITHUB_RUN_ID", ""),
                 )
                 write_snapshot_incremental_summary(incremental_summary)
             else:
