@@ -1,0 +1,28 @@
+name: Folketinget snapshot scheduled failure alert
+
+on:
+  workflow_run:
+    workflows: ["Folketinget snapshot incremental"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  alert:
+    if: ${{ github.event.workflow_run.event == 'schedule' && github.event.workflow_run.conclusion != 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Check out trusted alert sender
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Send scheduled failure alert
+        env:
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_OPERATIONAL_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_OPERATIONAL_ALERT_CHAT_ID }}
+        run: python3 tools/folketinget_snapshot_alert.py
