@@ -56,6 +56,13 @@ def alert_message(event: dict[str, Any], repository: str) -> str | None:
     )
 
 
+def diagnostic_message(event_name: str, confirmation: str) -> str | None:
+    """Return only the fixed diagnostic text after an explicit manual confirmation."""
+    if event_name != "workflow_dispatch" or confirmation != "true":
+        return None
+    return "🧪 DenmarkTgBot — operational alert test"
+
+
 def read_event(path: str) -> dict[str, Any]:
     try:
         raw = Path(path).read_bytes()
@@ -102,20 +109,30 @@ def send_telegram(message: str, token: str, chat_id: str) -> None:
 
 def main() -> int:
     try:
-        event = read_event(os.environ.get("GITHUB_EVENT_PATH", ""))
-        message = alert_message(event, os.environ.get("GITHUB_REPOSITORY", ""))
-        if message is None:
-            print("scheduled_alert=NOT_REQUIRED")
+        event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+        if event_name == "workflow_dispatch":
+            message = diagnostic_message(event_name, os.environ.get("INPUT_CONFIRM_TEST_ALERT", ""))
+            if message is None:
+                print("diagnostic_alert=NOT_CONFIRMED")
+                return 0
+        elif event_name == "workflow_run":
+            event = read_event(os.environ.get("GITHUB_EVENT_PATH", ""))
+            message = alert_message(event, os.environ.get("GITHUB_REPOSITORY", ""))
+            if message is None:
+                print("scheduled_alert=NOT_REQUIRED")
+                return 0
+        else:
+            print("alert=NOT_APPLICABLE")
             return 0
         send_telegram(
             message,
             os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             os.environ.get("TELEGRAM_OPERATIONAL_ALERT_CHAT_ID", ""),
         )
-        print("scheduled_alert=SENT")
+        print("alert=SENT")
         return 0
     except AlertError as exc:
-        print(f"scheduled_alert=FAIL category={exc}", file=sys.stderr)
+        print(f"alert=FAIL category={exc}", file=sys.stderr)
         return 1
 
 

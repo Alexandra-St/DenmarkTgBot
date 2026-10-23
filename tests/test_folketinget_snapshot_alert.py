@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import io
 import json
+import os
 import re
+import urllib.error
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.folketinget_snapshot_alert import AlertError, alert_message, read_event, send_telegram
+from tools.folketinget_snapshot_alert import (
+    AlertError, alert_message, diagnostic_message, main, read_event, send_telegram,
+)
 
 REPOSITORY = "Alexandra-St/DenmarkTgBot"
 
@@ -42,6 +47,14 @@ class FolketingetSnapshotAlertTests(unittest.TestCase):
     def test_manual_failure_does_not_alert(self):
         self.assertIsNone(alert_message(payload(event="workflow_dispatch"), REPOSITORY))
 
+    def test_manual_diagnostic_requires_exact_confirmation_and_fixed_text(self):
+        expected = "🧪 DenmarkTgBot — operational alert test"
+        self.assertEqual(diagnostic_message("workflow_dispatch", "true"), expected)
+        self.assertIsNone(diagnostic_message("workflow_dispatch", "false"))
+        self.assertIsNone(diagnostic_message("workflow_dispatch", "TRUE"))
+        self.assertIsNone(diagnostic_message("workflow_dispatch", ""))
+        self.assertIsNone(diagnostic_message("workflow_run", "true"))
+
     def test_unrelated_workflow_does_not_alert(self):
         self.assertIsNone(alert_message(payload(name="Other workflow"), REPOSITORY))
 
@@ -65,6 +78,10 @@ class FolketingetSnapshotAlertTests(unittest.TestCase):
         workflow = Path(".github/workflows/folketinget-snapshot-alert.yml").read_text(encoding="utf-8")
         self.assertIn('workflows: ["Folketinget snapshot incremental"]', workflow)
         self.assertIn("types: [completed]", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("default: false", workflow)
+        self.assertIn("inputs.confirm_test_alert == true", workflow)
+        self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
         self.assertIn("github.event.workflow_run.event == 'schedule'", workflow)
         self.assertIn("github.event.workflow_run.conclusion != 'success'", workflow)
         self.assertIn("secrets.TELEGRAM_BOT_TOKEN", workflow)
@@ -73,6 +90,33 @@ class FolketingetSnapshotAlertTests(unittest.TestCase):
         self.assertEqual(set(secret_refs), {"TELEGRAM_BOT_TOKEN", "TELEGRAM_OPERATIONAL_ALERT_CHAT_ID"})
         self.assertNotIn("curl", workflow)
         self.assertNotIn("wrangler", workflow)
+
+    def test_unconfirmed_manual_diagnostic_never_calls_telegram(self):
+        with patch.dict(os.environ, {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "INPUT_CONFIRM_TEST_ALERT": "false",
+        }, clear=False), patch("tools.folketinget_snapshot_alert.send_telegram") as send:
+            self.assertEqual(main(), 0)
+        send.assert_not_called()
+
+    def test_manual_send_failure_does_not_log_secrets(self):
+        token = "secret-bot-token-fixture"
+        chat_id = "private-chat-fixture"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "INPUT_CONFIRM_TEST_ALERT": "true",
+            "TELEGRAM_BOT_TOKEN": token,
+            "TELEGRAM_OPERATIONAL_ALERT_CHAT_ID": chat_id,
+        }, clear=False), patch("tools.folketinget_snapshot_alert.urllib.request.urlopen",
+                               side_effect=urllib.error.URLError("private transport details")), \
+             patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            self.assertEqual(main(), 1)
+        self.assertIn("category=telegram_request_failed", stderr.getvalue())
+        self.assertNotIn(token, stdout.getvalue() + stderr.getvalue())
+        self.assertNotIn(chat_id, stdout.getvalue() + stderr.getvalue())
+        self.assertNotIn("private transport details", stdout.getvalue() + stderr.getvalue())
 
     def test_event_file_is_bounded_and_parsed(self):
         with tempfile.TemporaryDirectory() as directory:

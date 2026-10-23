@@ -4,6 +4,13 @@ on:
   workflow_run:
     workflows: ["Folketinget snapshot incremental"]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      confirm_test_alert:
+        description: Send one diagnostic Telegram message to the configured owner chat
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -23,6 +30,24 @@ jobs:
         env:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_OPERATIONAL_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_OPERATIONAL_ALERT_CHAT_ID }}
+        run: python3 tools/folketinget_snapshot_alert.py
+
+  diagnostic:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_test_alert == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Check out trusted alert sender
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Send diagnostic alert
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          INPUT_CONFIRM_TEST_ALERT: ${{ inputs.confirm_test_alert }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_OPERATIONAL_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_OPERATIONAL_ALERT_CHAT_ID }}
         run: python3 tools/folketinget_snapshot_alert.py
