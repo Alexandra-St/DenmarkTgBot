@@ -8,8 +8,10 @@ import { test } from "node:test";
 import { handleIngestionRequest } from "../src/ingestion.ts";
 import {
   deliverPendingNotifications,
+  deliverSingleNotificationE2E,
   formatNotification,
   prepareNotificationQueue,
+  prepareSingleNotificationE2E,
   previewNotifications,
   sendNotificationCanary,
 } from "../src/notifications.ts";
@@ -187,6 +189,118 @@ test("queue requires its own enable flag and a committed incremental run", async
     const count = await db.prepare("SELECT COUNT(*) AS count FROM notifications").first<{ count: number }>();
     assert.equal(count?.count, 0);
   } finally { db.close(); }
+});
+
+test("single-recipient E2E path is default-off and leaves ordinary queue behavior unchanged", async () => {
+  const db = await fixture();
+  try {
+    await addEvent(db, { id: "e2e-default-off" });
+    const env = {
+      DB: db as never,
+      NOTIFICATION_QUEUE_ENABLED: "true",
+      NOTIFICATION_ACTIVATION_CUTOFF: cutoff,
+      NOTIFICATION_E2E_TELEGRAM_ID: "1",
+      NOTIFICATION_E2E_RUN_ID: "00000000-0000-4000-8000-000000000001",
+      NOTIFICATION_E2E_EVENT_ID: "1",
+    };
+    assert.deepEqual(await prepareSingleNotificationE2E(env, "PREPARE_ONE_ALLOWLISTED_NOTIFICATION", now), { status: "blocked", queued: 0 });
+    assert.deepEqual(await deliverSingleNotificationE2E({ ...env, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff }, { async sendMessage() {} }, "SEND_ONE_ALLOWLISTED_NOTIFICATION", now), { status: "blocked", sent: 0, failed: 0 });
+    assert.deepEqual(await prepareNotificationQueue(env, "00000000-0000-4000-8000-000000000001", now), { eligible: true, queued: 1 });
+  } finally { db.close(); }
+});
+
+test("authenticated notification E2E routes prepare and deliver only the pinned event/user", async () => {
+  const db = await fixture();
+  const originalFetch = globalThis.fetch;
+  try {
+    const allowlistedEventId = await addEvent(db, { id: "e2e-allowlisted", relevance: "DIRECT", detected: "2026-10-22T01:00:00.000Z" });
+    const unrelatedEventId = await addEvent(db, { id: "e2e-unrelated", relevance: "POTENTIAL", detected: "2026-10-22T01:00:00.000Z" });
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, attempts, created_at) VALUES (2, ?, 'PENDING', 0, ?)")
+      .bind(unrelatedEventId, now.toISOString()).run();
+
+    const token = "e2e-route-local-token";
+    const telegramToken = "mock-only-no-real-request";
+    const env = {
+      DB: db as never,
+      INGEST_API_TOKEN: token,
+      TELEGRAM_BOT_TOKEN: telegramToken,
+      NOTIFICATION_QUEUE_ENABLED: "true",
+      NOTIFICATION_ACTIVATION_CUTOFF: cutoff,
+      NOTIFICATION_DELIVERY_ENABLED: "true",
+      NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff,
+      NOTIFICATION_E2E_ENABLED: "true",
+      NOTIFICATION_E2E_TELEGRAM_ID: "1",
+      NOTIFICATION_E2E_RUN_ID: "00000000-0000-4000-8000-000000000001",
+      NOTIFICATION_E2E_EVENT_ID: String(allowlistedEventId),
+    };
+    const fetchWorker = worker.fetch as unknown as (request: Request, env: typeof env) => Promise<Response>;
+    const auth = { Authorization: "Bearer " + token, "Content-Type": "application/json" };
+    const ordinaryPrepare = await fetchWorker(new Request("https://local.test/internal/notifications/prepare", {
+      method: "POST", headers: auth, body: JSON.stringify({ run_id: env.NOTIFICATION_E2E_RUN_ID }),
+    }), env);
+    assert.deepEqual(await ordinaryPrepare.json(), { eligible: false, queued: 0 }, "normal broad prepare is closed during E2E mode");
+    const ordinaryDeliver = await fetchWorker(new Request("https://local.test/internal/notifications/deliver", {
+      method: "POST", headers: auth,
+    }), env);
+    assert.deepEqual(await ordinaryDeliver.json(), { enabled: false, sent: 0, failed: 0 }, "normal broad delivery is closed during E2E mode");
+
+    const invalid = await fetchWorker(new Request("https://local.test/internal/notifications/e2e/prepare", {
+      method: "POST", headers: auth, body: JSON.stringify({ confirmation: "PREPARE_ONE_ALLOWLISTED_NOTIFICATION", telegram_id: 2 }),
+    }), env);
+    assert.equal(invalid.status, 400, "request cannot override the pinned recipient or event");
+
+    const unauthorized = await fetchWorker(new Request("https://local.test/internal/notifications/e2e/prepare", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: "PREPARE_ONE_ALLOWLISTED_NOTIFICATION" }),
+    }), env);
+    assert.equal(unauthorized.status, 401);
+
+    const prepare = await fetchWorker(new Request("https://local.test/internal/notifications/e2e/prepare", {
+      method: "POST", headers: auth, body: JSON.stringify({ confirmation: "PREPARE_ONE_ALLOWLISTED_NOTIFICATION" }),
+    }), env);
+    const preparePayload = await prepare.json();
+    assert.deepEqual(preparePayload, { status: "prepared", queued: 1 });
+    const records = await db.prepare("SELECT telegram_id, event_id, status FROM notifications ORDER BY telegram_id")
+      .all<{ telegram_id: number; event_id: number; status: string }>();
+    assert.deepEqual(records.results.map((row) => ({ ...row })), [
+      { telegram_id: 1, event_id: allowlistedEventId, status: "PENDING" },
+      { telegram_id: 2, event_id: unrelatedEventId, status: "PENDING" },
+    ]);
+
+    const sent: Array<{ url: string; chatId: number }> = [];
+    globalThis.fetch = async (input, init) => {
+      const body = JSON.parse(String(init?.body)) as { chat_id: number };
+      sent.push({ url: String(input), chatId: body.chat_id });
+      return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    const deliver = await fetchWorker(new Request("https://local.test/internal/notifications/e2e/deliver", {
+      method: "POST", headers: auth, body: JSON.stringify({ confirmation: "SEND_ONE_ALLOWLISTED_NOTIFICATION" }),
+    }), env);
+    const deliverPayload = await deliver.json();
+    assert.deepEqual(deliverPayload, { status: "sent", sent: 1, failed: 0 });
+    assert.deepEqual(sent.map(({ chatId }) => chatId), [1]);
+    assert.ok(sent[0].url.endsWith("/sendMessage"));
+    assert.equal((await db.prepare("SELECT status FROM notifications WHERE event_id = ?").bind(allowlistedEventId).first<{ status: string }>())?.status, "SENT");
+    assert.equal((await db.prepare("SELECT status FROM notifications WHERE event_id = ?").bind(unrelatedEventId).first<{ status: string }>())?.status, "PENDING");
+
+    const repeatedPrepare = await fetchWorker(new Request("https://local.test/internal/notifications/e2e/prepare", {
+      method: "POST", headers: auth, body: JSON.stringify({ confirmation: "PREPARE_ONE_ALLOWLISTED_NOTIFICATION" }),
+    }), env);
+    assert.deepEqual(await repeatedPrepare.json(), { status: "blocked", queued: 0 }, "unique notification row prevents repeat preparation");
+    const repeatedDelivery = await fetchWorker(new Request("https://local.test/internal/notifications/e2e/deliver", {
+      method: "POST", headers: auth, body: JSON.stringify({ confirmation: "SEND_ONE_ALLOWLISTED_NOTIFICATION" }),
+    }), env);
+    assert.deepEqual(await repeatedDelivery.json(), { status: "blocked", sent: 0, failed: 0 }, "SENT is terminal and cannot be resent");
+    assert.equal(sent.length, 1);
+
+    const responseText = JSON.stringify({ prepare: preparePayload, delivery: deliverPayload });
+    assert.equal(responseText.includes("telegram_id"), false);
+    assert.equal(responseText.includes(telegramToken), false);
+    assert.deepEqual(Object.keys(preparePayload as object).sort(), ["queued", "status"]);
+    assert.deepEqual(Object.keys(deliverPayload as object).sort(), ["failed", "sent", "status"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    db.close();
+  }
 });
 
 test("confirmed source deletion creates no queue item and suppresses pending delivery", async () => {

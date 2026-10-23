@@ -16,6 +16,10 @@ export interface NotificationEnv {
   NOTIFICATION_CANARY_ENABLED?: string;
   NOTIFICATION_CANARY_ACTIVATION_CUTOFF?: string;
   NOTIFICATION_CANARY_TELEGRAM_ID?: string;
+  NOTIFICATION_E2E_ENABLED?: string;
+  NOTIFICATION_E2E_TELEGRAM_ID?: string;
+  NOTIFICATION_E2E_RUN_ID?: string;
+  NOTIFICATION_E2E_EVENT_ID?: string;
 }
 
 export interface NotificationTelegramClient {
@@ -37,14 +41,41 @@ function activationCutoff(value: string | undefined): Date | null {
 }
 
 /** Queue only events produced by a confirmed incremental ingestion run. */
-export async function prepareNotificationQueue(
+interface NotificationScope {
+  recipientId: number;
+  eventId: number;
+  runId: string;
+}
+
+interface NotificationE2EConfig extends NotificationScope {}
+
+const NOTIFICATION_E2E_PREPARE_CONFIRMATION = "PREPARE_ONE_ALLOWLISTED_NOTIFICATION";
+const NOTIFICATION_E2E_DELIVERY_CONFIRMATION = "SEND_ONE_ALLOWLISTED_NOTIFICATION";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function notificationE2EConfig(env: NotificationEnv): NotificationE2EConfig | null {
+  if (env.NOTIFICATION_E2E_ENABLED !== "true") return null;
+  const recipientText = env.NOTIFICATION_E2E_TELEGRAM_ID;
+  const eventText = env.NOTIFICATION_E2E_EVENT_ID;
+  const runId = env.NOTIFICATION_E2E_RUN_ID;
+  if (!recipientText || !/^[1-9]\d{0,19}$/u.test(recipientText)
+      || !eventText || !/^[1-9]\d{0,15}$/u.test(eventText)
+      || !runId || !UUID_PATTERN.test(runId)) return null;
+  const recipientId = Number(recipientText);
+  const eventId = Number(eventText);
+  if (!Number.isSafeInteger(recipientId) || !Number.isSafeInteger(eventId)) return null;
+  return { recipientId, eventId, runId };
+}
+
+async function prepareNotificationQueueScoped(
   env: NotificationEnv,
   runId: string,
-  now = new Date(),
+  now: Date,
+  scope?: NotificationScope,
 ): Promise<NotificationQueueResult> {
   if (env.NOTIFICATION_QUEUE_ENABLED !== "true") return { eligible: false, queued: 0 };
   const cutoff = activationCutoff(env.NOTIFICATION_ACTIVATION_CUTOFF);
-  if (!cutoff || now.getTime() < cutoff.getTime() || !/^[0-9a-f-]{36}$/iu.test(runId)) {
+  if (!cutoff || now.getTime() < cutoff.getTime() || !UUID_PATTERN.test(runId)) {
     return { eligible: false, queued: 0 };
   }
   const run = await env.DB.prepare("SELECT run_id FROM ingestion_runs WHERE run_id = ? AND mode = 'incremental' AND status = 'COMMITTED'")
@@ -52,6 +83,8 @@ export async function prepareNotificationQueue(
   if (!run) return { eligible: false, queued: 0 };
 
   const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
+  const scopeSql = scope ? " AND e.id = ? AND u.telegram_id = ?" : "";
+  const scopeBindings = scope ? [scope.eventId, scope.recipientId] : [];
   const result = await env.DB.prepare(`
     INSERT INTO notifications (telegram_id, event_id, status, attempts, created_at)
     SELECT u.telegram_id, e.id, 'PENDING', 0, ?
@@ -71,11 +104,31 @@ export async function prepareNotificationQueue(
       AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')
       AND NOT EXISTS (
         SELECT 1 FROM notifications n WHERE n.telegram_id = u.telegram_id AND n.event_id = e.id
-      )
+      )${scopeSql}
     ON CONFLICT (telegram_id, event_id) DO NOTHING
-  `).bind(now.toISOString(), `ingest:${runId}:%`, cutoff.toISOString(), staleBefore).run();
+  `).bind(now.toISOString(), `ingest:${runId}:%`, cutoff.toISOString(), staleBefore, ...scopeBindings).run();
 
   return { eligible: true, queued: result.meta.changes ?? 0 };
+}
+
+export async function prepareNotificationQueue(
+  env: NotificationEnv,
+  runId: string,
+  now = new Date(),
+): Promise<NotificationQueueResult> {
+  return prepareNotificationQueueScoped(env, runId, now);
+}
+
+export async function prepareSingleNotificationE2E(
+  env: NotificationEnv,
+  confirmation: unknown,
+  now = new Date(),
+): Promise<{ status: "prepared" | "blocked"; queued: 0 | 1 }> {
+  const config = notificationE2EConfig(env);
+  if (!config || confirmation !== NOTIFICATION_E2E_PREPARE_CONFIRMATION) return { status: "blocked", queued: 0 };
+  const result = await prepareNotificationQueueScoped(env, config.runId, now, config);
+  if (result.eligible && result.queued === 1) return { status: "prepared", queued: 1 };
+  return { status: "blocked", queued: 0 };
 }
 
 export interface NotificationPreview {
@@ -271,11 +324,14 @@ export async function deliverPendingNotifications(
   env: NotificationEnv,
   telegram: NotificationTelegramClient,
   now = new Date(),
+  scope?: NotificationScope,
 ): Promise<DeliveryResult> {
   if (env.NOTIFICATION_DELIVERY_ENABLED !== "true") return { enabled: false, sent: 0, failed: 0 };
   const cutoff = activationCutoff(env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF);
   if (!cutoff || now.getTime() < cutoff.getTime()) return { enabled: false, sent: 0, failed: 0 };
   const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
+  const scopeSql = scope ? " AND n.telegram_id = ? AND e.id = ? AND e.event_key LIKE ?" : "";
+  const scopeBindings = scope ? [scope.recipientId, scope.eventId, `ingest:${scope.runId}:%`] : [];
   const rows = await env.DB.prepare(`
     SELECT n.id, n.telegram_id, u.language, e.event_type, e.previous_status, e.new_status,
       u.notify_direct, u.notify_potential, p.historical, p.source_complete,
@@ -296,10 +352,10 @@ export async function deliverPendingNotifications(
         OR (p.relevance = 'POTENTIAL' AND u.notify_potential = 1))
       AND e.detected_at > ?
       AND e.detected_at >= ?
-      AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')
+      AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')${scopeSql}
     ORDER BY n.created_at, n.id
-    LIMIT 100
-  `).bind(cutoff.toISOString(), staleBefore).all<PendingNotification>();
+    LIMIT ${scope ? 1 : 100}
+  `).bind(cutoff.toISOString(), staleBefore, ...scopeBindings).all<PendingNotification>();
 
   let sent = 0;
   let failed = 0;
@@ -327,4 +383,21 @@ export async function deliverPendingNotifications(
     }
   }
   return { enabled: true, sent, failed };
+}
+
+
+export async function deliverSingleNotificationE2E(
+  env: NotificationEnv,
+  telegram: NotificationTelegramClient,
+  confirmation: unknown,
+  now = new Date(),
+): Promise<{ status: "sent" | "failed" | "blocked"; sent: 0 | 1; failed: 0 | 1 }> {
+  const config = notificationE2EConfig(env);
+  if (!config || confirmation !== NOTIFICATION_E2E_DELIVERY_CONFIRMATION) {
+    return { status: "blocked", sent: 0, failed: 0 };
+  }
+  const result = await deliverPendingNotifications(env, telegram, now, config);
+  if (result.sent === 1 && result.failed === 0) return { status: "sent", sent: 1, failed: 0 };
+  if (result.sent === 0 && result.failed === 1) return { status: "failed", sent: 0, failed: 1 };
+  return { status: "blocked", sent: 0, failed: 0 };
 }

@@ -6,7 +6,7 @@ import { D1PublicationRepository } from "./database/publications.ts";
 import { D1SourceStatusRepository } from "./database/source_status.ts";
 import type { TelegramUpdate } from "./types/telegram.ts";
 import { handleIngestionRequest, handleSnapshotReadinessRequest, handleSourceStatesRequest, isIngestionRequestAuthorized } from "./ingestion.ts";
-import { deliverPendingNotifications, prepareNotificationQueue, previewNotifications, sendNotificationCanary, type NotificationEnv } from "./notifications.ts";
+import { deliverPendingNotifications, deliverSingleNotificationE2E, prepareNotificationQueue, prepareSingleNotificationE2E, previewNotifications, sendNotificationCanary, type NotificationEnv } from "./notifications.ts";
 
 interface Env {
   DB: D1Database;
@@ -20,6 +20,10 @@ interface Env {
   NOTIFICATION_CANARY_ENABLED?: string;
   NOTIFICATION_CANARY_ACTIVATION_CUTOFF?: string;
   NOTIFICATION_CANARY_TELEGRAM_ID?: string;
+  NOTIFICATION_E2E_ENABLED?: string;
+  NOTIFICATION_E2E_TELEGRAM_ID?: string;
+  NOTIFICATION_E2E_RUN_ID?: string;
+  NOTIFICATION_E2E_EVENT_ID?: string;
 }
 
 const json = (body: unknown, status = 200): Response =>
@@ -35,6 +39,15 @@ function secretsMatch(expected: string, actual: string): boolean {
     mismatch |= expected.charCodeAt(index) ^ actual.charCodeAt(index);
   }
   return mismatch === 0;
+}
+
+async function confirmationOnlyBody(request: Request): Promise<string | null> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return null; }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const record = body as Record<string, unknown>;
+  if (Object.keys(record).length !== 1 || typeof record.confirmation !== "string") return null;
+  return record.confirmation;
 }
 
 export default {
@@ -57,6 +70,7 @@ export default {
       }
       if (url.pathname === "/internal/notifications/prepare") {
         if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        if (env.NOTIFICATION_E2E_ENABLED === "true") return json({ eligible: false, queued: 0 });
         let body: unknown;
         try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
         if (!body || typeof body !== "object" || typeof (body as { run_id?: unknown }).run_id !== "string") {
@@ -66,12 +80,26 @@ export default {
       }
       if (url.pathname === "/internal/notifications/deliver") {
         if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        if (env.NOTIFICATION_E2E_ENABLED === "true") return json({ enabled: false, sent: 0, failed: 0 });
         if (env.NOTIFICATION_DELIVERY_ENABLED !== "true" || !env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF) {
           return json({ enabled: false, sent: 0, failed: 0 });
         }
         if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "delivery_not_configured" }, 503);
         const result = await deliverPendingNotifications(notificationEnv, new TelegramApi(env.TELEGRAM_BOT_TOKEN));
         return json(result);
+      }
+      if (url.pathname === "/internal/notifications/e2e/prepare") {
+        if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        const confirmation = await confirmationOnlyBody(request);
+        if (confirmation === null) return json({ error: "invalid_notification_e2e_request" }, 400);
+        return json(await prepareSingleNotificationE2E(notificationEnv, confirmation));
+      }
+      if (url.pathname === "/internal/notifications/e2e/deliver") {
+        if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        const confirmation = await confirmationOnlyBody(request);
+        if (confirmation === null) return json({ error: "invalid_notification_e2e_request" }, 400);
+        if (!env.TELEGRAM_BOT_TOKEN) return json({ status: "blocked", sent: 0, failed: 0 });
+        return json(await deliverSingleNotificationE2E(notificationEnv, new TelegramApi(env.TELEGRAM_BOT_TOKEN), confirmation));
       }
       if (url.pathname === "/internal/notifications/canary") {
         if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
