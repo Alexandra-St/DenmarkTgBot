@@ -4,9 +4,10 @@ import io
 import json
 import os
 import re
-import urllib.error
 import tempfile
 import unittest
+import urllib.error
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +75,34 @@ class FolketingetSnapshotAlertTests(unittest.TestCase):
             with self.assertRaisesRegex(AlertError, "telegram_response_invalid"):
                 send_telegram("safe", "token", "123")
 
+    def test_telegram_http_400_and_401_are_safe_categories(self):
+        for status in (400, 401):
+            body = b'{"ok":false,"description":"private telegram description"}'
+            failure = urllib.error.HTTPError(
+                "https://api.telegram.org/botsecret-token/sendMessage",
+                status, "private response text", {}, BytesIO(body),
+            )
+            with self.subTest(status=status), patch(
+                "tools.folketinget_snapshot_alert.urllib.request.urlopen", side_effect=failure
+            ):
+                with self.assertRaisesRegex(AlertError, f"telegram_http_{status}") as raised:
+                    send_telegram("safe", "secret-token", "private-chat")
+                self.assertNotIn("private", str(raised.exception))
+                self.assertNotIn("secret-token", str(raised.exception))
+
+    def test_telegram_http_5xx_is_bounded_category(self):
+        failure = urllib.error.HTTPError("https://api.telegram.org/botsecret/sendMessage", 503,
+                                         "private description", {}, BytesIO(b"secret body"))
+        with patch("tools.folketinget_snapshot_alert.urllib.request.urlopen", side_effect=failure):
+            with self.assertRaisesRegex(AlertError, "telegram_http_5xx"):
+                send_telegram("safe", "secret", "chat")
+
+    def test_telegram_transport_error_has_safe_category(self):
+        with patch("tools.folketinget_snapshot_alert.urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("private network detail")):
+            with self.assertRaisesRegex(AlertError, "telegram_transport_failed"):
+                send_telegram("safe", "token", "chat")
+
     def test_workflow_is_scoped_to_scheduled_target_and_configured_secrets(self):
         workflow = Path(".github/workflows/folketinget-snapshot-alert.yml").read_text(encoding="utf-8")
         self.assertIn('workflows: ["Folketinget snapshot incremental"]', workflow)
@@ -113,10 +142,33 @@ class FolketingetSnapshotAlertTests(unittest.TestCase):
                                side_effect=urllib.error.URLError("private transport details")), \
              patch("sys.stdout", stdout), patch("sys.stderr", stderr):
             self.assertEqual(main(), 1)
-        self.assertIn("category=telegram_request_failed", stderr.getvalue())
+        self.assertIn("category=telegram_transport_failed", stderr.getvalue())
         self.assertNotIn(token, stdout.getvalue() + stderr.getvalue())
         self.assertNotIn(chat_id, stdout.getvalue() + stderr.getvalue())
         self.assertNotIn("private transport details", stdout.getvalue() + stderr.getvalue())
+
+    def test_http_error_logs_only_status_category(self):
+        token = "secret-bot-token-fixture"
+        chat_id = "private-chat-fixture"
+        body = b'{"ok":false,"description":"private telegram description"}'
+        failure = urllib.error.HTTPError(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            401, "private exception text", {}, BytesIO(body),
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "INPUT_CONFIRM_TEST_ALERT": "true",
+            "TELEGRAM_BOT_TOKEN": token,
+            "TELEGRAM_OPERATIONAL_ALERT_CHAT_ID": chat_id,
+        }, clear=False), patch("tools.folketinget_snapshot_alert.urllib.request.urlopen",
+                               side_effect=failure), patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            self.assertEqual(main(), 1)
+        output = stdout.getvalue() + stderr.getvalue()
+        self.assertIn("category=telegram_http_401", output)
+        for private_value in (token, chat_id, "private telegram description", "private exception text"):
+            self.assertNotIn(private_value, output)
 
     def test_event_file_is_bounded_and_parsed(self):
         with tempfile.TemporaryDirectory() as directory:

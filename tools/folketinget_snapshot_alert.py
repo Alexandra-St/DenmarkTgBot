@@ -97,8 +97,17 @@ def send_telegram(message: str, token: str, chat_id: str) -> None:
                 raise AlertError("telegram_request_failed")
     except AlertError:
         raise
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise AlertError("telegram_request_failed") from exc
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        if status in (400, 401, 403, 429):
+            category = f"telegram_http_{status}"
+        elif isinstance(status, int) and 500 <= status <= 599:
+            category = "telegram_http_5xx"
+        else:
+            category = "telegram_http_error"
+        raise AlertError(category) from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise AlertError("telegram_transport_failed") from None
     try:
         result = json.loads(raw)
     except Exception as exc:
