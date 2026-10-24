@@ -220,7 +220,7 @@ class BackupPocSafetyTests(unittest.TestCase):
                 {"source": "folketinget", "historical": False, "notify_eligible": None,
                  "title": "Fordrevne fra Ukraine"},
                 {"source": "folketinget", "historical": False, "notify_eligible": None,
-                 "title": "Ændring af udlændingeloven om opholdstilladelse"},
+                 "title": "Ændring af udlændingeloven om opholdstilladelse for ukrainere"},
                 {"source": "folketinget", "historical": False, "notify_eligible": None,
                  "title": "PRIVATE IRRELEVANT TITLE"},
             ]
@@ -228,7 +228,7 @@ class BackupPocSafetyTests(unittest.TestCase):
             classification = result["classification"]
             self.assertEqual(classification["relevance_counts"], {"DIRECT": 1, "POTENTIAL": 1, "IRRELEVANT": 1})
             self.assertEqual(classification["classified_case_count"], 3)
-            self.assertEqual(classification["ruleset_version"], "1.1")
+            self.assertEqual(classification["ruleset_version"], "1.2")
             output = StringIO()
             with redirect_stdout(output):
                 POC.write_candidate_classification_summary(result)
@@ -307,7 +307,7 @@ class BackupPocSafetyTests(unittest.TestCase):
     def test_snapshot_ingestion_preparation_uses_existing_classifier_and_record_contract(self) -> None:
         cases = [
             self._ingestion_case(101, "Fordrevne fra Ukraine"),
-            self._ingestion_case(102, "Ændring af udlændingeloven om opholdstilladelse"),
+            self._ingestion_case(102, "Ændring af udlændingeloven om opholdstilladelse for ukrainere"),
             self._ingestion_case(103, "Vejlov om vejvedligeholdelse"),
         ]
         with tempfile.TemporaryDirectory() as temp:
@@ -317,7 +317,7 @@ class BackupPocSafetyTests(unittest.TestCase):
             self.assertEqual(ingestion["relevance_counts"], {"DIRECT": 1, "POTENTIAL": 1, "IRRELEVANT": 1})
             self.assertEqual(ingestion["complete_candidate_count"], 3)
             self.assertEqual(ingestion["incomplete_candidate_count"], 0)
-            self.assertEqual(ingestion["ruleset_version"], "1.1")
+            self.assertEqual(ingestion["ruleset_version"], "1.2")
 
     def test_snapshot_ingestion_preparation_batches_more_than_50_records(self) -> None:
         cases = [self._ingestion_case(index + 1, f"Vejlov {index + 1}") for index in range(51)]

@@ -204,7 +204,7 @@ class CollectionTests(unittest.TestCase):
             return sample_feed()
 
         with self.assertLogs("collectors.main", level="ERROR"):
-            output, has_failures = collect(feeds, fetcher)
+            output, has_failures = collect(feeds, fetcher, evidence_fetcher=Mock(side_effect=RuntimeError("offline fixture")))
         self.assertTrue(has_failures)
         self.assertEqual(output["feeds"]["ok"]["status"], "success")  # type: ignore[index]
         self.assertEqual(output["feeds"]["failed"]["status"], "unavailable")  # type: ignore[index]

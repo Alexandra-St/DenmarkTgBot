@@ -7,7 +7,9 @@ import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Mapping
 
-RULESET_VERSION = "1.1"
+from collectors.hearing_evidence import DRAFT_NEW_PROVISIONS
+
+RULESET_VERSION = "1.2"
 DIRECT = "DIRECT"
 POTENTIAL = "POTENTIAL"
 IRRELEVANT = "IRRELEVANT"
@@ -71,12 +73,15 @@ _DIRECT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("direct.displaced_from_ukraine", _compile(r"\bperson(?:er|en)?\s+(?:der\s+er\s+)?fordrevet\s+fra\s+ukraine\b")),
     ("direct.displaced_from_ukraine", _compile(r"\bukrainske\s+fordrevne\b")),
     ("direct.displaced_from_ukraine", _compile(r"\bfordrevne\s+ukrainere?\b")),
+    ("direct.ukrainian_refugees", _compile(r"\bukrainsk(?:e)?\s+flygtning(?:e|en|es|ens|ene|enes)?\b")),
+    ("direct.ukrainian_refugees", _compile(r"\bflygtning(?:e|en|ene)?\s+fra\s+ukraine\b")),
 )
 _UKRAINIAN = _compile(r"\bukrain\w*\b")
 _TEMP_PROTECTION = _compile(r"\bmidlertidig\s+beskyttelse\b")
 
 _POPULATION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    _compile(r"\budlænding\w*\b"),
+    # Inflections of people, excluding compounds such as udlændingeloven.
+    _compile(r"\budlænding(?:e|en|es|ens|ene|enes|s)?\b"),
     _compile(r"\b(?:flygtning|flygtninge|flygtningens|flygtningenes)\b"),
     _compile(r"\bfordrevne?\b"),
     _compile(r"\basylansøger\w*\b"),
@@ -136,7 +141,7 @@ _POTENTIAL_REASONS = {
     "potential.housing_displaced_population": "Housing or accommodation provisions concern displaced people or foreigners.",
     "potential.family_reunification": "Family reunification or family residence rules may be relevant.",
     "potential.education_displaced_population": "Education access provisions concern displaced people or foreigners.",
-    "potential.temporary_protection_general": "Temporary protection rules may concern displaced people even without a Ukraine-specific reference.",
+    "potential.temporary_protection_general": "Temporary protection wording is linked to Ukraine-specific context.",
 }
 
 
@@ -154,6 +159,13 @@ def _publication_texts(record: Mapping[str, object]) -> list[tuple[str, str, str
             for item in collection:
                 mapped = _as_mapping(item)
                 add(f"{field}.title", mapped.get("title"))
+    # Attachment provenance is never flattened into content_text. Current-law and
+    # other attachments cannot promote a proposed change.
+    if record.get("source") == "hoeringsportalen":
+        fragments = record.get("evidence_fragments")
+        for fragment in fragments if isinstance(fragments, (list, tuple)) else ():
+            if isinstance(fragment, Mapping) and fragment.get("kind") == DRAFT_NEW_PROVISIONS:
+                add("evidence.DRAFT_NEW_PROVISIONS", fragment.get("text"))
     return texts
 
 
@@ -178,108 +190,192 @@ def _matched_direct(text: str) -> list[str]:
     return matches
 
 
-def _potential_matches(text: str) -> list[str]:
+def _target_context(text: str) -> bool:
+    # Bare særloven is ambiguous (e.g. Afghanistansærloven). Do not infer Ukraine.
+    return bool(_UKRAINIAN.search(text))
+
+
+def _child_evidence_scope(record: Mapping[str, object], primary_text: str) -> str:
+    """Require a topical bridge before a child can classify an entire Sag."""
+    if record.get("source") != "folketinget":
+        return "topical"
+    title = normalize_text(record.get("title")) if isinstance(record.get("title"), str) else ""
+    if record.get("type_id") == 4 or re.fullmatch(r"[a-zæøå]+ alm del(?: .*)?", title):
+        return "mixed"
+    unrelated_subjects = (
+        _compile(r"\badopter\w*\b"),
+        *_NEGATIVE_RULES[0][1],
+        _compile(r"\b(?:vejlov\w*|trafik\w*|jernbane\w*|togdrift\w*|boligbyggeri\w*|uddannelsespolitik\w*)\b"),
+    )
+    if _has(unrelated_subjects, primary_text):
+        return "none"
+    if record.get("type_id") == 6 or re.search(r"\brådsmøde\w*\b|\bfinanslov\w*\b", title):
+        return "mixed"
+    generic_case = re.fullmatch(r"(?:forslag|udkast)(?: til lov)?(?: om(?: ændrede| nye)? regler)?", title)
+    if (generic_case or _target_context(primary_text)
+            or any(_has(patterns, primary_text) for patterns in _TOPICS.values())
+            or re.search(r"\bopholdsreg(?:el|ler)\w*\b", primary_text)):
+        return "topical"
+    return "none"
+
+
+def _potential_matches(text: str, *, target_context: bool = False) -> list[str]:
     population = _has(_POPULATION_PATTERNS, text)
+    target_context = target_context or _target_context(text)
     matched: list[str] = []
     for topic, patterns in _TOPICS.items():
         if not _has(patterns, text):
             continue
-        if topic == "residence":
-            # These legal domains are specifically immigration/residence
-            # measures even when a short title omits the affected population.
+        if topic == "residence" and target_context:
             matched.append("potential.residence_immigration_law")
-        elif topic == "work" and population:
+        elif topic == "work" and population and target_context:
             matched.append("potential.work_foreign_population")
-        elif topic == "social_support" and (population or _has((_compile(r"\bintegrationsydelse\w*\b"),), text)):
+        elif topic == "social_support" and target_context and (population or _has((_compile(r"\bintegrationsydelse\w*\b"),), text)):
             matched.append("potential.social_support_targeted")
-        elif topic == "integration" and population:
+        elif topic == "integration" and population and target_context:
             matched.append("potential.integration_targeted")
-        elif topic == "housing" and population:
+        elif topic == "housing" and population and target_context:
             matched.append("potential.housing_displaced_population")
-        elif topic == "family":
+        elif topic == "family" and target_context:
             matched.append("potential.family_reunification")
-        elif topic == "education" and population:
+        elif topic == "education" and population and target_context:
             matched.append("potential.education_displaced_population")
-    if _TEMP_PROTECTION.search(text) and population:
+    if _TEMP_PROTECTION.search(text) and target_context:
         matched.append("potential.temporary_protection_general")
     return matched
 
 
+def _scope_exclusion(record: Mapping[str, object], primary: str) -> str | None:
+    """Positive evidence of another jurisdiction/regime, never absence of a keyword."""
+    if record.get("source") != "folketinget":
+        return None
+    title = normalize_text(record.get("title")) if isinstance(record.get("title"), str) else ""
+    strong = _matched_direct(primary)
+    if not strong:
+        if re.search(r"\bafghanistansærlov\w*\b", title) and not _UKRAINIAN.search(primary):
+            child_titles = " ".join(str(item.get("title") or "") for key in ("documents", "stages")
+                                    for item in record.get(key, ()) or () if isinstance(item, Mapping))
+            if not _UKRAINIAN.search(normalize_text(child_titles)):
+                return "negative.other_protection_regime"
+        if (re.search(r"\b(?:for grønland|i grønland|grønlandske)\b", title)
+                and not re.search(r"\bdanmark\b", title) and not re.search(r"\b1\s+.*\b2\b", title)):
+            return "negative.greenland_specific_regime"
+        syrian_subject = re.search(r"\bsyriske (?:flygtninge|asylansøgere|statsborgere)\b|\b(?:syrere|syrer|syrien)\b", title)
+        # A country mentioned as one example in a general programme is not its scope.
+        if (syrian_subject and not _UKRAINIAN.search(primary)
+                and not re.search(r"\bf eks\b|\beksempelvis\b", title)
+                and (record.get("type_id") in (9, 10) or title.startswith("om ")
+                     or title.startswith("midlertidig beskyttelse for syriske"))):
+            return "negative.other_protection_regime"
+        if (re.search(r"\bpermanent(?:e)? ophold\w*\b", title)
+                and re.search(r"\bfængselsstraf\w*|\bkriminalitet\b|\bdomfæld\w*", title)
+                and not _UKRAINIAN.search(primary)):
+            return "negative.permanent_residence_conviction"
+        dates = [item.get("date_raw") for item in record.get("stages", ()) or () if isinstance(item, Mapping)]
+        years = [int(value[:4]) for value in dates if isinstance(value, str) and re.match(r"^\d{4}-\d{2}-\d{2}", value)]
+        individual_scheme = (re.search(r"\b(?:praktikant\w*|praktikophold\w*)\b", title)
+                             or (re.search(r"\bsagsbehandling\b", title)
+                                 and re.search(r"\b(?:udvises|udvist|sagen|familien)\b", title)))
+        if record.get("type_id") == 10 and individual_scheme and years and min(years) < 2022:
+            return "negative.pre_temporary_protection_individual_question"
+    if not strong or all(rule != "direct.ukraine_special_law" for rule in strong):
+        unrelated = re.search(r"\badopter\w*\b|\bmilitær\w* (?:bidrag|støtte|bistand)\b|\b(?:vejlov\w*|jernbane\w*|togdrift\w*)\b", title)
+        if unrelated and not strong:
+            return "negative.unrelated_case_subject"
+    return None
+
+
+def _broad_scope(text: str) -> bool:
+    population = _has(_POPULATION_PATTERNS, text)
+    migration_context = population or bool(re.search(r"\b(?:udlænding\w*|flygtning\w*|ophold\w*|ukrain\w*)\b", text))
+    return (_has(_TOPICS["residence"] + _TOPICS["family"] + _TOPICS["work"], text)
+            or bool(_TEMP_PROTECTION.search(text))
+            or (migration_context and any(_has(patterns, text) for patterns in _TOPICS.values()))
+            or bool(re.search(r"\bintegrationsydelse\w*\b", text)))
+
+
 def classify(publication: object) -> RelevanceResult:
-    """Classify a Høringsportalen consultation or normalized Folketinget case."""
+    """Screen with provenance, explicit scope exclusions and conservative uncertainty."""
     record = _as_mapping(publication)
     texts = _publication_texts(record)
-    primary = [item for item in texts if item[0] in {"title", "content_text", "stages.title"}]
-    documents = [item for item in texts if item[0] == "documents.title"]
-    primary_direct = [(field, rule) for field, _, text in primary for rule in _matched_direct(text)]
-    document_direct = [(field, rule) for field, _, text in documents for rule in _matched_direct(text)]
-
-    negative_rules: list[str] = []
-    title_context = normalize_text(record.get("title")) if isinstance(record.get("title"), str) else ""
+    primary = [item for item in texts if item[0] in {"title", "content_text"}]
+    drafts = [item for item in texts if item[0] == "evidence.DRAFT_NEW_PROVISIONS"]
+    children = [item for item in texts if item[0] in {"documents.title", "stages.title"}]
     primary_context = " ".join(text for _, _, text in primary)
+    # One child's words cannot establish scope for unrelated siblings.
+    primary_direct = [(field, rule) for field, _, text in primary for rule in _matched_direct(text)]
+    # A comparison is not an assertion that the proposed change applies to this group.
+    comparative = re.compile(r"\bpå lige fod med\b|\bsammenlignet med\b|\bi modsætning til\b|\btil forskel fra\b")
+    child_direct = [(field, rule) for field, _, text in children
+                    if not comparative.search(text) for rule in _matched_direct(text)]
+    child_target = [(field, "potential.child_target_context") for field, _, text in children if _target_context(text)]
+    draft_direct = [(field, rule) for field, _, text in drafts for rule in _matched_direct(text)]
+    negative_rules: list[str] = []
     if _UKRAINIAN.search(primary_context) and _has(_NEGATIVE_RULES[0][1], primary_context):
         negative_rules.append(_NEGATIVE_RULES[0][0])
     for rule_id, patterns in _NEGATIVE_RULES[1:]:
         if _has(patterns, primary_context):
             negative_rules.append(rule_id)
-
-    has_population = _has(_POPULATION_PATTERNS, title_context)
-    clear_unrelated_title = _has((
-        _compile(r"\bvejlov\w*\b"), _compile(r"\btrafik\w*\b"), _compile(r"\bjernbane\w*\b"),
-        _compile(r"\btogdrift\w*\b"), _compile(r"\bboligbyggeri\w*\b"), _compile(r"\buddannelsespolitik\w*\b"),
-    ), title_context)
-    unrelated_primary = bool(
-        (_UKRAINIAN.search(title_context) and _has(_NEGATIVE_RULES[0][1], title_context))
-        or (clear_unrelated_title and not has_population)
-    )
+    child_scope = _child_evidence_scope(record, primary_context)
+    container = (record.get("type_id") == 4 or bool(re.fullmatch(r"[a-zæøå]+ alm del(?: .*)?", normalize_text(str(record.get("title") or "")))))
+    exclusion = None if container else _scope_exclusion(record, primary_context)
+    if child_scope == "none" and not exclusion:
+        child_scope = "uncertain"
+    # An explicitly unrelated substantive title cannot inherit a comparison in a child.
+    if child_scope == "none" and (child_direct or child_target):
+        negative_rules.append("negative.child_evidence_outside_case_scope")
     direct_matches = primary_direct[:]
-    suppressed_document_direct = bool(document_direct and not direct_matches and unrelated_primary)
-    if document_direct and not unrelated_primary:
-        direct_matches.extend(document_direct)
-
+    if _target_context(primary_context):
+        direct_matches.extend(draft_direct)
+    title = normalize_text(record.get("title")) if isinstance(record.get("title"), str) else ""
+    generic = re.fullmatch(r"(?:forslag|udkast)(?: til lov)?(?: om(?: ændrede| nye)? regler)?|forslag om (?:ændrede|nye) opholdsregler", title)
+    if child_scope == "topical" and (generic or _target_context(primary_context)):
+        direct_matches.extend(child_direct)
+    mixed = (child_scope == "mixed" or (record.get("source") == "folketinget"
+             and record.get("type_id") == 9 and _has(_NEGATIVE_RULES[0][1], primary_context)))
     diagnostics: list[object] = []
     rules: list[str] = []
     evidence_fields: list[str] = []
-    if direct_matches:
+    allowed = primary + drafts + (children if child_scope != "none" else [])
+    potential = [(field, rule) for field, _, text in allowed
+                 for rule in _potential_matches(text, target_context=_target_context(primary_context))]
+    relevant_child = (child_direct + child_target) if child_scope != "none" else []
+    relevant_child += draft_direct
+    uncertain = [(field, text) for field, _, text in allowed if _broad_scope(text)]
+    if container and record.get("complete") is False and not uncertain:
+        uncertain = [("case.graph", "")]
+    if exclusion:
+        relevance = IRRELEVANT
+        reason = "Available evidence establishes a different subject, jurisdiction or legal regime."
+        rules.append(exclusion)
+    elif direct_matches and not mixed:
         relevance = DIRECT
-        first_rule = direct_matches[0][1]
-        reason = (
-            "Explicit reference to Ukrainesærloven or Ukraine-specific protection."
-            if first_rule == "direct.ukraine_special_law"
-            else "Explicit reference to people displaced from Ukraine or their protection."
-        )
+        reason = "Explicit Ukraine-specific protection evidence within the publication scope."
         rules.extend(rule for _, rule in direct_matches)
         evidence_fields.extend(field for field, _ in direct_matches)
+    elif direct_matches or relevant_child:
+        relevance = POTENTIAL
+        reason = "Target-specific evidence belongs to a mixed or not fully resolved case scope."
+        rules.append("potential.mixed_case_target_context" if mixed else "potential.child_target_context")
+        evidence_fields.extend(field for field, _ in direct_matches + relevant_child)
+    elif potential:
+        relevance = POTENTIAL
+        rules.extend(rule for _, rule in potential)
+        evidence_fields.extend(field for field, _ in potential)
+        reason = _POTENTIAL_REASONS[potential[0][1]]
+    elif uncertain:
+        relevance = POTENTIAL
+        reason = "Insufficient scope evidence to confirm or exclude applicability to the target group."
+        rules.append("potential.insufficient_scope_evidence")
+        diagnostics.append("insufficient_scope_evidence")
+        evidence_fields.extend(field for field, _ in uncertain)
+    elif not texts:
+        relevance = IRRELEVANT
+        reason = "Insufficient publication text for assessment."
+        diagnostics.append("insufficient_information")
     else:
-        allowed_texts = texts
-        if unrelated_primary:
-            allowed_texts = [item for item in texts if item[0] not in {"documents.title"}]
-        potential = [(field, rule) for field, _, text in allowed_texts for rule in _potential_matches(text)]
-        if suppressed_document_direct:
-            relevance = POTENTIAL
-            reason = "A related document has direct evidence, but the case title points to an unrelated subject; review the conflict."
-            rules.extend(rule for _, rule in document_direct)
-            rules.extend(("potential.conflicting_context_review", "negative.unrelated_primary_context", "negative.document_direct_suppressed"))
-            evidence_fields.extend(field for field, _ in document_direct)
-            diagnostics.append({
-                "code": "conflicting_context",
-                "message": "Direct document evidence conflicts with an unrelated primary title; classified POTENTIAL for review.",
-                "positive_rules": list(dict.fromkeys(rule for _, rule in document_direct)),
-                "negative_rules": list(dict.fromkeys([*negative_rules, "negative.unrelated_primary_context", "negative.document_direct_suppressed"])),
-                "evidence_fields": ["title", "documents.title"],
-            })
-        elif potential:
-            relevance = POTENTIAL
-            rules.extend(rule for _, rule in potential)
-            evidence_fields.extend(field for field, _ in potential)
-            reason = _POTENTIAL_REASONS[potential[0][1]]
-        elif not texts:
-            relevance = IRRELEVANT
-            reason = "Insufficient publication text for assessment."
-            diagnostics.append("insufficient_information")
-        else:
-            relevance = IRRELEVANT
-            reason = "No configured relevance rule matched the available publication text."
+        relevance = IRRELEVANT
+        reason = "No configured relevance rule matched the available publication text."
 
     rules.extend(negative_rules)
     matched_rules = tuple(dict.fromkeys(rules))

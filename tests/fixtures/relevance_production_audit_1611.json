@@ -1,0 +1,286 @@
+[
+  {
+    "name": "folketinget_101703",
+    "source_url": "https://oda.ft.dk/api/Sag(101703)",
+    "evidence_provenance": "Production title; official SagDokument title lookups from the 2026-10-24 read-only audit. Relationships are an evidence subset, not a complete source graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "101703",
+      "title": "Forslag til lov om ændring af lov om aktiv socialpolitik. (Ligestilling af adopterede fra udlandet med personer født her i riget i forhold til opholds- og beskæftigelseskravene).",
+      "type_id": 3,
+      "complete": true,
+      "historical": false,
+      "documents": [
+        {
+          "id": 1164906,
+          "title": "Spm., om teknisk bistand til udformning af et ændringsforslag, som sikrer, at personer omfattet af lov om midlertidig opholdstilladelse til personer, der i Afghanistan har bistået danske myndigheder m.v., undtages fra arbejdspligten på lige fod med de fordrevne fra Ukraine"
+        },
+        {
+          "id": 1167556,
+          "title": "L 208 - svar på spm. 6 om teknisk bistand til udformning af et ændringsforslag, som sikrer, at personer omfattet af lov om midlertidig opholdstilladelse til personer, der i Afghanistan har bistået danske myndigheder m.v., undtages fra arbejdspligten på lige fod med de fordrevne fra Ukraine"
+        }
+      ],
+      "stages": []
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "folketinget_12673",
+    "source_url": "https://oda.ft.dk/api/Sag(12673)",
+    "evidence_provenance": "Production title; official SagDokument title lookups from the 2026-10-24 read-only audit. Relationships are an evidence subset, not a complete source graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "12673",
+      "title": "Forslag til folketingsbeslutning om yderligere dansk militært bidrag til støtte for indsatsen mod ISIL.",
+      "type_id": 5,
+      "complete": true,
+      "historical": false,
+      "documents": [
+        {
+          "id": 154307,
+          "title": "Spm. om, hvilke konsekvenser vedtagelsen af B 123 har for danske statsborgere og folk med opholdstilladelse i Danmark, der deltager i kampen på Islamisk Stats side, til justitsministeren"
+        },
+        {
+          "id": 154578,
+          "title": "Svar på B 123 - spm. 18 om, hvilke konsekvenser vedtagelsen af B 123 har for danske statsborgere og folk med opholdstilladelse i Danmark, der deltager i kampen på Islamisk Stats side, fra justitsministeren"
+        },
+        {
+          "id": 154629,
+          "title": "Samrådsspm. om en redegørelse for, om straffelovens paragraf 101 og 102 m.fl. (\"landssvigerparagrafferne\") finder anvendelse overfor de jihadister med dansk statsborgerskab eller opholdstilladelse, der kæmper på Islamisk Stats side, til udenrigsministeren og justitsministeren"
+        }
+      ],
+      "stages": []
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "folketinget_97218",
+    "source_url": "https://oda.ft.dk/api/Sag(97218)",
+    "evidence_provenance": "Production title; official SagDokument title lookups from the 2026-10-24 read-only audit. Relationships are an evidence subset, not a complete source graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "97218",
+      "title": "Forslag til folketingsbeslutning om danske militære bidrag til styrkelse af den maritime sikkerhed i og omkring Det Røde Hav.",
+      "type_id": 5,
+      "complete": true,
+      "historical": false,
+      "documents": [
+        {
+          "id": 1082038,
+          "title": "Spm. om artiklen ”Etbenet pirat har fået dansk opholdstilladelse” på tv2.dk og i den forbindelse, om retstilstanden i dag er den samme for evt. tilfangetagne modstandere, der bringes til Danmark"
+        },
+        {
+          "id": 1083128,
+          "title": "B 103 - svar på spm. 20 om artiklen ”Etbenet pirat har fået dansk opholdstilladelse” på tv2.dk og i den forbindelse, om retstilstanden i dag er den samme for evt. tilfangetagne modstandere, der bringes til Danmark"
+        }
+      ],
+      "stages": []
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "folketinget_97251",
+    "source_url": "https://oda.ft.dk/api/Sag(97251)",
+    "evidence_provenance": "Production title; official SagDokument title lookups from the 2026-10-24 read-only audit. Relationships are an evidence subset, not a complete source graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "97251",
+      "title": "Forslag til folketingsbeslutning om dansk militært bidrag til den amerikanskledede indsats for at begrænse trusler mod den maritime sikkerhed i og omkring Det Røde Hav.",
+      "type_id": 5,
+      "complete": true,
+      "historical": false,
+      "documents": [
+        {
+          "id": 1082022,
+          "title": "Spm. om ved kommende militære aktiviteter i Det Røde Hav at undgå situationer som den med den etbenede pirat Lucky, der fik opholdstilladelse"
+        },
+        {
+          "id": 1082152,
+          "title": "B 104 - svar på spm. 17 om ved kommende militære aktiviteter i Det Røde Hav at undgå situationer som den med den etbenede pirat Lucky, der fik opholdstilladelse"
+        }
+      ],
+      "stages": []
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "folketinget_106402",
+    "source_url": "https://oda.ft.dk/api/Sag(106402)",
+    "evidence_provenance": "Production title; official SagDokument title lookups from the 2026-10-24 read-only audit. Relationships are an evidence subset, not a complete source graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "106402",
+      "title": "Hvad er ministerens holdning til at udelukke udlændinge, som er idømt betinget eller ubetinget fængselsstraf eller en lignende foranstaltning, fra at få permanent opholdstilladelse?",
+      "type_id": 10,
+      "complete": true,
+      "historical": false,
+      "documents": [],
+      "stages": []
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "folketinget_91896",
+    "source_url": "https://oda.ft.dk/api/Sag(91896)",
+    "evidence_provenance": "Production title; official SagDokument title lookups from the 2026-10-24 read-only audit. Relationships are an evidence subset, not a complete source graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "91896",
+      "title": "Er ministeren enig i, at det er dybt uhensigtsmæssigt, at danske virksomheder mangler arbejdskraft og står med åbne arme for at tage imod ukrainske flygtninge, mens lange ventetider hos myndighederne spænder ben for arbejdstilladelser?",
+      "type_id": 10,
+      "complete": true,
+      "historical": false,
+      "documents": [],
+      "stages": []
+    },
+    "expected": "DIRECT"
+  },
+  {
+    "name": "folketinget_92153",
+    "source_url": "https://oda.ft.dk/api/Sag(92153)",
+    "evidence_provenance": "Production title; official SagDokument title lookups from the 2026-10-24 read-only audit. Relationships are an evidence subset, not a complete source graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "92153",
+      "title": "Er ministeren enig i, at der fortsat er store udfordringer med lange ventetider for udstedelse af opholdstilladelser til ukrainske flygtninge?",
+      "type_id": 10,
+      "complete": true,
+      "historical": false,
+      "documents": [],
+      "stages": []
+    },
+    "expected": "DIRECT"
+  },
+  {
+    "name": "folketinget_97183",
+    "source_url": "https://oda.ft.dk/api/Sag(97183)",
+    "evidence_provenance": "Production title; official SagDokument title lookups from the 2026-10-24 read-only audit. Relationships are an evidence subset, not a complete source graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "97183",
+      "title": "Mener ministeren, at ukrainske flygtninge ikke skal have adgang til eget bad og toilet på kommunal indkvartering for flygtninge og at det er rimeligt, at man fraviger fra FN’s standarder for indkvartering af ukrainske flygtninge?",
+      "type_id": 10,
+      "complete": true,
+      "historical": false,
+      "documents": [],
+      "stages": []
+    },
+    "expected": "DIRECT"
+  },
+  {
+    "name": "folketinget_1227",
+    "source_url": "https://oda.ft.dk/api/Sag(1227)",
+    "evidence_provenance": "Actual official primary title and stage date/title projection from Phase1.61.3; not a full case graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "1227",
+      "title": "Forslag til lov for Grønland om udlændinges adgang til opholds- og arbejdstilladelse i anlægsfasen af et storskalaprojekt.",
+      "type_id": 3,
+      "complete": true,
+      "stages": [
+        {
+          "title": "Fremsættelse",
+          "date_raw": "2014-05-09T10:00:00"
+        },
+        {
+          "title": "Lovforslag som fremsat",
+          "date_raw": "2014-05-09T00:00:00"
+        },
+        {
+          "title": "1. behandling",
+          "date_raw": "2014-05-20T13:00:00"
+        },
+        {
+          "title": "Betænkning",
+          "date_raw": "2014-06-02T00:00:00"
+        },
+        {
+          "title": "2. behandling",
+          "date_raw": "2014-06-04T13:00:00"
+        },
+        {
+          "title": "3. behandling",
+          "date_raw": "2014-06-11T09:00:00"
+        },
+        {
+          "title": "Lovforslag som vedtaget",
+          "date_raw": "2014-06-11T00:00:00"
+        },
+        {
+          "title": "(Omtrykt)",
+          "date_raw": "2014-06-03T00:00:00"
+        }
+      ]
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "folketinget_52216",
+    "source_url": "https://oda.ft.dk/api/Sag(52216)",
+    "evidence_provenance": "Actual official primary title and stage date/title projection from Phase1.61.3; not a full case graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "52216",
+      "title": "Vil ministeren kommentere Fagbladet 3F´s reportager om misbruget af fattige udlændinge – især fra Ukraine – som praktikanter i Danmark efter udlændingelovens bestemmelser om praktikophold for uddannelsessøgende, idet det af Fagbladet 3F fremgår, at fagforbundet 3F gentagne gange har gjort Udlændingeservice opmærksom på, at ordningen udelukkendes anvendes til at fremskaffe billig arbejdskraft og ikke til uddannelsesformål?",
+      "type_id": 10,
+      "complete": true,
+      "stages": [
+        {
+          "title": "Anmeldelse",
+          "date_raw": "2007-09-14T00:00:00"
+        },
+        {
+          "title": "Skriftlig besvarelse",
+          "date_raw": "2007-09-21T00:00:00"
+        }
+      ]
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "folketinget_52562",
+    "source_url": "https://oda.ft.dk/api/Sag(52562)",
+    "evidence_provenance": "Actual official primary title and stage date/title projection from Phase1.61.3; not a full case graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "52562",
+      "title": "Finder statsministeren det acceptabelt for et retssamfund som Danmark, at det er omtale i pressen, der er afgørende for, om udlændinge udvises af Danmark, og hvilke initiativer vil statsministeren tage for at sikre, at udlændinge, der søger opholds- og arbejdstilladelse, får en sagsbehandling, så der kan være tillid til Danmark som retssamfund?",
+      "type_id": 10,
+      "complete": true,
+      "stages": [
+        {
+          "title": "Anmeldelse",
+          "date_raw": "2007-10-15T00:00:00"
+        },
+        {
+          "title": "Skriftlig besvarelse",
+          "date_raw": "2007-10-22T00:00:00"
+        }
+      ]
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "folketinget_92060",
+    "source_url": "https://oda.ft.dk/api/Sag(92060)",
+    "evidence_provenance": "Actual official primary title and stage date/title projection from Phase1.61.3; not a full case graph.",
+    "record": {
+      "source": "folketinget",
+      "external_id": "92060",
+      "title": "Folketinget konstaterer, at flygtninge har krav på ophold i Danmark, så længe de opfylder betingelserne herfor, og at de skal rejse hjem, så snart kriterierne for hjemsendelse er opfyldt. \n\nFolketinget ønsker, at det så vidt muligt sikres, at midlertidig beskyttelse ikke udvikler sig til de facto permanent ophold. \n\nFolketinget ønsker endvidere at styrke repatrieringsordningen, så flere syrere kan få hjælp til frivillig hjemrejse.",
+      "type_id": 9,
+      "complete": true,
+      "stages": [
+        {
+          "title": "Fremsættelse",
+          "date_raw": "2022-04-28T00:00:00"
+        },
+        {
+          "title": "Behandling",
+          "date_raw": "2022-05-03T00:00:00"
+        }
+      ]
+    },
+    "expected": "IRRELEVANT"
+  }
+]

@@ -44,6 +44,8 @@ jobs:
           CONFIRM_PRODUCTION_INGESTION: ${{ inputs.confirm_production_ingestion }}
           HOERINGSPORTALEN_AUTOMATION_ENABLED: ${{ vars.HOERINGSPORTALEN_AUTOMATION_ENABLED }}
         run: python -m collectors.workflow_support gate
+      - name: Install text-only hearing evidence parser
+        run: python -m pip install -r collectors/requirements.txt
       - name: Collect both official feeds
         id: collect
         continue-on-error: true

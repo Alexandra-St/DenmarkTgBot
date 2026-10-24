@@ -1,0 +1,2 @@
+# Text extraction only; no OCR. Required by hearing_evidence.
+pypdf==6.21.2

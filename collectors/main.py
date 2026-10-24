@@ -8,6 +8,8 @@ import logging
 import sys
 from collections.abc import Callable, Sequence
 
+from collectors.hearing_evidence import enrich_hearing
+
 from collectors.hoeringsportalen import (
     FEEDS,
     FeedConfig,
@@ -26,6 +28,7 @@ Fetcher = Callable[[FeedConfig], bytes]
 def collect(
     feeds: Sequence[FeedConfig] = FEEDS,
     fetcher: Fetcher | None = None,
+    evidence_fetcher: Callable | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Fetch all configured feeds and return JSON-ready partial results."""
     retrieve = fetcher or fetch_feed
@@ -88,7 +91,8 @@ def collect(
         "duplicate_entries_merged": len(all_entries) - len(publications),
     }
     result: dict[str, object] = {
-        "publications": [item.to_dict() for item in publications],
+        "publications": [enrich_hearing(item.to_dict(), **({"fetcher": evidence_fetcher} if evidence_fetcher else {}))
+                         for item in publications],
         "feeds": feed_report,
     }
     return result, any_failed

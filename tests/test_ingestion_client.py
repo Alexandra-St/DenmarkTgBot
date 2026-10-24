@@ -89,7 +89,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result["source_metadata"]["feed_codes"], ["immigration_ministry", "immigration_category"])
         self.assertEqual(result["source_updated_at_raw"], "2026-10-16T10:11:12.123456+00:00")
         self.assertEqual(result["normalized_snapshot"]["content_text"], "Proposed changes")
-        self.assertEqual(result["ruleset_version"], "1.1")
+        self.assertEqual(result["ruleset_version"], "1.2")
 
     def test_oda_raw_offset_free_update_is_preserved_but_not_converted_to_utc(self):
         row = prepare_records(oda_output(), "folketinget", "incremental")[0]

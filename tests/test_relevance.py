@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from collectors.relevance import DIRECT, IRRELEVANT, POTENTIAL, classify, normalize_text
+from collectors.relevance import DIRECT, IRRELEVANT, POTENTIAL, RULESET_VERSION, classify, normalize_text
 from collectors.relevance_batch import evaluate, main as batch_main
 from collectors.hoeringsportalen import Consultation
 from collectors.folketinget_models import CaseStatus, CaseStage, LegislativeCase
@@ -52,32 +52,170 @@ class RelevanceTests(unittest.TestCase):
         self.assertEqual(result.relevance, DIRECT)
         self.assertIn("stages.title", result.evidence_fields)
 
-    def test_document_direct_conflict_is_potential_and_structured_for_review(self):
-        for title in ("Dansk militær støtte til Ukraine", "Ændring af vejloven"):
+    def test_unrelated_case_cannot_be_promoted_by_a_direct_child(self):
+        for title in ("Dansk militær støtte til Ukraine", "Ændring af vejloven", "Forslag om adopterede fra udlandet"):
             with self.subTest(title=title):
                 result = classify(publication(title, documents=[{"title": "Ukrainesærloven"}]))
-                self.assertEqual(result.relevance, POTENTIAL)
-                conflict = next(item for item in result.diagnostics if isinstance(item, dict) and item.get("code") == "conflicting_context")
-                self.assertEqual(conflict["positive_rules"], ["direct.ukraine_special_law"])
-                self.assertIn("negative.unrelated_primary_context", conflict["negative_rules"])
-                self.assertIn("negative.document_direct_suppressed", conflict["negative_rules"])
-                self.assertIn("direct.ukraine_special_law", result.matched_rules)
-                self.assertIn("negative.unrelated_primary_context", result.matched_rules)
+                self.assertEqual(result.relevance, IRRELEVANT)
+                self.assertIn("negative.child_evidence_outside_case_scope", result.matched_rules)
+                self.assertNotIn("documents.title", result.evidence_fields)
+                self.assertFalse(any(rule.startswith("direct.") for rule in result.matched_rules))
 
     def test_primary_direct_evidence_still_beats_conflicting_document_context(self):
         result = classify(publication("Ukrainesærloven", documents=[{"title": "Dansk militær støtte til Ukraine"}]))
         self.assertEqual(result.relevance, DIRECT)
         self.assertNotIn("conflicting_context", [item.get("code") for item in result.diagnostics if isinstance(item, dict)])
 
-    def test_general_immigration_rules_are_potential(self):
+    def test_general_immigration_rules_need_target_context(self):
         result = classify(publication("Ændring af udlændingeloven om opholdstilladelser for udlændinge"))
         self.assertEqual(result.relevance, POTENTIAL)
-        self.assertIn("potential.residence_immigration_law", result.matched_rules)
+        self.assertIn("insufficient_scope_evidence", result.diagnostics)
+        self.assertNotIn("potential.residence_immigration_law", result.matched_rules)
+
+    def test_residence_and_family_with_explicit_primary_target_context(self):
+        for topic in ("opholdstilladelse", "udlændingeloven", "familiesammenføring"):
+            with self.subTest(topic=topic):
+                result = classify({"source": "hoeringsportalen", "title": "Regler om " + topic,
+                                   "content_text": "Ordningen omfatter også ukrainere."})
+                self.assertEqual(result.relevance, POTENTIAL)
+        self.assertEqual(classify(publication("Opholdstilladelse ved midlertidig beskyttelse")).relevance, POTENTIAL)
+        self.assertEqual(classify(publication("Opholdstilladelse efter Afghanistansærloven")).relevance, IRRELEVANT)
+
+    def test_population_inflections_are_context_not_standalone_relevance(self):
+        for person in ("udlænding", "udlændinge", "udlændingen", "udlændinges", "udlændingene", "udlændingenes"):
+            with self.subTest(person=person):
+                self.assertEqual(classify(publication(person)).relevance, IRRELEVANT)
+                self.assertEqual(classify(publication("Integrationsprogram for " + person)).relevance, POTENTIAL)
+        self.assertEqual(classify(publication("Integrationsindsats nævnt i udlændingeloven")).relevance, POTENTIAL)
+
+    def test_ukrainian_refugee_inflections_are_direct(self):
+        for phrase in ("ukrainske flygtninge", "ukrainske flygtninges", "den ukrainske flygtning",
+                       "ukrainske flygtningenes", "flygtninge fra Ukraine"):
+            with self.subTest(phrase=phrase):
+                result = classify(publication("Ophold for " + phrase))
+                self.assertEqual(result.relevance, DIRECT)
+                self.assertIn("direct.ukrainian_refugees", result.matched_rules)
+
+    def test_committee_container_caps_child_relevance_at_potential(self):
+        for details in ({"title": "UUI alm. del"}, {"title": "Komitémateriale", "type_id": 4}):
+            with self.subTest(details=details):
+                result = classify({"source": "folketinget", **details,
+                                   "stages": [{"title": "Fordrevne fra Ukraine"}],
+                                   "documents": [{"title": "Ændring af Ukrainesærloven"}]})
+                self.assertEqual(result.relevance, POTENTIAL)
+                self.assertIn("documents.title", result.evidence_fields)
+
+    def test_mixed_case_target_agenda_is_potential(self):
+        result = classify(publication("Rådsmøde om retlige og indre anliggender", type_id=6,
+                                     stages=[{"title": "Den fremtidige juridiske status for fordrevne fra Ukraine"}]))
+        self.assertEqual(result.relevance, POTENTIAL)
+        self.assertIn("potential.mixed_case_target_context", result.matched_rules)
+        self.assertIn("stages.title", result.evidence_fields)
+
+    def test_unrelated_case_ignores_both_potential_and_direct_stage_or_document(self):
+        for kind in ("stages", "documents"):
+            for child_title in ("Ukrainske flygtninge", "Opholdstilladelse for ukrainere"):
+                with self.subTest(kind=kind, child_title=child_title):
+                    result = classify(publication("Forslag om adopterede fra udlandet", **{kind: [{"title": child_title}]}))
+                    self.assertEqual(result.relevance, IRRELEVANT)
+
+    def test_container_without_relevant_or_uncertain_child_is_irrelevant(self):
+        self.assertEqual(classify(publication("TRU alm. del", type_id=4,
+                         documents=[{"title": "Asfaltering af motorveje"}])).relevance, IRRELEVANT)
+        result = classify(publication("UUI alm. del", type_id=4,
+                         documents=[{"title": "Opholdstilladelse"}]))
+        self.assertEqual(result.relevance, POTENTIAL)
+        self.assertIn("insufficient_scope_evidence", result.diagnostics)
+
+    def test_broad_keywords_are_uncertainty_not_confirmed_target_rules(self):
+        for word in ("udlændingeloven", "opholdstilladelse", "familiesammenføring", "Midlertidig beskyttelse"):
+            with self.subTest(word=word):
+                result = classify(publication(word))
+                self.assertEqual(result.relevance, POTENTIAL)
+                self.assertEqual(result.matched_rules, ("potential.insufficient_scope_evidence",))
+                self.assertIn("insufficient_scope_evidence", result.diagnostics)
+
+    def test_syria_and_greenland_are_explicit_scope_exclusions(self):
+        for title in ("Midlertidig beskyttelse for syriske flygtninge i Danmark",
+                      "Lov for Grønland om opholds- og arbejdstilladelse"):
+            with self.subTest(title=title):
+                result = classify(publication(title, documents=[{"title": "Ukrainske flygtninge"}]))
+                self.assertEqual(result.relevance, IRRELEVANT)
+        self.assertEqual(classify(publication("Midlertidig beskyttelse af fordrevne fra Ukraine")).relevance, DIRECT)
+
+    def test_old_source_update_does_not_prove_old_individual_case(self):
+        result = classify(publication("Spørgsmål om sagsbehandling af opholdstilladelse", type_id=10,
+                         source_updated_at_raw="2007-01-01"))
+        self.assertEqual(result.relevance, POTENTIAL)
+        result = classify(publication("Spørgsmål om sagsbehandling af opholdstilladelse", type_id=10,
+                         stages=[{"date_raw": "2007-10-15T00:00:00"}]))
+        self.assertEqual(result.relevance, POTENTIAL)
+        result = classify(publication("Udvises efter sagsbehandling af opholdstilladelse", type_id=10,
+                         stages=[{"date_raw": "2007-10-15T00:00:00"}]))
+        self.assertEqual(result.relevance, IRRELEVANT)
+        # Age of a general law/question alone is never sufficient to exclude scope.
+        result = classify(publication("Regler om opholdstilladelse", type_id=10,
+                         stages=[{"date_raw": "2007-10-15T00:00:00"}]))
+        self.assertEqual(result.relevance, POTENTIAL)
+
+    def test_child_target_does_not_make_another_program_direct(self):
+        result = classify(publication("Opholdstilladelse efter Afghanistansærloven",
+                         documents=[{"title": "På lige fod med ukrainske flygtninge"}]))
+        self.assertEqual(result.relevance, POTENTIAL)
+        self.assertFalse(any(rule.startswith("direct.") for rule in result.matched_rules))
+
+    def test_political_resolution_is_not_a_concrete_direct_legal_change(self):
+        result = classify(publication("Ukrainske fordrevne skal beskyttes; våben og sanktioner", type_id=9))
+        self.assertEqual(result.relevance, POTENTIAL)
+        self.assertIn("potential.mixed_case_target_context", result.matched_rules)
+
+    def test_country_example_or_institution_name_does_not_exclude_general_programme(self):
+        for title in ("Forslag om videreførelse af igu og mulighed for opholdstilladelse til personer der i Afghanistan har bistået myndigheder",
+                      "Ændring af udlændingeloven om myndighedernes registre og Forsvarets adgang til oplysninger",
+                      "Arbejdets vilkår og arbejdstilladelse for statsborgere fra nye EU lande"):
+            with self.subTest(title=title):
+                result = classify(publication(title, type_id=3))
+                self.assertEqual(result.relevance, POTENTIAL)
+                self.assertIn("insufficient_scope_evidence", result.diagnostics)
+
+    def test_country_example_keeps_scope_uncertain(self):
+        result = classify(publication("Regeringen vil give opholdstilladelse til f.eks. unge kvinder fra Syrien under uddannelse", type_id=10))
+        self.assertEqual(result.relevance, POTENTIAL)
+        self.assertIn("insufficient_scope_evidence", result.diagnostics)
+
+    def test_container_scope_cannot_discard_target_child_or_missing_graph(self):
+        result = classify(publication("Komité for Grønland", type_id=4,
+                         documents=[{"title": "Ukrainske flygtninge i Danmark"}]))
+        self.assertEqual(result.relevance, POTENTIAL)
+        self.assertEqual(classify(publication("UUI alm. del", type_id=4, complete=False)).relevance, POTENTIAL)
+
+    def test_comparative_child_cannot_make_generic_case_direct(self):
+        result = classify(publication("Forslag om regler", documents=[{"title": "Undtagelse for andre grupper på lige fod med ukrainske flygtninge"}]))
+        self.assertEqual(result.relevance, POTENTIAL)
+        self.assertFalse(any(rule.startswith("direct.") for rule in result.matched_rules))
+
+    def test_case_type_alone_does_not_downgrade_explicit_target_scope(self):
+        self.assertEqual(classify(publication("Forlængelse af Ukrainesærloven", type_id=9)).relevance, DIRECT)
+
+    def test_production_audit_regression_evidence_and_identifier_independence(self):
+        fixtures = json.loads((Path(__file__).parent / "fixtures" / "relevance_production_audit_1611.json").read_text())
+        self.assertEqual(len(fixtures), 12)
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture["name"]):
+                for external_id in (fixture["record"]["external_id"], "999999999"):
+                    result = classify({**fixture["record"], "external_id": external_id})
+                    self.assertEqual(result.relevance, fixture["expected"])
+                    self.assertTrue(result.evidence_fields or result.relevance == IRRELEVANT)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            for fixture in fixtures:
+                classify(fixture["record"])
+        self.assertEqual(output.getvalue(), "")
 
     def test_work_permits_for_foreigners_are_potential(self):
         result = classify(publication("Arbejdstilladelser for udenlandske borgere"))
         self.assertEqual(result.relevance, POTENTIAL)
-        self.assertIn("potential.work_foreign_population", result.matched_rules)
+        self.assertIn("potential.insufficient_scope_evidence", result.matched_rules)
 
     def test_integration_benefits_for_displaced_people_are_potential(self):
         self.assertEqual(classify(publication("Integrationsydelser til fordrevne personer")).relevance, POTENTIAL)
@@ -88,8 +226,9 @@ class RelevanceTests(unittest.TestCase):
     def test_housing_for_refugees_is_potential(self):
         self.assertEqual(classify(publication("Kommunal boligplacering af flygtninge")).relevance, POTENTIAL)
 
-    def test_family_reunification_is_potential(self):
+    def test_family_reunification_needs_target_context(self):
         self.assertEqual(classify(publication("Regler om familiesammenføring")).relevance, POTENTIAL)
+        self.assertIn("insufficient_scope_evidence", classify(publication("familiesammenføring")).diagnostics)
 
     def test_education_access_for_displaced_people_is_potential(self):
         self.assertEqual(classify(publication("Adgang til uddannelse for fordrevne personer")).relevance, POTENTIAL)
@@ -117,7 +256,7 @@ class RelevanceTests(unittest.TestCase):
     def test_source_feed_status_vote_and_date_do_not_establish_relevance(self):
         result = classify(publication("Ændring af vejloven", feed_codes=["immigration_ministry"], status={"name": "Aktuel"}, votes=[{"approved": True}], updated_at="2026-01-01"))
         self.assertEqual(result.relevance, IRRELEVANT)
-        self.assertEqual(result.matched_rules, ())
+        self.assertFalse(any(rule.startswith(("direct.", "potential.")) for rule in result.matched_rules))
 
     def test_empty_or_unreadable_text_is_insufficient(self):
         result = classify({"source": "folketinget", "external_id": "7", "title": "... —", "notify_eligible": True})
@@ -164,7 +303,7 @@ class RelevanceTests(unittest.TestCase):
         self.assertIsNone(incremental.notify_eligible)
 
     def test_incomplete_source_data_blocks_notification_without_changing_relevance(self):
-        for title, expected in (("Ukrainesærloven", DIRECT), ("Udlændingeloven om opholdstilladelser", POTENTIAL), ("Andre regler", IRRELEVANT)):
+        for title, expected in (("Ukrainesærloven", DIRECT), ("Ukraine og opholdstilladelser", POTENTIAL), ("Andre regler", IRRELEVANT)):
             with self.subTest(title=title):
                 result = classify(publication(title, complete=False, historical=False, notify_eligible=True))
                 self.assertEqual(result.relevance, expected)
@@ -186,13 +325,13 @@ class RelevanceTests(unittest.TestCase):
         first, second = classify(item).to_dict(), classify(item).to_dict()
         self.assertEqual(first, second)
         self.assertEqual(first["external_id"], "123")
-        self.assertEqual(first["ruleset_version"], "1.1")
+        self.assertEqual(first["ruleset_version"], RULESET_VERSION)
         self.assertTrue(first["reason"])
         self.assertTrue(first["matched_rules"])
 
     def test_batch_evaluation_supports_both_collector_envelopes(self):
         hearings = evaluate({"publications": [publication("Ukrainesærloven"), publication("Arbejde")]})
-        cases = evaluate({"cases": [publication("Ukrainesærloven"), publication("Udlændingeloven")]})
+        cases = evaluate({"cases": [publication("Ukrainesærloven"), publication("Ukraine og opholdstilladelser")]})
         self.assertEqual(hearings["counts"], {"DIRECT": 1, "POTENTIAL": 0, "IRRELEVANT": 1})
         self.assertEqual(cases["counts"], {"DIRECT": 1, "POTENTIAL": 1, "IRRELEVANT": 0})
 
