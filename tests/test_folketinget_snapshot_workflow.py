@@ -345,7 +345,12 @@ class SnapshotWorkflowSelectionTests(unittest.TestCase):
         self.assertIn("actions/upload-artifact@v7", workflow)
         self.assertIn("retention-days: 30", workflow)
         self.assertIn("folketinget-snapshot-no-commit-${{ github.run_id }}", workflow)
-        self.assertNotIn("notification", workflow.lower())
+        notification_step = workflow.split("- name: Queue and deliver notifications after snapshot advancement", 1)[1].split("- name: Promote target manifest", 1)[0]
+        self.assertIn("github.event_name == 'schedule'", notification_step)
+        self.assertIn("steps.run-incremental.outputs.promote_manifest == 'true'", notification_step)
+        self.assertIn("collectors.notification_client", notification_step)
+        self.assertIn("NOTIFICATION_QUEUE_AUTOMATION_ENABLED", notification_step)
+        self.assertIn("NOTIFICATION_DELIVERY_AUTOMATION_ENABLED", notification_step)
         self.assertNotIn("worker deploy", workflow.lower())
 
 

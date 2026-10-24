@@ -107,6 +107,75 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python3 tools/folketinget_backup_poc.py
 
+      - name: Queue and deliver notifications after snapshot advancement
+        id: notifications
+        if: ${{ github.event_name == 'schedule' && steps.run-incremental.outcome == 'success' && steps.run-incremental.outputs.promote_manifest == 'true' }}
+        continue-on-error: true
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          NOTIFICATION_RUN_ID: ${{ steps.run-incremental.outputs.notification_run_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          NOTIFICATION_QUEUE_AUTOMATION_ENABLED: ${{ vars.NOTIFICATION_QUEUE_AUTOMATION_ENABLED || 'DISABLED' }}
+          NOTIFICATION_DELIVERY_AUTOMATION_ENABLED: ${{ vars.NOTIFICATION_DELIVERY_AUTOMATION_ENABLED || 'DISABLED' }}
+          INGEST_API_URL: ${{ vars.INGEST_API_URL }}
+          INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          run_id = os.environ.get("NOTIFICATION_RUN_ID", "")
+          if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", run_id):
+              raise SystemExit("notification=FAIL category=ingestion_result_invalid")
+          path = os.path.join(os.environ["RUNNER_TEMP"], "folketinget-ingestion-result.json")
+          with open(path, "w", encoding="utf-8") as stream:
+              json.dump({"run_id": run_id, "status": "COMMITTED", "mode": "incremental",
+                         "state_kind": "snapshot", "snapshot_advanced": True}, stream,
+                        separators=(",", ":"))
+          os.chmod(path, 0o600)
+          PY
+          python -m collectors.notification_client "$RUNNER_TEMP/folketinget-ingestion-result.json" > "$RUNNER_TEMP/folketinget-notifications.json" 2> "$RUNNER_TEMP/folketinget-notifications.log"
+
+      - name: Write safe notification summary
+        if: ${{ always() && github.event_name == 'schedule' && steps.run-incremental.outputs.promote_manifest == 'true' }}
+        env:
+          NOTIFICATION_RESULT: ${{ runner.temp }}/folketinget-notifications.json
+          NOTIFICATION_STATUS: ${{ steps.notifications.outcome || 'not_run' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          statuses = {"not_run", "success", "failure", "skipped", "cancelled"}
+          response = {}
+          try:
+              with open(os.environ["NOTIFICATION_RESULT"], encoding="utf-8") as stream:
+                  parsed = json.load(stream)
+              if isinstance(parsed, dict):
+                  response = parsed
+          except (OSError, json.JSONDecodeError):
+              pass
+          status = os.environ.get("NOTIFICATION_STATUS", "not_run")
+          if status not in statuses:
+              status = "unknown"
+          queue = response.get("queue_status")
+          delivery = response.get("delivery_status")
+          allowed = {"disabled", "manual_skipped", "not_run", "blocked", "failed", "eligible", "worker_gate_closed", "disabled", "completed", "completed_with_failures"}
+          queue = queue if queue in allowed else "unknown"
+          delivery = delivery if delivery in allowed else "unknown"
+          queued = response.get("queued", 0)
+          sent = response.get("sent", 0)
+          failed = response.get("failed", 0)
+          counts = [value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+                    for value in (queued, sent, failed)]
+          lines = ["## Folketinget notifications", f"- Orchestration: `{status}`",
+                   f"- Queue: `{queue}` (queued {counts[0]})",
+                   f"- Delivery: `{delivery}` (sent {counts[1]}, failed {counts[2]})"]
+          category = response.get("error_category")
+          if isinstance(category, str) and re.fullmatch(r"[a-z_]{1,60}", category):
+              lines.append(f"- Error category: `{category}`")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+              stream.write("\n".join(lines) + "\n")
+          PY
+
       - name: Promote target manifest only after COMMITTED
         if: success() && steps.run-incremental.outputs.promote_manifest == 'true'
         uses: actions/upload-artifact@v7
@@ -164,3 +233,13 @@ jobs:
           if [[ "$BASE_RUN_ID" =~ ^[0-9]+$ ]] && [ "$(dirname "$target")" = "$RUNNER_TEMP" ] && [ -d "$target" ] && [ ! -L "$target" ]; then
             rm -rf -- "$target"
           fi
+
+      - name: Remove temporary notification data
+        if: always()
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: rm -f -- "$RUNNER_TEMP/folketinget-ingestion-result.json" "$RUNNER_TEMP/folketinget-notifications.json" "$RUNNER_TEMP/folketinget-notifications.log"
+
+      - name: Fail scheduled run if notification orchestration failed
+        if: ${{ always() && github.event_name == 'schedule' && steps.notifications.outcome == 'failure' }}
+        run: exit 1

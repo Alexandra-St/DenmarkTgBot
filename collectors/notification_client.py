@@ -66,7 +66,19 @@ def orchestrate(
         return result
     data = dict(ingestion) if isinstance(ingestion, Mapping) else {}
     run_id = data.get("run_id")
-    if data.get("status") != "COMMITTED" or data.get("checkpoints_advanced") is not True or not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+    checkpoint_commit = (
+        data.get("status") == "COMMITTED"
+        and data.get("checkpoints_advanced") is True
+        and data.get("state_kind") != "snapshot"
+    )
+    snapshot_commit = (
+        data.get("status") == "COMMITTED"
+        and data.get("mode") == "incremental"
+        and data.get("state_kind") == "snapshot"
+        and data.get("snapshot_advanced") is True
+    )
+    if (not (checkpoint_commit or snapshot_commit)
+            or not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id)):
         result.update(queue_status="blocked", delivery_status="not_run")
         raise OrchestrationError("ingestion_not_confirmed_committed", result)
     if not endpoint.startswith("https://") or not token:

@@ -107,6 +107,21 @@ def create_v2_candidate_manifest(
 
 
 class BackupPocSafetyTests(unittest.TestCase):
+    def test_incremental_notification_run_id_output_only_exists_for_committed_promotion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = pathlib.Path(temp) / "github-output"
+            run_id = "00000000-0000-4000-8000-000000000001"
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                POC.write_incremental_promotion_output(False)
+                self.assertNotIn("notification_run_id", output.read_text(encoding="utf-8"))
+                POC.write_incremental_promotion_output(True, run_id)
+                with self.assertRaises(POC.PocError) as caught:
+                    POC.write_incremental_promotion_output(True, "invalid")
+            rendered = output.read_text(encoding="utf-8")
+            self.assertIn(f"notification_run_id={run_id}", rendered)
+            self.assertNotIn("title", rendered)
+            self.assertEqual(caught.exception.category, "snapshot_incremental_notification_contract_invalid")
+
     @staticmethod
     def _candidate_bundle(cases, *, complete=True, diagnostics=None, candidate_count=None):
         return {
@@ -978,6 +993,8 @@ class BackupPocSafetyTests(unittest.TestCase):
                 )
             self.assertTrue(result["promote_manifest"])
             self.assertEqual(result["snapshot_client_status"], "COMMITTED")
+            self.assertEqual(result["run_id"], POC.snapshot_incremental_run_id(
+                "Alexandra-St/DenmarkTgBot", "12345"))
             kwargs = extract.call_args.kwargs
             self.assertEqual(kwargs["base_snapshot"], context["identity"])
             self.assertEqual(kwargs["target_snapshot"], complete["snapshot_ingestion_live"]["target_snapshot"])
@@ -1068,6 +1085,7 @@ class BackupPocSafetyTests(unittest.TestCase):
             extract.assert_not_called()
             self.assertFalse(result["promote_manifest"])
             self.assertEqual(result["snapshot_client_status"], "NOT_REQUIRED")
+            self.assertNotIn("run_id", result)
 
             new_finish = "2026-10-21 02:00:40.000"
             changed = {entity: [] for entity in POC.REQUIRED_ENTITIES}

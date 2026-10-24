@@ -85,6 +85,33 @@ class NotificationClientTests(unittest.TestCase):
                 self.assertEqual(caught.exception.category, "ingestion_not_confirmed_committed")
                 self.assertEqual(requests, [])
 
+    def test_committed_advanced_snapshot_uses_existing_queue_and_delivery_contract(self):
+        ingestion = {"run_id": RUN_ID, "status": "COMMITTED", "mode": "incremental",
+                     "state_kind": "snapshot", "snapshot_advanced": True,
+                     "checkpoints_advanced": False}
+        result, requests = self.invoke(
+            [{"eligible": True, "queued": 1}, {"enabled": True, "sent": 1, "failed": 0}],
+            ingestion=ingestion,
+        )
+        self.assertEqual(result["delivery_status"], "completed")
+        self.assertEqual(len(requests), 2)
+
+    def test_snapshot_contract_requires_incremental_snapshot_commit_and_advance(self):
+        invalid = [
+            {"run_id": RUN_ID, "status": "COMMITTED", "mode": "incremental", "state_kind": "snapshot"},
+            {"run_id": RUN_ID, "status": "COMMITTED", "mode": "historical", "state_kind": "snapshot", "snapshot_advanced": True},
+            {"run_id": RUN_ID, "status": "COMMITTED", "mode": "incremental", "state_kind": "snapshot", "snapshot_advanced": False},
+        ]
+        for ingestion in invalid:
+            with self.subTest(ingestion=ingestion):
+                requests = []
+                with self.assertRaises(OrchestrationError) as caught:
+                    orchestrate(ingestion, event_name="schedule", queue_gate="true", delivery_gate="true",
+                                endpoint="https://worker.example", token="hidden",
+                                opener=lambda *_args, **_kwargs: requests.append(True))
+                self.assertEqual(caught.exception.category, "ingestion_not_confirmed_committed")
+                self.assertEqual(requests, [])
+
     def test_queue_failure_blocks_delivery_and_delivery_is_never_retried(self):
         calls = []
 
@@ -131,6 +158,18 @@ class NotificationClientTests(unittest.TestCase):
         self.assertIn("NOTIFICATION_QUEUE_AUTOMATION_ENABLED: ${{ vars.NOTIFICATION_QUEUE_AUTOMATION_ENABLED || 'DISABLED' }}", step)
         self.assertIn("NOTIFICATION_DELIVERY_AUTOMATION_ENABLED: ${{ vars.NOTIFICATION_DELIVERY_AUTOMATION_ENABLED || 'DISABLED' }}", step)
         self.assertIn("--notifications", workflow)
+
+    def test_folketinget_notifications_are_schedule_only_after_confirmed_snapshot_commit(self):
+        workflow = (ROOT / ".github/workflows/folketinget-snapshot-incremental.yml").read_text(encoding="utf-8")
+        step = workflow.split("- name: Queue and deliver notifications after snapshot advancement", 1)[1].split("- name: Promote target manifest", 1)[0]
+        self.assertIn("github.event_name == 'schedule'", step)
+        self.assertIn("steps.run-incremental.outcome == 'success'", step)
+        self.assertIn("steps.run-incremental.outputs.promote_manifest == 'true'", step)
+        self.assertIn("NOTIFICATION_QUEUE_AUTOMATION_ENABLED: ${{ vars.NOTIFICATION_QUEUE_AUTOMATION_ENABLED || 'DISABLED' }}", step)
+        self.assertIn("NOTIFICATION_DELIVERY_AUTOMATION_ENABLED: ${{ vars.NOTIFICATION_DELIVERY_AUTOMATION_ENABLED || 'DISABLED' }}", step)
+        self.assertIn("collectors.notification_client", step)
+        self.assertNotIn("/internal/notifications/deliver", step)
+        self.assertIn("steps.notifications.outcome == 'failure'", workflow)
 
     def test_summary_includes_only_safe_aggregate_notification_state(self):
         rendered = render_summary({}, COMMITTED, run_id="123", mode="production_ingest", gate_status="success",

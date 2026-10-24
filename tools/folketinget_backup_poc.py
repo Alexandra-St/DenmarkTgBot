@@ -1675,19 +1675,26 @@ def run_snapshot_incremental_live(
         "prepared_record_count": records, "batch_count": batches,
         "snapshot_client_status": client_status, "snapshot_advanced": is_committed,
         "snapshot_generation": generation,
+        "run_id": run_id,
         "promote_manifest": is_committed,
     }
 
 
-def write_incremental_promotion_output(enabled: bool) -> None:
+def write_incremental_promotion_output(enabled: bool, run_id: str | None = None) -> None:
     """Set a GitHub output only after the full live path returned COMMITTED."""
     output = os.environ.get("GITHUB_OUTPUT")
     if not output:
         return
+    if enabled and (not isinstance(run_id, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", run_id
+    )):
+        raise PocError("snapshot_incremental_notification_contract_invalid")
     try:
         with open(output, "a", encoding="utf-8") as target:
             target.write(f"promote_manifest={str(enabled).lower()}\n")
             target.write(f"incremental_outcome={'committed' if enabled else 'no_commit'}\n")
+            if enabled:
+                target.write(f"notification_run_id={run_id}\n")
     except OSError:
         raise PocError("snapshot_incremental_output_write_failed") from None
 
@@ -3273,7 +3280,10 @@ def main() -> int:
                 )
                 write_snapshot_incremental_live_summary(incremental_summary)
                 incremental_manifest_promotable = incremental_summary.get("promote_manifest") is True
-                write_incremental_promotion_output(incremental_manifest_promotable)
+                write_incremental_promotion_output(
+                    incremental_manifest_promotable,
+                    incremental_summary.get("run_id") if incremental_manifest_promotable else None,
+                )
             if incremental_summary["status"] != "PASS":
                 print("restore_validation=INCOMPLETE")
                 return 2
