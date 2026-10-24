@@ -1,0 +1,132 @@
+name: Notification production E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: E2E operation to run
+        type: choice
+        required: true
+        options:
+          - prepare
+          - deliver
+      confirm:
+        description: Confirm the one-recipient production E2E operation
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notification-production-e2e
+  cancel-in-progress: false
+
+jobs:
+  notification-e2e:
+    if: ${{ inputs.confirm == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Call pinned notification E2E endpoint
+        env:
+          E2E_ACTION: ${{ inputs.action }}
+          INGEST_API_URL: ${{ vars.INGEST_API_URL }}
+          INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          paths = {
+              "prepare": (
+                  "/internal/notifications/e2e/prepare",
+                  "PREPARE_ONE_ALLOWLISTED_NOTIFICATION",
+              ),
+              "deliver": (
+                  "/internal/notifications/e2e/deliver",
+                  "SEND_ONE_ALLOWLISTED_NOTIFICATION",
+              ),
+          }
+
+          action = os.environ.get("E2E_ACTION", "")
+          base = os.environ.get("INGEST_API_URL", "")
+          token = os.environ.get("INGEST_API_TOKEN", "")
+          if action not in paths or not base.startswith("https://") or not token:
+              print(json.dumps({"status": "error", "category": "request_configuration_invalid"}, separators=(",", ":")))
+              sys.exit(2)
+
+          path, confirmation = paths[action]
+          request = urllib.request.Request(
+              base.rstrip("/") + path,
+              data=json.dumps({"confirmation": confirmation}, separators=(",", ":")).encode("utf-8"),
+              headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "DenmarkTgBot-NotificationE2E/1.0",
+              },
+              method="POST",
+          )
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect())
+          try:
+              response = opener.open(request, timeout=20)
+          except urllib.error.HTTPError as error:
+              print(json.dumps({"status": "error", "category": "worker_http_error", "http_status": error.code}, separators=(",", ":")))
+              sys.exit(2)
+          except (urllib.error.URLError, TimeoutError, OSError):
+              print(json.dumps({"status": "error", "category": "worker_request_failed"}, separators=(",", ":")))
+              sys.exit(2)
+          except Exception:
+              print(json.dumps({"status": "error", "category": "worker_request_failed"}, separators=(",", ":")))
+              sys.exit(2)
+
+          try:
+              raw = response.read(4097)
+              if response.status < 200 or response.status >= 300:
+                  print(json.dumps({"status": "error", "category": "worker_http_error", "http_status": response.status}, separators=(",", ":")))
+                  sys.exit(2)
+              if len(raw) > 4096:
+                  raise ValueError
+              payload = json.loads(raw.decode("utf-8"))
+              if not isinstance(payload, dict):
+                  raise ValueError
+              if action == "prepare":
+                  status = payload.get("status")
+                  queued = payload.get("queued")
+                  if not isinstance(status, str) or status not in {"prepared", "blocked"} or type(queued) is not int or queued not in {0, 1}:
+                      raise ValueError
+                  safe_response = {"status": status, "queued": queued}
+              else:
+                  status = payload.get("status")
+                  sent = payload.get("sent")
+                  failed = payload.get("failed")
+                  if (not isinstance(status, str) or status not in {"sent", "failed", "blocked"}
+                          or type(sent) is not int or sent not in {0, 1}
+                          or type(failed) is not int or failed not in {0, 1}):
+                      raise ValueError
+                  safe_response = {"status": status, "sent": sent, "failed": failed}
+              print(json.dumps(safe_response, separators=(",", ":")))
+              if safe_response["status"] not in ({"prepared"} if action == "prepare" else {"sent"}):
+                  sys.exit(2)
+          except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+              print(json.dumps({"status": "error", "category": "worker_response_invalid"}, separators=(",", ":")))
+              sys.exit(2)
+          except Exception:
+              print(json.dumps({"status": "error", "category": "worker_response_invalid"}, separators=(",", ":")))
+              sys.exit(2)
+          finally:
+              try:
+                  response.close()
+              except Exception:
+                  pass
+          PY
