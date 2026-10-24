@@ -276,9 +276,12 @@ async function showAbout(
   sourceStatus?: SourceStatusRepository,
 ): Promise<void> {
   let lastSuccessfulHoeringsportalenRun: string | null = null;
+  let lastSuccessfulFolketingetRun: string | null = null;
   try { lastSuccessfulHoeringsportalenRun = await sourceStatus?.lastSuccessfulHoeringsportalenRun() ?? null; }
   catch { /* Keep About available if metadata cannot be read. */ }
-  const body = `${t(language, "aboutText")}\n\n${sourceStatusScreen(language, lastSuccessfulHoeringsportalenRun)}`;
+  try { lastSuccessfulFolketingetRun = await sourceStatus?.lastSuccessfulFolketingetRun() ?? null; }
+  catch { /* A source-status read error is unknown, not stale. */ }
+  const body = `${t(language, "aboutText")}\n\n${sourceStatusScreen(language, lastSuccessfulHoeringsportalenRun, lastSuccessfulFolketingetRun)}`;
   await sendTrackedScreen(telegram, navigation, telegramId, chatId, language, sectionState("about"), body, sectionNavigationKeyboard(language));
 }
 

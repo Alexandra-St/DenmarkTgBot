@@ -13,25 +13,22 @@ export function sourceFreshness(timestamp: string | null | undefined, now = Date
   return now - parsed <= SOURCE_STALE_AFTER_MS ? "active" : "stale";
 }
 
-export function sourceStatusScreen(language: Language, timestamp: string | null, now = Date.now()): string {
-  const freshness = sourceFreshness(timestamp, now);
-  let hearingStatus: string;
-  if (freshness === "unknown") {
-    hearingStatus = t(language, "sourceStatusUnknown");
-  } else {
-    const formatted = new Intl.DateTimeFormat(language === "uk" ? "uk-UA" : "ru-RU", {
-      dateStyle: "medium",
-      timeStyle: "short",
-      timeZone: "Europe/Copenhagen",
-    }).format(new Date(timestamp!));
-    const key = freshness === "active" ? "sourceStatusActive" : "sourceStatusStale";
-    hearingStatus = t(language, key).replace("{date}", formatted);
-  }
-
+export function sourceStatusScreen(
+  language: Language,
+  hoeringsportalenTimestamp: string | null,
+  folketingetTimestamp: string | null,
+  now = Date.now(),
+): string {
+  const statusLabel = (timestamp: string | null): string => {
+    const freshness = sourceFreshness(timestamp, now);
+    return t(language, freshness === "active" ? "sourceStatusActive"
+      : freshness === "stale" ? "sourceStatusStale" : "sourceStatusUnknown");
+  };
   return [
     t(language, "sourceStatusTitle"),
-    `${t(language, "sourceHoeringsportalen")}: ${hearingStatus}`,
-    `${t(language, "sourceFolketinget")}: ${t(language, "sourceMonitoringInactive")}`,
+    `${t(language, "sourceHoeringsportalen")}: ${statusLabel(hoeringsportalenTimestamp)}`,
+    `${t(language, "sourceFolketinget")}: ${statusLabel(folketingetTimestamp)}`,
+    `${t(language, "sourcePlannedHeading")}: ${t(language, "sourcePlannedNames")}`,
     t(language, "sourceStatusDisclaimer"),
   ].join("\n");
 }

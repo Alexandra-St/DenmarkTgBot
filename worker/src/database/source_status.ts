@@ -1,5 +1,6 @@
 export interface SourceStatusRepository {
   lastSuccessfulHoeringsportalenRun(): Promise<string | null>;
+  lastSuccessfulFolketingetRun(): Promise<string | null>;
 }
 
 const HEARING_STREAMS = ["immigration_ministry", "immigration_category"] as const;
@@ -26,5 +27,17 @@ export class D1SourceStatusRepository implements SourceStatusRepository {
     // marker for the latest point at which both streams were confirmed.
     return timestamps.map((value) => value as string)
       .reduce((earliest, value) => Date.parse(value) < Date.parse(earliest) ? value : earliest);
+  }
+
+  async lastSuccessfulFolketingetRun(): Promise<string | null> {
+    const result = await this.db.prepare(`
+      SELECT ss.updated_at
+      FROM source_snapshot_states ss
+      JOIN sources s ON s.id = ss.source_id
+      WHERE s.code = 'folketinget'
+    `).first<{ updated_at: string | null }>();
+    const timestamp = result?.updated_at;
+    return typeof timestamp === "string" && SOURCE_TIMESTAMP.test(timestamp)
+      && Number.isFinite(Date.parse(timestamp)) ? timestamp : null;
   }
 }

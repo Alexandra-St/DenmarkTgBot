@@ -51,8 +51,10 @@ class MemoryNavigation implements NavigationStateRepository {
 
 class MemorySourceStatus implements SourceStatusRepository {
   private readonly timestamp: string | null;
-  constructor(timestamp: string | null) { this.timestamp = timestamp; }
+  private readonly folketingetTimestamp: string | null;
+  constructor(timestamp: string | null, folketingetTimestamp: string | null = null) { this.timestamp = timestamp; this.folketingetTimestamp = folketingetTimestamp; }
   async lastSuccessfulHoeringsportalenRun(): Promise<string | null> { return this.timestamp; }
+  async lastSuccessfulFolketingetRun(): Promise<string | null> { return this.folketingetTimestamp; }
 }
 
 class MemoryTelegram implements TelegramClient {
@@ -186,7 +188,7 @@ test("first language selection sends localized first-time welcome and then main 
     const welcome = telegram.sent.at(-1)!.text;
     assert.match(welcome, language === "uk" ? /Вітаємо в DenmarkBot/u : /Добро пожаловать в DenmarkBot/u);
     assert.match(welcome, language === "uk" ? /Høringsportalen/u : /Høringsportalen/u);
-    assert.match(welcome, language === "uk" ? /Folketinget ще розробляється/u : /Folketinget ещё разрабатывается/u);
+    assert.match(welcome, language === "uk" ? /Бета-джерела: Høringsportalen і Folketinget/u : /Beta-источники: Høringsportalen и Folketinget/u);
     assert.match(welcome, language === "uk" ? /Сповіщення поки тестуються й не надсилаються/u : /Уведомления пока тестируются и не отправляются/u);
     assert.ok(welcome.length < 4096);
     assert.equal(telegram.edited.at(-1)!.text, language === "uk" ? "Мову збережено." : "Язык сохранён.");
@@ -549,8 +551,8 @@ test("content-send failure removes only its newly sent keyboard anchor and prese
 
 test("About and unknown callbacks are handled in selected language", async () => {
   for (const [id, language, expected] of [
-    [400, "ru", [/бесплатный информационный бот/, /Høringsportalen/, /Folketinget: мониторинг пока не активен/, /автоматические уведомления пока отключены/i, /Telegram ID/, /не является юридической консультацией/]],
-    [401, "uk", [/безкоштовний інформаційний бот/, /Høringsportalen/, /Folketinget: моніторинг ще не активний/, /автоматичні сповіщення наразі вимкнені/i, /Telegram ID/, /не є юридичною консультацією/]],
+    [400, "ru", [/бесплатный информационный бот/, /Høringsportalen/, /Folketinget: статус неизвестен/, /после бета-версии/i, /Nyidanmark, Retsinformation/, /автоматические уведомления пока отключены/i, /Telegram ID/, /не является юридической консультацией/]],
+    [401, "uk", [/безкоштовний інформаційний бот/, /Høringsportalen/, /Folketinget: статус невідомий/, /після бета-версії/i, /Nyidanmark, Retsinformation/, /автоматичні сповіщення наразі вимкнені/i, /Telegram ID/, /не є юридичною консультацією/]],
   ] as const) {
     const repo = new MemoryRepository();
     const telegram = new MemoryTelegram();
@@ -570,17 +572,20 @@ test("About and unknown callbacks are handled in selected language", async () =>
   }
 });
 
-test("About shows unknown Høringsportalen status when source metadata fails", async () => {
+test("About maps source metadata errors to Unknown and preserves navigation", async () => {
   const repo = new MemoryRepository();
   const telegram = new MemoryTelegram();
   await handleTelegramUpdate(callback(402, "lang:ru"), repo, telegram);
   const brokenSourceStatus: SourceStatusRepository = {
     async lastSuccessfulHoeringsportalenRun() { throw new Error("database unavailable"); },
+    async lastSuccessfulFolketingetRun() { throw new Error("database unavailable"); },
   };
   await handleTelegramUpdate(callback(402, "menu:about"), repo, telegram, undefined, brokenSourceStatus);
   const text = telegram.sent.at(-1)!.text;
-  assert.match(text, /Høringsportalen: неизвестен/);
-  assert.match(text, /Folketinget: мониторинг пока не активен/);
+  assert.match(text, /Høringsportalen: статус неизвестен/);
+  assert.match(text, /Folketinget: статус неизвестен/);
+  assert.match(text, /Nyidanmark, Retsinformation/);
+  assert.doesNotMatch(text, /database unavailable|2026|source_snapshot_states/u);
   assert.ok(Array.from(text).length <= 4096);
 });
 
