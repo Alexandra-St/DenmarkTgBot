@@ -535,7 +535,7 @@ test("localized message includes change, relevance, title, source, official URL,
     source_name: "Høringsportalen", external_url: "https://hoeringsportalen.dk/Hearing/Details/123",
   };
   const uk = formatNotification({ ...common, language: "uk" });
-  assert.match(uk ?? "", /🟢 DIRECT/u);
+  assert.match(uk ?? "", /🟢 Прямі/u);
   assert.match(uk ?? "", /статус/u);
   assert.match(uk ?? "", /Було: Open/u);
   assert.match(uk ?? "", /Стало: Closed/u);
@@ -545,7 +545,7 @@ test("localized message includes change, relevance, title, source, official URL,
   assert.match(uk ?? "", /не юридична консультація/u);
 
   const ru = formatNotification({ ...common, language: "ru", relevance: "POTENTIAL" });
-  assert.match(ru ?? "", /🟡 POTENTIAL/u);
+  assert.match(ru ?? "", /🟡 Потенциальные/u);
   assert.match(ru ?? "", /Изменился статус/u);
   assert.match(ru ?? "", /Было: Open/u);
   assert.match(ru ?? "", /Стало: Closed/u);

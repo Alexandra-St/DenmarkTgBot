@@ -148,6 +148,7 @@ test("News and Archive read only complete relevant records from local D1", async
       assert.match(telegram.latestScreen!.text, /доступні в боті офіційні публікації|доступные в боте официальные публикации/u);
       assert.match(telegram.latestScreen!.text, /ті самі записи|одни и те же записи/u);
       assert.match(telegram.latestScreen!.text, /бета-версії використовуються Høringsportalen і Folketinget|бета-версии используются Høringsportalen и Folketinget/u);
+      assert.doesNotMatch(telegram.latestScreen!.text, /\b(?:DIRECT|POTENTIAL)\b/u);
       assert.match(telegram.latestScreen!.text, /Danish title/);
       assert.ok(Array.from(telegram.latestScreen!.text).length <= 4096, "News fits Telegram message limit");
       let markup = telegram.latestScreen!.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data?: string }>> };
@@ -185,14 +186,14 @@ test("News and Archive read only complete relevant records from local D1", async
       await click("menu:archive");
       assert.match(telegram.latestScreen!.text, new RegExp(fixture.archiveHeading));
       assert.match(telegram.latestScreen!.text, /Усі публікації, що стосуються теми|Все публикации по теме/u);
-      assert.match(telegram.latestScreen!.text, /🟢 DIRECT/u);
-      assert.match(telegram.latestScreen!.text, /🟡 POTENTIAL/u);
+      assert.match(telegram.latestScreen!.text, fixture.language === "uk" ? /🟢 Прямо/u : /🟢 Непосредственно/u);
+      assert.match(telegram.latestScreen!.text, fixture.language === "uk" ? /🟡 Можуть/u : /🟡 Могут/u);
       assert.match(telegram.latestScreen!.text, /ті самі записи|одни и те же записи/u);
       assert.ok(Array.from(telegram.latestScreen!.text).length <= 4096, "Archive fits Telegram message limit");
       markup = telegram.latestScreen!.keyboard as typeof markup;
       const filterButton = (name: string) => markup.inline_keyboard.flat().find((button) => button.callback_data === `archive:filter:${name}:0`)!.callback_data!;
-      assert.ok(markup.inline_keyboard.flat().some((button) => button.text === "🟢 DIRECT"));
-      assert.ok(markup.inline_keyboard.flat().some((button) => button.text === "🟡 POTENTIAL"));
+      assert.ok(markup.inline_keyboard.flat().some((button) => button.text === (fixture.language === "uk" ? "🟢 Прямі" : "🟢 Прямые")));
+      assert.ok(markup.inline_keyboard.flat().some((button) => button.text === (fixture.language === "uk" ? "🟡 Потенційні" : "🟡 Потенциальные")));
       await click(filterButton("direct"));
       let publicationRows = telegram.latestScreen!.text.split("\n").filter((line) => /^[🟢🟡] Danish title/u.test(line));
       assert.ok(publicationRows.length > 0 && publicationRows.every((line) => line.startsWith("🟢")), "DIRECT filter excludes POTENTIAL entries");
@@ -221,8 +222,8 @@ test("News and Archive read only complete relevant records from local D1", async
 
       await click("archive:page:potential:9999");
       assert.match(telegram.latestScreen!.text, new RegExp(fixture.empty));
-      assert.match(telegram.latestScreen!.text, /🟢 DIRECT/u);
-      assert.match(telegram.latestScreen!.text, /🟡 POTENTIAL/u);
+      assert.match(telegram.latestScreen!.text, fixture.language === "uk" ? /🟢 Прямо/u : /🟢 Непосредственно/u);
+      assert.match(telegram.latestScreen!.text, fixture.language === "uk" ? /🟡 Можуть/u : /🟡 Могут/u);
       assert.match(telegram.latestScreen!.text, /бета-версії використовуються Høringsportalen і Folketinget|бета-версии используются Høringsportalen и Folketinget/u);
       await click("pub:d:999:news:all:0");
       assert.match(telegram.sent.at(-1)!.text, /більше не знайдено|больше не найдена/u);
