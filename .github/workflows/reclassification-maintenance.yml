@@ -1,0 +1,49 @@
+name: Controlled production reclassification
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Preview the pinned plan or apply it
+        type: choice
+        required: true
+        options:
+          - preview
+          - apply
+      plan_json:
+        description: Exact plan JSON object returned/reviewed from preview
+        type: string
+        required: true
+      confirm:
+        description: Required to apply the pinned production plan
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-reclassification
+  cancel-in-progress: false
+
+jobs:
+  reclassification:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preview or apply pinned plan
+        shell: bash
+        env:
+          INPUT_ACTION: ${{ inputs.action }}
+          INPUT_PLAN_JSON: ${{ inputs.plan_json }}
+          INPUT_CONFIRM: ${{ inputs.confirm }}
+          INGEST_API_URL: ${{ vars.INGEST_API_URL }}
+          INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}
+        run: |
+          set +x
+          temp_dir="$(mktemp -d)"
+          chmod 700 "$temp_dir"
+          trap 'rm -rf "$temp_dir"' EXIT
+          TMPDIR="$temp_dir" python3 tools/reclassification_workflow.py
