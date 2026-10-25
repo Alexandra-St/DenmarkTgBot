@@ -1,0 +1,50 @@
+name: Controlled pending reconciliation
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Preview or apply the exact pending reconciliation plan
+        type: choice
+        required: true
+        options:
+          - preview
+          - apply
+      plan_json:
+        description: Exact reviewed reconciliation plan JSON
+        type: string
+        required: true
+      confirm:
+        description: Required to apply the pinned reconciliation plan
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize with publication maintenance too; pins and write gates remain separate.
+concurrency:
+  group: production-reclassification
+  cancel-in-progress: false
+
+jobs:
+  reconciliation:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preview or apply pending reconciliation
+        shell: bash
+        env:
+          INPUT_ACTION: ${{ inputs.action }}
+          INPUT_CONFIRM: ${{ inputs.confirm }}
+          INGEST_API_URL: ${{ vars.INGEST_API_URL }}
+          INGEST_API_TOKEN: ${{ secrets.INGEST_API_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: |
+          set +x
+          temp_dir="$(mktemp -d)"
+          chmod 700 "$temp_dir"
+          trap 'rm -rf "$temp_dir"' EXIT
+          TMPDIR="$temp_dir" python3 -m tools.pending_reconciliation_workflow

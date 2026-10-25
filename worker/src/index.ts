@@ -1,4 +1,5 @@
 import { handleReclassificationRequest } from "./reclassification.ts";
+import { handlePendingReconciliationRequest } from "./pending_reconciliation.ts";
 import { handleTelegramUpdate } from "./bot/handlers/webhook.ts";
 import { TelegramApi } from "./bot/telegram.ts";
 import { D1UserRepository } from "./database/users.ts";
@@ -14,6 +15,9 @@ interface Env {
   RECLASSIFICATION_WRITE_ENABLED?: string;
   RECLASSIFICATION_PLAN_SHA256?: string;
   RECLASSIFICATION_EXPECTED_COUNT?: string;
+  PENDING_RECONCILIATION_WRITE_ENABLED?: string;
+  PENDING_RECONCILIATION_PLAN_SHA256?: string;
+  PENDING_RECONCILIATION_EXPECTED_COUNT?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   INGEST_API_TOKEN?: string;
@@ -66,6 +70,7 @@ export default {
     if (url.pathname === "/internal/source-states") return handleSourceStatesRequest(request, env);
     if (url.pathname === "/internal/snapshot-readiness") return handleSnapshotReadinessRequest(request, env);
     if (url.pathname.startsWith("/internal/reclassification/")) return handleReclassificationRequest(request, env);
+    if (url.pathname.startsWith("/internal/notifications/reconcile/")) return handlePendingReconciliationRequest(request, env);
     if (url.pathname.startsWith("/internal/notifications/")) {
       if (!await isIngestionRequestAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
       const notificationEnv = env as Env & NotificationEnv;

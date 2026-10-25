@@ -23,6 +23,31 @@ ENDPOINTS = {
 }
 
 
+@dataclass(frozen=True)
+class _Contract:
+    endpoints: dict[str, str]
+    confirmation: str
+    user_agent: str
+    counts: tuple[str, ...]
+    label: str
+    log_name: str
+
+
+# Selected by a fixed Python entry point, never by workflow input/environment.
+_CONTRACTS = {
+    "reclassification": _Contract(ENDPOINTS, CONFIRMATION,
+        "DenmarkTgBot-Reclassification-Maintenance/1.0", ALLOWED_COUNTS,
+        "Controlled reclassification", "reclassification"),
+    "pending_reconciliation": _Contract({
+        "preview": "/internal/notifications/reconcile/preview",
+        "apply": "/internal/notifications/reconcile/apply",
+    }, "APPLY_PINNED_PENDING_RECONCILIATION", "DenmarkTgBot-PendingReconciliation-Maintenance/1.0",
+        ("expected_count", "ready", "applied", "already_reconciled", "stale", "missing", "invalid", "blocked",
+         "writes", "irrelevant_count", "preference_count"),
+        "Controlled pending reconciliation", "pending_reconciliation"),
+}
+
+
 class WorkflowError(Exception):
     def __init__(self, category: str, *, size: int | None = None) -> None:
         super().__init__(category)
@@ -37,7 +62,7 @@ class Result:
     summary: dict[str, Any]
 
 
-def _safe_summary(value: object) -> dict[str, Any] | None:
+def _safe_summary(value: object, counts: tuple[str, ...] = ALLOWED_COUNTS) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     result: dict[str, Any] = {}
@@ -47,7 +72,7 @@ def _safe_summary(value: object) -> dict[str, Any] | None:
     digest = value.get("plan_sha256")
     if isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest):
         result["plan_sha256"] = digest
-    for key in ALLOWED_COUNTS:
+    for key in counts:
         count = value.get(key)
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             result[key] = count
@@ -67,13 +92,13 @@ def _reject_json_constant(_: str) -> None:
     raise ValueError("invalid_json_constant")
 
 
-def _read_response(response: Any) -> tuple[int, dict[str, Any] | None]:
+def _read_response(response: Any, counts: tuple[str, ...] = ALLOWED_COUNTS) -> tuple[int, dict[str, Any] | None]:
     status = int(getattr(response, "status", None) or response.getcode())
     raw = response.read(MAX_RESPONSE_BYTES + 1)
     if len(raw) > MAX_RESPONSE_BYTES:
         return status, None
     try:
-        return status, _safe_summary(json.loads(raw.decode("utf-8")))
+        return status, _safe_summary(json.loads(raw.decode("utf-8")), counts)
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return status, None
 
@@ -95,8 +120,12 @@ def run_request(
     *,
     opener: Any = None,
     temp_directory: str | None = None,
+    operation: str = "reclassification",
 ) -> Result:
-    if action not in ENDPOINTS:
+    contract = _CONTRACTS.get(operation)
+    if contract is None:
+        raise WorkflowError("invalid_operation")
+    if action not in contract.endpoints:
         raise WorkflowError("invalid_action")
     if action == "apply" and confirm != "true":
         raise WorkflowError("apply_confirmation_required")
@@ -116,7 +145,7 @@ def run_request(
     if not base_url or not token:
         raise WorkflowError("worker_credentials_unavailable")
     try:
-        endpoint = _validate_base_url(base_url) + ENDPOINTS[action]
+        endpoint = _validate_base_url(base_url) + contract.endpoints[action]
     except (TypeError, ValueError):
         raise WorkflowError("worker_url_invalid") from None
 
@@ -130,23 +159,23 @@ def run_request(
         # Embed the exact caller-supplied JSON bytes; do not reorder or rewrite entries.
         with open(plan_path, "rb") as stream:
             exact_plan = stream.read()
-        suffix = b',"confirmation":"' + CONFIRMATION.encode("ascii") + b'"' if action == "apply" else b""
+        suffix = b',"confirmation":"' + contract.confirmation.encode("ascii") + b'"' if action == "apply" else b""
         body = b'{"plan":' + exact_plan + suffix + b"}"
         request = urllib.request.Request(
             endpoint,
             data=body,
             headers={"Authorization": "Bearer " + token, "Accept": "application/json", "Content-Type": "application/json",
-                     "User-Agent": "DenmarkTgBot-Reclassification-Maintenance/1.0"},
+                     "User-Agent": contract.user_agent},
             method="POST",
         )
         client = opener or urllib.request.build_opener(_NoRedirect())
         try:
             with client.open(request, timeout=20) as response:
-                status, summary = _read_response(response)
+                status, summary = _read_response(response, contract.counts)
         except urllib.error.HTTPError as error:
             # Read only a bounded body for allowlisted aggregate fields; never reflect it.
             try:
-                _, summary = _read_response(error)
+                _, summary = _read_response(error, contract.counts)
             except (OSError, UnicodeDecodeError, ValueError):
                 summary = None
             finally:
@@ -168,12 +197,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _write_github_summary(action: str, result: Result) -> None:
+def _write_github_summary(action: str, result: Result, operation: str = "reclassification") -> None:
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
     fields = {"action": action, **result.summary}
-    lines = ["## Controlled reclassification " + ("PASS" if result.ok else "FAIL")]
+    lines = ["## " + _CONTRACTS[operation].label + " " + ("PASS" if result.ok else "FAIL")]
     if result.category:
         lines.append("- error category: `" + result.category + "`")
     for key, value in fields.items():
@@ -185,7 +214,7 @@ def _write_github_summary(action: str, result: Result) -> None:
         stream.write("\n".join(lines) + "\n")
 
 
-def main() -> int:
+def main(operation: str = "reclassification") -> int:
     action = os.environ.get("INPUT_ACTION", "")
     confirm = os.environ.get("INPUT_CONFIRM", "false")
     try:
@@ -202,20 +231,21 @@ def main() -> int:
         if not isinstance(plan_json, str):
             raise WorkflowError("plan_json_missing")
         result = run_request(action, confirm, plan_json, os.environ.get("INGEST_API_URL", ""),
-                             os.environ.get("INGEST_API_TOKEN", ""))
+                             os.environ.get("INGEST_API_TOKEN", ""), operation=operation)
     except WorkflowError as error:
         result = Result(False, error.category, {})
         if error.size is not None:
             result = Result(False, error.category, {"plan_input_bytes": error.size, "max_plan_bytes": MAX_PLAN_BYTES})
     except Exception:
         result = Result(False, "worker_request_failed", {})
-    _write_github_summary(action, result)
+    _write_github_summary(action, result, operation)
+    log_name = _CONTRACTS[operation].log_name
     if result.ok:
-        print("reclassification=PASS")
+        print(log_name + "=PASS")
         for key, value in result.summary.items():
             print(f"{key}={value}")
         return 0
-    print("reclassification=FAIL category=" + str(result.category))
+    print(log_name + "=FAIL category=" + str(result.category))
     if result.category == "PLAN_INPUT_TOO_LARGE":
         print(f"plan_input_bytes={result.summary['plan_input_bytes']} max_plan_bytes={MAX_PLAN_BYTES}")
     # Non-success HTTP responses keep only filtered aggregate summary data.
