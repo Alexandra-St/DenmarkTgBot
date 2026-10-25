@@ -116,7 +116,7 @@ class PendingWorkflowTests(unittest.TestCase):
                 self.assertTrue(request.data.startswith(b'{"plan":' + PLAN.encode()))
                 body = json.loads(request.data)
                 self.assertEqual(body["plan"], json.loads(PLAN))
-                self.assertEqual(timeout, 20)
+                self.assertEqual(timeout, 30)
                 if action == "apply":
                     self.assertEqual(body["confirmation"], "APPLY_PINNED_PENDING_RECONCILIATION")
                 else:

@@ -28,6 +28,7 @@ class _Contract:
     endpoints: dict[str, str]
     confirmation: str
     user_agent: str
+    timeout_seconds: int
     counts: tuple[str, ...]
     label: str
     log_name: str
@@ -36,12 +37,12 @@ class _Contract:
 # Selected by a fixed Python entry point, never by workflow input/environment.
 _CONTRACTS = {
     "reclassification": _Contract(ENDPOINTS, CONFIRMATION,
-        "DenmarkTgBot-Reclassification-Maintenance/1.0", ALLOWED_COUNTS,
+        "DenmarkTgBot-Reclassification-Maintenance/1.0", 90, ALLOWED_COUNTS,
         "Controlled reclassification", "reclassification"),
     "pending_reconciliation": _Contract({
         "preview": "/internal/notifications/reconcile/preview",
         "apply": "/internal/notifications/reconcile/apply",
-    }, "APPLY_PINNED_PENDING_RECONCILIATION", "DenmarkTgBot-PendingReconciliation-Maintenance/1.0",
+    }, "APPLY_PINNED_PENDING_RECONCILIATION", "DenmarkTgBot-PendingReconciliation-Maintenance/1.0", 30,
         ("expected_count", "ready", "applied", "already_reconciled", "stale", "missing", "invalid", "blocked",
          "writes", "irrelevant_count", "preference_count"),
         "Controlled pending reconciliation", "pending_reconciliation"),
@@ -170,7 +171,7 @@ def run_request(
         )
         client = opener or urllib.request.build_opener(_NoRedirect())
         try:
-            with client.open(request, timeout=20) as response:
+            with client.open(request, timeout=contract.timeout_seconds) as response:
                 status, summary = _read_response(response, contract.counts)
         except urllib.error.HTTPError as error:
             # Read only a bounded body for allowlisted aggregate fields; never reflect it.

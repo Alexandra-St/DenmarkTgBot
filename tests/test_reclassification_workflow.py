@@ -62,7 +62,7 @@ class ReclassificationWorkflowTests(unittest.TestCase):
         self.assertTrue(request.data.endswith(PLAN.encode() + b"}"))
         self.assertEqual(request.get_header("Authorization"), "Bearer " + TOKEN)
         self.assertEqual(request.get_header("User-agent"), "DenmarkTgBot-Reclassification-Maintenance/1.0")
-        self.assertEqual(timeout, 20)
+        self.assertEqual(timeout, 90)
         self.assertNotIn("conflicts", result.summary)
         self.assertNotIn("telegram_id", result.summary)
 
