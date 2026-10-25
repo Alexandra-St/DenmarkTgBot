@@ -197,6 +197,96 @@ class RelevanceTests(unittest.TestCase):
     def test_case_type_alone_does_not_downgrade_explicit_target_scope(self):
         self.assertEqual(classify(publication("Forlængelse af Ukrainesærloven", type_id=9)).relevance, DIRECT)
 
+    def test_territory_only_scope_applies_to_both_sources_and_beats_ukraine_evidence(self):
+        for source in ("folketinget", "hoeringsportalen"):
+            for territory in ("Grønland", "Færøerne", "Norge"):
+                with self.subTest(source=source, territory=territory):
+                    result = classify({"source": source,
+                        "title": f"Bekendtgørelse for {territory} om ophold for fordrevne fra Ukraine",
+                        "evidence_fragments": [{"kind": "DRAFT_NEW_PROVISIONS", "text": "Ukrainesærloven"}]})
+                    self.assertEqual(result.relevance, IRRELEVANT)
+                    self.assertIn("negative.territory_specific_regime", result.matched_rules)
+
+    def test_mixed_danish_and_territorial_scope_remains_applicable(self):
+        for territory in ("Grønland", "Færøerne"):
+            for title in (f"Regler for Danmark og {territory} om opholdstilladelse for ukrainere",
+                          f"Regler for {territory} og Danmark om opholdstilladelse for ukrainere"):
+                result = classify({"source": "hoeringsportalen", "title": title})
+                self.assertEqual(result.relevance, POTENTIAL)
+                self.assertNotIn("negative.territory_specific_regime", result.matched_rules)
+        self.assertEqual(classify(publication("Opholdstilladelse i Danmark for personer fra Grønland")).relevance, POTENTIAL)
+        self.assertEqual(classify({"source": "hoeringsportalen", "title": "Regler for Grønland om opholdstilladelser",
+                                   "content_text": "Ordningen gælder også i Danmark for ukrainere."}).relevance, POTENTIAL)
+        self.assertEqual(classify({"source": "hoeringsportalen", "title": "Regler for Grønland om opholdstilladelser",
+                                   "content_text": "Ordningen gælder ikke i Danmark."}).relevance, IRRELEVANT)
+
+    def test_child_ukraine_business_financing_military_and_event_do_not_establish_applicability(self):
+        for title in ("Build with Ukraine og etablering af ukrainske virksomheder",
+                      "Finansiering og investeringer via Ukrainefonden",
+                      "Militær støtte til Ukraine og våbenleverancer",
+                      "Invitation: humanitær adgang og sikker evakuering i Ukraine",
+                      "Rådets betaling af niende rate under Ukrainefaciliteten"):
+            with self.subTest(title=title):
+                result = classify(publication("ERU alm. del", type_id=4, complete=True,
+                                               documents=[{"title": title}]))
+                self.assertEqual(result.relevance, IRRELEVANT)
+                self.assertNotIn("potential.child_target_context", result.matched_rules)
+
+    def test_humanitarian_event_cannot_inherit_protected_group_phrase(self):
+        title = "Invitation til velgørenhedskoncert for ukrainske flygtninge"
+        self.assertEqual(classify(publication(title)).relevance, IRRELEVANT)
+        self.assertEqual(classify(publication("SOU alm. del", type_id=4,
+                         documents=[{"title": title}])).relevance, IRRELEVANT)
+        self.assertEqual(classify(publication("UUI alm. del", type_id=4,
+                         documents=[{"title": "Invitation til høring om opholdstilladelse for ukrainske flygtninge"}])).relevance, POTENTIAL)
+
+    def test_territorial_permits_are_not_mistaken_for_mixed_danish_law(self):
+        result = classify(publication("Ændring af udlændingeloven om behandlingen af opholdstilladelser på Færøerne og i Grønland"))
+        self.assertEqual(result.relevance, IRRELEVANT)
+        self.assertEqual(classify(publication("Regler om opholdstilladelser i Danmark og på Færøerne")).relevance, POTENTIAL)
+
+    def test_child_applicable_residence_rights_and_services_are_preserved(self):
+        for title in ("Opholdstilladelse til ukrainere", "Rettigheder og tandpleje for ukrainere",
+                      "Ændring af Ukrainesærloven", "Midlertidig beskyttelse for ukrainere"):
+            with self.subTest(title=title):
+                result = classify(publication("UUI alm. del", type_id=4, documents=[{"title": title}]))
+                self.assertEqual(result.relevance, POTENTIAL)
+
+    def test_foreign_residence_in_applicant_background_is_not_exclusive_jurisdiction(self):
+        result = classify(publication("Spørgsmål om familiesammenføring med en hustru som har opholdstilladelse i Norge"))
+        self.assertEqual(result.relevance, POTENTIAL)
+        self.assertNotIn("negative.territory_specific_regime", result.matched_rules)
+
+    def test_mixed_welfare_question_keeps_conservative_potential(self):
+        result = classify(publication("FIU alm. del", type_id=4, documents=[{
+            "title": "Afskære udenlandske statsborgere fra danske velfærdsydelser og yde lån til Ukraine"}]))
+        self.assertEqual(result.relevance, POTENTIAL)
+        statistics = classify(publication("Forslag til finanslov", type_id=3, documents=[{
+            "title": "Udgifter til skattefinansierede velfærdsydelser for udenlandske statsborgere"},
+            {"title": "Militær støtte til Ukraine"}]))
+        self.assertEqual(statistics.relevance, IRRELEVANT)
+
+    def test_bare_special_law_requires_manual_scope_review_without_automatic_upgrade(self):
+        result = classify(publication("SUU alm. del", type_id=4, documents=[{
+            "title": "Finansiering af voksentandplejen inden for rammerne af særloven og en tandkonto"}]))
+        self.assertEqual(result.relevance, IRRELEVANT)
+        self.assertIn("ambiguous_special_law_scope", result.diagnostics)
+        self.assertEqual(classify(publication("Opholdstilladelse efter særloven")).relevance, POTENTIAL)
+
+    def test_source_scope_regressions_are_not_identifier_exceptions(self):
+        path = Path(__file__).parent / "fixtures" / "relevance_scope_1617.json"
+        fixtures = json.loads(path.read_text())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            for item in fixtures:
+                classify(item["record"])
+        self.assertEqual(output.getvalue(), "")
+        for item in fixtures:
+            for external_id in (item["record"].get("external_id"), "999999999"):
+                with self.subTest(name=item["name"], external_id=external_id):
+                    result = classify({**item["record"], "external_id": external_id})
+                    self.assertEqual(result.relevance, item["expected"])
+
     def test_production_audit_regression_evidence_and_identifier_independence(self):
         fixtures = json.loads((Path(__file__).parent / "fixtures" / "relevance_production_audit_1611.json").read_text())
         self.assertEqual(len(fixtures), 12)

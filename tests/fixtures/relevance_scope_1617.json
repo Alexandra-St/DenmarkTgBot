@@ -1,0 +1,350 @@
+[
+  {
+    "name": "Official source title excerpts FT 102971",
+    "record": {
+      "source": "folketinget",
+      "external_id": "102971",
+      "title": "ERU alm. del",
+      "type_id": 4,
+      "documents": [
+        {
+          "title": "Orientering om aktstykke om overførsel af uforbrugte midler fra grøn investeringsordning til erhvervssporet i Ukrainefonden, fra erhvervsministeren "
+        },
+        {
+          "title": "Orientering om aktstykke om en ny etableringsenhed i regi af Erhvervsstyrelsen, som skal tilbyde ukrainske virksomheder den fornødne hjælp til hurtig etablering, med henblik på at opbygge forsvarsindustriel produktion i Danmark til gavn for den ukrainske forsvarskamp, fra erhvervsministeren"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 105133",
+    "record": {
+      "source": "folketinget",
+      "external_id": "105133",
+      "title": "UDF alm. del",
+      "type_id": 4,
+      "documents": [
+        {
+          "title": "Appel fra Ukraines parlament vedrørende markeringen af 30‑året for landets forfatning"
+        },
+        {
+          "title": "Spm. om andel af udisponerede midler i Ukrainefonden der er politisk reserveret, øremærket og fortsat disponibel til nye initiativer"
+        },
+        {
+          "title": "Henvendelse af 20. august 2026 fra Ukraines Centrale Valgkommission om erklæring  om de planlagte, ulovlige russiske Duma-valg i besatte områder af Ukraine"
+        },
+        {
+          "title": "UDF alm. del - svar på spm. 81 om andel af udisponerede midler i Ukrainefonden der er politisk reserveret, øremærket og fortsat disponibel til nye initiativer"
+        },
+        {
+          "title": "UDF alm. del - svar på spm. 73 om status for Ukrainefonden, samlet ramme og udbetalte, disponerede, endnu ikke udbetalte og udisponerede midler"
+        },
+        {
+          "title": "Spm. om status for Ukrainefonden, samlet ramme og udbetalte, disponerede, endnu ikke udbetalte og udisponerede midler"
+        },
+        {
+          "title": "Erklæring af 3. september 2026 fra Ukraines parlament om sovjetiske forbrydelser i Zakarpattia 1944-1946"
+        },
+        {
+          "title": "Spm. om regeringen vil tilføre nye midler til Ukrainefonden mv."
+        },
+        {
+          "title": "Spm., om behovet for støtte til ukrainere med handicap og veteraner med handicap vil være mindre efter 2026 end i dag mv. "
+        },
+        {
+          "title": "Spm. om, hvilke initiativer Danmark støtter eller planlægger at støtte for at sikre, at mennesker med handicap i Ukraine får bedre adgang til beskyttelsesrum, offentlig infrastruktur og andre centrale dele af genopbygningen mv. "
+        },
+        {
+          "title": "Spm. om, hvilke konkrete aktiviteter og indsatser der forventes at bortfalde eller blive reduceret, når særbevillingen på 6 mio. kr. årligt til Danske Handicaporganisationers arbejde i Ukraine og Moldova udløber ved udgangen af 2026 mv."
+        },
+        {
+          "title": "Spm. om, hvordan Danmark fremadrettet vil bidrage til rehabilitering og reintegration af ukrainske veteraner med handicap mv."
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 105144",
+    "record": {
+      "source": "folketinget",
+      "external_id": "105144",
+      "title": "MOF alm. del",
+      "type_id": 4,
+      "documents": [
+        {
+          "title": "MOF alm. del - svar på MFU spm. 39 om den danske stat direkte eller indirekte støtter industrielle svineprojekter i andre EU-lande og i Ukraine gennem investeringer, eksportkreditordninger, eksportfremme eller andre offentligt støttede initiativer"
+        },
+        {
+          "title": "MFU spm. om den danske stat direkte eller indirekte støtter industrielle svineprojekter i andre EU-lande og i Ukraine gennem investeringer, eksportkreditordninger, eksportfremme eller andre offentligt støttede initiativer"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 105947",
+    "record": {
+      "source": "folketinget",
+      "external_id": "105947",
+      "title": "UDF alm. del",
+      "type_id": 4,
+      "documents": [
+        {
+          "title": "Invitation til markeringen \"SAVE OLESHKY – Humanitær adgang og sikker evakuering nu\" 8/10-26, fra Ukrainians in Denmark (AUD)"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 106002",
+    "record": {
+      "source": "folketinget",
+      "external_id": "106002",
+      "title": "ERU alm. del",
+      "type_id": 4,
+      "documents": [
+        {
+          "title": "Orientering om aktstykke om genudlånsadgang til Ukrainefondens erhvervsspor, fra erhvervs- og konkurrencekraftsministeren"
+        },
+        {
+          "title": "Orientering om implementering af Build with Ukraine, fra erhvervs- og konkurrencekraftsministeren"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 106037",
+    "record": {
+      "source": "folketinget",
+      "external_id": "106037",
+      "title": "Forslag til finanslov for finansåret 2027. ",
+      "type_id": 3,
+      "documents": [
+        {
+          "title": "Spm. om fordelingen af reserven på konto 35.11.70 mellem dansk forsvar og militær støtte til Ukraine"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 106375",
+    "record": {
+      "source": "folketinget",
+      "external_id": "106375",
+      "title": "Forslag til RÅDETS GENNEMFØRELSESAFGØRELSE om konstatering af, at betingelserne for den delvise betaling af den niende rate i henhold til planen for Ukraine under Ukrainefaciliteten er opfyldt på tilfredsstillende vis",
+      "type_id": 7,
+      "documents": [
+        {
+          "title": "Forslag til RÅDETS GENNEMFØRELSESAFGØRELSE om konstatering af, at betingelserne for den delvise betaling af den niende rate i henhold til planen for Ukraine under Ukrainefaciliteten er opfyldt på tilfredsstillende vis"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 99241",
+    "record": {
+      "source": "folketinget",
+      "external_id": "99241",
+      "title": "ERU alm. del",
+      "type_id": 4,
+      "documents": [
+        {
+          "title": "Aktstykke 13 fra Erhvervsministeriet om udvidelsen af låne- og garantiordningen i EIFO til genopbygning af kritisk infrastruktur i Ukraine"
+        },
+        {
+          "title": "Aktstykke om etablering af en garantifacilitet til at understøtte danske virksomheders investeringer i ukrainsk forsvarsindustri, fra erhvervsministeren"
+        },
+        {
+          "title": "Orientering om etablering af ukrainsk virksomhed i Danmark, fra erhvervsministeren"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 1227",
+    "record": {
+      "source": "folketinget",
+      "external_id": "1227",
+      "title": "Forslag til lov for Grønland om udlændinges adgang til opholds- og arbejdstilladelse i anlægsfasen af et storskalaprojekt.",
+      "type_id": 3,
+      "documents": [
+        {
+          "title": "Spm. om hvad den danske regering vil gør, hvis det efter ikraftræden af særloven viser sig, at denne er i strid med ILO´s kernekonventioner, idet den henviser til Storskalaloven, til justitsministeren"
+        },
+        {
+          "title": "L 198 - svar på spm. 96 om hvad den danske regering vil gør, hvis det efter ikraftræden af særloven viser sig, at denne er i strid med ILO´s kernekonventioner, idet den henviser til Storskalaloven, fra justitsministeren"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official source title excerpts FT 105095",
+    "record": {
+      "source": "folketinget",
+      "external_id": "105095",
+      "title": "SUU alm. del",
+      "type_id": 4,
+      "documents": [
+        {
+          "title": "Spm. om, hvorvidt de 4 mia. kr. som regeringen har afsat til voksentandplejen frem mod 2030 vil blive forvaltet inden for rammerne af særloven som en del af etableringen af en tandkonto eller via særskilte puljemidler"
+        },
+        {
+          "title": "SUU alm. del - svar på spm. 78 om, hvorvidt de 4 mia. kr. som regeringen har afsat til voksentandplejen frem mod 2030 vil blive forvaltet inden for rammerne af særloven som en del af etableringen af en tandkonto eller via særskilte puljemidler"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official Danish Greenland border-control draft HP 70190",
+    "record": {
+      "source": "hoeringsportalen",
+      "external_id": "70190",
+      "title": "Høring over udkast til bekendtgørelse for Grønland om luftfartsselskabers og førere af luftfartøjers forpligtelser i forbindelse med grænsekontrol",
+      "evidence_fragments": [
+        {
+          "kind": "DRAFT_NEW_PROVISIONS",
+          "text": "  \nNotat \n \n \n \n \n \n \n \n \n20. juni 2025 \nUdlændinge- og \nIntegrationsministeriet \nAsyl og Visum \nSlotsholmsgade 10 \n1216 København K \n \nTel. 6198 4000 \nMail uim@uim.dk \nWeb www.uim.dk \n \n \n \n \n \n \n \n \nUDKAST \n \nBekendtgørelse for Grønland om luftfartsselskabers og førere af \nluftfartøjers forpligtelser i forbindelse med grænsekontrol  \n \nI medfør af § 38, stk. 4, og § 60, stk. 2,  i anordning nr. 150 af 23. februar \n2001 om ikrafttræden for Grønland af udlændingeloven som ændret ved \nanordning nr. 759 af 12. juni 2023, jf. anordningsbekendtgørelse nr. 184 \naf 14. februar 2025, og efter forhandling med Naalakkersuisut, fastsættes: \n \nLuftfartsselskabers og førere af luftfartøjers forpligtelser \n \n§ 1. Førere af luftfartøjer, der ankommer til Grønland fra eller afgår fra \nGrønland til et land, der ikke er tilsluttet Schengenkonventionen, skal påse, \n1) at besætningsmedlemmer og eventuelle passagerer forbliver \nombord, indtil indrejsekontrol kan finde sted, jf. stk. 2-4, og \n2) at luftfartøjet ikke afgår, før udrejsekontrol af \nbesætningsmedlemmer og eventuelle passagerer har fundet sted, \njf. stk. 2-4. \nStk. 2.  Luftfartsselskaber for luftfartøjer, jf. stk. 1, der i fast rutefart \nmedbringer passagerer til lufthavne i Grønland, hvor der ikke er fast \npolitibetjening, skal have en ilandsætningstilladelse, der efter forhandling \nmed Grønland Selvstyre udstedes af udlæ ndinge- og \nintegrationsministeren. Førere af luftfartøjer skal overholde de \nbestemmelser, der fastsættes i ilandsætningstilladelsen, om anmeldelse af \nbesætningsmedlemmer og passagerer samt andre vilkår i forbindelse med \nind- og udrejsekontrol i Grønland. \nStk. 3. Førere af luftfartøjer, jf. stk. 1, der ikke i fast rutefart ankommer \ntil eller afgår fra en lufthavn i Grønland, skal inden ankomst eller afgang \nunderrette lufthavnen om luftfartøjets ankomst- eller afgangstidspunkt og \n  \nNotat \n \n \n \n \nom antallet af besætningsmedlemmer og passagerer med henblik på, at \nlufthavnen videregiver oplysningerne til politiets \npassagerlisteoplysningsenhed i Danmark til brug for tilrettelæggelse af \nind- og udrejsekontrollen. \nStk. 4. Førere af private luftfartøjer, jf. stk. 1, skal før afgang fremsende \nflyveplanen i overensstemmelse med bilag 2 til konventionen angående \ninternational civil luftfart samt oplysninger om passagerernes identitet til \npolitiets passagerlisteoplysningsenhed i Danmark til brug for \ntilrettelæggelse af ind- og udrejsekontrollen. \nStk. 5. Luftfartsselskaber skal forud for luftfartøjets ankomst til \nGrønland levere oplysninger om de ombordværende passagerers og \nbesætningsmedlemmers fulde navn, fødselsdato, køn, nationalitet, \nrejselegitimation (type, nummer, udstedende myndighed og udløbsdato) , \ngrænseovergangssted i Grønland, luftfartøjets transportkode og afgangs - \nog ankomsttidspunkt samt oplysninger om passagerers oprindelige \nombordstigningssted, rejserute og bookingkode til politiets \npassagerlisteoplysningsenhed i Danmark. Oplysninge rne afgives \nelektronisk eller på anden af Rigspolitiet fastsat måde. Politiets \npassagerlisteoplysningsenhed i Danmark sletter modtagne \npersonhenførbare oplysninger senest 24 timer efter, at passagererne er \nindrejst i Grønland, medmindre oplysningerne sener e er nødvendige til \nvaretagelsen af politiets øvrige opgaver. \n \nForanstaltninger \n \n§ 2. Den, der overtræder § 1, idømmes bøde eller foranstaltninger efter \nkriminallov for Grønland. \nStk. 2. Der kan pålægges selskaber m.v. (juridiske personer) \nkriminalretligt ansvar efter reglerne i kapitel 5 i kriminallov for Grønland. \n \nIkrafttræden mv. \n \n§ 3. Bekendtgørelsen træder i kraft den […] 2025.  \n \nKaare Dybvad Bek \n/ \nBrit Gotthard Jensen ",
+          "source_url": "https://prodstoragehoeringspo.blob.core.windows.net/bc817119-6053-4a7a-8f13-36ca4b2a74a9/Udkast%20til%20bekendtg%C3%B8relse%20(Gr%C3%B8nland).pdf",
+          "sha256": "c52084df0267e83b7210cb713ae186477bbdf0c7958c09575ef3043bf4fdce63"
+        },
+        {
+          "kind": "OTHER_OFFICIAL_ATTACHMENT",
+          "text": " \nAllakkiaq \n \n \n \n \n \n \n \n20. juni 2025 \nUdlændinge- og \nIntegrationsministeriet \nAsyl og Visum \nSlotsholmsgade 10 \n1216 København K \n \nTel. 6198 4000 \nMail uim@uim.dk \nWeb www.uim.dk \n \n \n \n \n \n \n \n \nMISSINGIUT \n \nSilaannakkut anga llassinermut ingerlatseqatigiiffiit aamma  \nsilaannakkut angallassissutini  timmisartortartut killeqarfinnik \nnakkutilliinermut atatillugu pisissaaffii pillugit Kalaallit Nunaannut \nnalunaarut. \n \nNunami allamiut pillugit inatsisip Kalaallit Nunaannut atortuulernera \npillugu peqqussummi nr. 150 -imi, 23. februar 2001 -imeersumi, \npeqqussummik nalunaarut nr. 184, 14. februar 2025 -imeersoq malillugu \npeqqussutikkut nr. 759 -ikkut, 12. juni 2023 -imeersukkut \nallanngortinneqartumi § 385, imm. 4, aamma § 60, imm. 2 malillugit, \naamma Naalakkersuisut isumaqatigiinniarfigereernerisa kingorna, \naalajangersarneqassaaq: \n \nSilaannakkut angallassinermut ingerlatseqatigiiffiit aamma \nsilaannakkut angallassissutini timmisartortartut pisussaaffii \n \n§ 1.   Timmisartuni timmisartortartut, nunamit Schengen -imi \nisumaqatigiissummik ilanngussimanngitsumit tikittut imaluunniit \nnunamut Schengen -imi isumaqatigiissummik ilanngussimanngitsumut \naallartut, tulliuttut nakkutigissavaat, \n1) inuttat aamma ilaasoqarpat ilaasut, imm. 2 -miit 4 ilanngullugu \nmalillugit nunamut tassunga isernermut nakkutilliinerup \npinissaanut timmisartumiiginnarnissaat, aamma \n2) imm. 2-miit 4 ilanngullugu malillugit inuttat aamma ilaasoqarpat \nilaasut aallarnissamut nakkutilliivigineqarnerat pisinnagu, \nsilaannakkut angallassissutip aallannginnissaa. \nImm. 2.   Imm. 1 malillugu, silaannakkut angallassissutit, \naalajangersimasumik aaqqissuuteriikkamik angallaveqarlutik Kalaallit \nNunaanni mittarfinnut ilaasunik nassataqartartut, taakkunani \n \nAllakkiaq \n \n \n \naalajangersimasumik politiinit sullissisoqarani, Kalaallit Nunaanni \nNamminersorlutik Oqartussat isumaq atigiinniarfigereerlugit udlændinge- \naamma intregrationsministerimit atulersinneqartumik minnissamut \nakuersissummik peqassapput.  Inuttat aamma ilaasut pillugit \nnalunaaruteqartarnissaq kiisalu Kalaallit Nunaanni isernermi - aamma \naallarnermi nakkutilliinernut atatillugu piumasaqaatit, minnissamut \nakuersissummut atatillugu  piumasaqaatigineqartut allat \naalajangersarneqartut, silaannakkut angallassissutini timmisartortartut \neqqortissavaat. \nImm. 3 . Imm. 1 malillugu silaannakkut angallassissutini  \ntimmisartortartut, aalajangersimasumik aaqqissuuteriigaanngitsumik \nangallaveqarlutik Kalaallit Nunaanni mittarfinnut tikittartut imaluunniit \nmittarfinnit aallartartut, tikinnginnerminni imaluunniit \naallannginnerminni, silaannakkut angallassissutip tikinnissaanut - \nimaluunniit aallarnissaanut piffissaq  aamma isernermut - aamma \naallarnermut nakkutilliinermut atugassamik, politiit ilaasut pillugit \npaasissutissanik katersiviannut Danmarkimiittumut paasissutissat \ningerlateqqinnissaat siunertaralugu, inuttat ilaasullu amerlassusaat pillugit \nmittarfimmut nalunaaruteqassapput. \nImm. 4.  Imm. 1 malillugu silaannakkut an gallassissutini \nnamminersortunit pigineqartuni timmisartortartut, nunat tamat akornanni \ninuit sakkutuujunngitsut pillugit silaannakkut angallassineq pillugu \nisumaqatigiissummut ilanngussaq 2 -mut naapertuuttumik, \naallannginnermi silaannakkut angallassinissamut pilersaarut kiisalu ilaasut \nkikkuuneri pillugit paasissutissat , isernermut- aamma aallarnermut \nnakkutilliinermut atugassat, politiit ilaasut pillugit paasissutissanik \nkatersiviannut Danmarkimiittumut nalunaarutigissavaat. \nImm. 5.  Ilaasut inuttallu atii tamakkiisut, ullut inuuffii, suia assusaat, \nnaalagaaffimmit suminngaanneernerat, angalanerminni kinaassutsimut \nuppernarsaataat (suussusaa, normua, oqartussaasut atulersitsisut aamma \nulloq atorunnaarfissaa), Kalaallit Nunaanni killeqarfiup ikaarfiusussap \nsumiiffia, silaannakkut angallassissutip angal lassisinnaanerminut kodea \naamma Kalaallit Nunaanit aallarnissaq - aamma Kalaallit Nunaannut \ntikinnissaq pillugit piffissaq kiisalu ilaasut aallaqqaataani \nangallassissummut ikiffiata sumiiffia, angalanermi aqqutit aamma \ninniminniinerminni kodeat, politiit il aasut pillugit paasissutissanik \nkatersiviannut Danmarkimiittumut, silaannakkut angallassissutip Kalaallit \nNunaannut tikinnissaa sioqqullugu, silaannakkut angallassinermut \ningerlatseqatigiiffiit nalunaarutigissavaat.  Paasissutissat \n \nAllakkiaq \n \n \n \nelektroniskiusumik imaluunniit periaaseq Rigspolitiinit \naalajangerneqartoq atorlugu tunniunneqassapput.  Paasissutissat inunnut \nataasiakkanut atassuserneqarsinnaasut, paasissutissat taakku politiit \nallanik suliaqarnerannut atatillugu kingusinnerusukkut \npisariaqartinneqalissanngippata, ilaasut Kalaallit Nunaannut isernerisa \nkingusinnerpaamik nalunaaquttap akunneri 24-it kingorna, politiit ilaasut \npillugit paasissutissanik katersiviata Danmarkimiittup nungutissavai. \n \nPineqaatissiissutit \n \n§ 2.  Inuk, § 1 -imik unioqqutitsisoq, akiliisitsissummik imaluunniit \nKalaallit Nunaanni pinerluttulerinermi inatsit malillugu \npineqaatissiissutinik eqqartuunneqassaaq. \nImm. 2. Ingerlatseqatigiiffiit il.il. (inatsisitigut pisinnaatitaasut \npisussaatitaasullu) Kalaallit Nunaanni pinerluttulerinermi inatsimmi \nkapitali 5 -imi malittarisassat malillugit pinerluttulerineq pillugu \ninatsiseqartitsineq malillugu akisussaatinneqarsinnaapput. \n \nAtuutilerfissaa il.il. \n \n§ 3.  Nalunaarut ulloq […] 2025 atuutilissaaq.  \n \nKaare Dybvad Bek \n/ \nBrit Gotthard Jensen ",
+          "source_url": "https://prodstoragehoeringspo.blob.core.windows.net/bc817119-6053-4a7a-8f13-36ca4b2a74a9/Udkast%20til%20bekendtg%C3%B8relse%20(Gr%C3%B8nlandsk).pdf",
+          "sha256": "8e89424237ea335a0026a286430c87324fc8f773a8c757a035f24105798cbd31"
+        }
+      ],
+      "complete": true
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official Faroe-only subject FT 57096",
+    "record": {
+      "source": "folketinget",
+      "external_id": "57096",
+      "title": "Vil ministeren sikre, at der bliver indført en rimelig tidsbegrænset behandlingsgaranti vedrørende ansøgninger omfattet af lov for Færøerne om udlændinges adgang til opholdstilladelse med henblik på visse former for beskæftigelse?",
+      "type_id": 10,
+      "complete": true,
+      "documents": []
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official Faroe-only subject FT 6994",
+    "record": {
+      "source": "folketinget",
+      "external_id": "6994",
+      "title": "Forslag til lov for Færøerne om udlændinges adgang til opholdstilladelse med henblik på visse former for beskæftigelse.",
+      "type_id": 3,
+      "complete": true,
+      "documents": [
+        {
+          "title": "Fremsættelsestale af lovforslag"
+        },
+        {
+          "title": "Lovforslag som fremsat"
+        },
+        {
+          "title": "Høringssvar, fra integrationsministeren"
+        },
+        {
+          "title": "Høringsnotat fra integrationsministeren"
+        },
+        {
+          "title": "Udkast til tidsplan for udvalgets behandling af lovforslaget"
+        },
+        {
+          "title": "Tidsplan for udvalgets behandling af lovforslaget"
+        },
+        {
+          "title": "Lagmandens beslutning om rigslovsindstilling samt den færøske be-tænkning over lovforslaget, fra integrationsministeren "
+        },
+        {
+          "title": "1. udkast til betænkning"
+        },
+        {
+          "title": "Betænkning afgivet 27. maj"
+        },
+        {
+          "title": "Lovforslag som vedtaget"
+        }
+      ]
+    },
+    "expected": "IRRELEVANT"
+  },
+  {
+    "name": "Official Faroe-only subject FT 85359",
+    "record": {
+      "source": "folketinget",
+      "external_id": "85359",
+      "title": "Forslag til lov om ændring af lov for Færøerne om udlændinges adgang til opholdstilladelse med henblik på visse former for beskæftigelse. (Ændring af bestemmelsen om arbejdsmarkedstilknytning).",
+      "type_id": 3,
+      "complete": true,
+      "documents": [
+        {
+          "title": "Skriftlig fremsættelse (30. oktober 2020)"
+        },
+        {
+          "title": "Høringssvar og høringsnotat"
+        },
+        {
+          "title": "Spm. om, hvilke følger lovforslaget vil have for udlændinges adgang til Danmark, når Færøerne ligestiller de to nævnte udlændingegrupper, til udlændinge- og integrationsministeren\n"
+        },
+        {
+          "title": "Spm. om, at hvis de i loven nævnte udlændingegrupper med midlertidigt ophold sidestilles med udlændinge med varigt ophold, vil førstnævnte så samtidig få adgang til Danmark, til udlændinge- og integrationsministeren\n"
+        },
+        {
+          "title": "Spm. om  andre lovmæssige ændringer på udlændingeområdet, der i fremtiden vedtages på Færøerne, kan få følger for udlændingeloven i Danmark ophold, vil førstnævnte så samtidig få adgang til Danmark, til udlændinge- og integrationsministeren\n"
+        },
+        {
+          "title": "L 72 - svar på spm. 1 om, hvilke følger lovforslaget vil have for udlændinges adgang til Danmark, når Færøerne ligestiller de to nævnte udlændingegrupper, fra udlændinge- og integrationsministeren\n"
+        },
+        {
+          "title": "L 72 - svar på spm. 2 om, at hvis de i loven nævnte udlændingegrupper med midlertidigt ophold sidestilles med udlændinge med varigt ophold, vil førstnævnte så samtidig få adgang til Danmark, fra udlændinge- og integrationsministeren\n"
+        },
+        {
+          "title": "L 72 - svar på spm. 3 om  andre lovmæssige ændringer på udlændingeområdet, der i fremtiden vedtages på Færøerne, kan få følger for udlændingeloven i Danmark ophold, vil førstnævnte så samtidig få adgang til Danmark, fra udlændinge- og integrationsministeren\n"
+        },
+        {
+          "title": "Rigslovsindstilling fra Færøernes lagting, om at sætte forslag til Lov for Færøerne om udlændinges adgang til opholdstilladelse\nmed henblik på visse former for beskæftigelse i kraft for Færøerne, fra udlændinge- og integrationsministeren"
+        },
+        {
+          "title": "Udkast til betænkning"
+        },
+        {
+          "title": "Betænkning afgivet af Færøudvalget den 9. december 2020"
+        },
+        {
+          "title": "Betænkning afgivet 9/12-20"
+        },
+        {
+          "title": "Vedtaget af Folketinget ved 3. behandling den 18. december 2020"
+        },
+        {
+          "title": "Fremsat den 30. oktober 2020 af udlændinge- og integrationsministeren (Mattias Tesfaye)"
+        }
+      ]
+    },
+    "expected": "IRRELEVANT"
+  }
+]

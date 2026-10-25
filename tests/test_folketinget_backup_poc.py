@@ -228,7 +228,7 @@ class BackupPocSafetyTests(unittest.TestCase):
             classification = result["classification"]
             self.assertEqual(classification["relevance_counts"], {"DIRECT": 1, "POTENTIAL": 1, "IRRELEVANT": 1})
             self.assertEqual(classification["classified_case_count"], 3)
-            self.assertEqual(classification["ruleset_version"], "1.2")
+            self.assertEqual(classification["ruleset_version"], "1.3")
             output = StringIO()
             with redirect_stdout(output):
                 POC.write_candidate_classification_summary(result)
@@ -317,7 +317,7 @@ class BackupPocSafetyTests(unittest.TestCase):
             self.assertEqual(ingestion["relevance_counts"], {"DIRECT": 1, "POTENTIAL": 1, "IRRELEVANT": 1})
             self.assertEqual(ingestion["complete_candidate_count"], 3)
             self.assertEqual(ingestion["incomplete_candidate_count"], 0)
-            self.assertEqual(ingestion["ruleset_version"], "1.2")
+            self.assertEqual(ingestion["ruleset_version"], "1.3")
 
     def test_snapshot_ingestion_preparation_batches_more_than_50_records(self) -> None:
         cases = [self._ingestion_case(index + 1, f"Vejlov {index + 1}") for index in range(51)]

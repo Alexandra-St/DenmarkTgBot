@@ -592,6 +592,52 @@ test("delivery remains disabled by default; success is recorded once through a m
   } finally { db.close(); }
 });
 
+test("reclassification to IRRELEVANT defers a pending row but restoration can send it", async () => {
+  const db = await fixture();
+  try {
+    const eventId = await addEvent(db, { id: "relevance-change", relevance: "POTENTIAL" });
+    const queueEnv = { DB: db as never, NOTIFICATION_QUEUE_ENABLED: "true", NOTIFICATION_ACTIVATION_CUTOFF: cutoff };
+    await prepareNotificationQueue(queueEnv, "00000000-0000-4000-8000-000000000001", now);
+    await db.prepare("UPDATE publications SET relevance = 'IRRELEVANT' WHERE external_id = ?").bind("relevance-change").run();
+    let calls = 0;
+    const mock = { sendMessage: async () => { calls += 1; return { ok: true }; } };
+    const deliveryEnv = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff };
+    assert.deepEqual(await deliverPendingNotifications(deliveryEnv, mock, now), { enabled: true, sent: 0, failed: 0 });
+    assert.equal(calls, 0);
+    const pending = await db.prepare("SELECT status, attempts FROM notifications WHERE event_id = ?").bind(eventId).first();
+    assert.deepEqual({ ...pending }, { status: "PENDING", attempts: 0 });
+    await db.prepare("UPDATE publications SET relevance = 'POTENTIAL' WHERE external_id = ?").bind("relevance-change").run();
+    assert.deepEqual(await deliverPendingNotifications(deliveryEnv, mock, now), { enabled: true, sent: 1, failed: 0 });
+    assert.equal(calls, 1, "without terminal suppression an old pending event can become eligible again");
+  } finally { db.close(); }
+});
+
+test("existing FAILED status supports scoped idempotent suppression without changing SENT audit", async () => {
+  const db = await fixture();
+  try {
+    const pendingEvent = await addEvent(db, { id: "suppressed", relevance: "POTENTIAL" });
+    const sentEvent = await addEvent(db, { id: "preserved-sent", relevance: "POTENTIAL" });
+    await prepareNotificationQueue({ DB: db as never, NOTIFICATION_QUEUE_ENABLED: "true", NOTIFICATION_ACTIVATION_CUTOFF: cutoff },
+      "00000000-0000-4000-8000-000000000001", now);
+    await db.prepare("UPDATE notifications SET status = 'SENT', attempts = 1 WHERE event_id = ?").bind(sentEvent).run();
+    // Local-only proof of the proposed future reclassification transaction.
+    await db.prepare("UPDATE publications SET relevance = 'IRRELEVANT' WHERE external_id IN ('suppressed', 'preserved-sent')").run();
+    const suppress = () => db.prepare("UPDATE notifications SET status = 'FAILED', last_error = 'reclassified_irrelevant' WHERE status = 'PENDING' AND event_id = ? AND EXISTS (SELECT 1 FROM publications p JOIN publication_events e ON e.publication_id=p.id WHERE e.id=notifications.event_id AND p.relevance='IRRELEVANT')")
+      .bind(pendingEvent).run();
+    assert.equal(suppress().meta.changes, 1);
+    assert.equal(suppress().meta.changes, 0);
+    await db.prepare("UPDATE publications SET relevance = 'POTENTIAL' WHERE external_id = 'suppressed'").run();
+    let calls = 0;
+    await deliverPendingNotifications({ DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff },
+      { sendMessage: async () => { calls += 1; return { ok: true }; } }, now);
+    assert.equal(calls, 0);
+    const suppressed = await db.prepare("SELECT status, attempts, last_error FROM notifications WHERE event_id = ?").bind(pendingEvent).first();
+    assert.deepEqual({ ...suppressed }, { status: "FAILED", attempts: 0, last_error: "reclassified_irrelevant" });
+    const sent = await db.prepare("SELECT status, attempts FROM notifications WHERE event_id = ?").bind(sentEvent).first();
+    assert.deepEqual({ ...sent }, { status: "SENT", attempts: 1 });
+  } finally { db.close(); }
+});
+
 test("Telegram timeout/error is terminal and is not retried automatically", async () => {
   const db = await fixture();
   try {

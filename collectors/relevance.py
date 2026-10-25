@@ -9,7 +9,7 @@ from typing import Mapping
 
 from collectors.hearing_evidence import DRAFT_NEW_PROVISIONS
 
-RULESET_VERSION = "1.2"
+RULESET_VERSION = "1.3"
 DIRECT = "DIRECT"
 POTENTIAL = "POTENTIAL"
 IRRELEVANT = "IRRELEVANT"
@@ -87,7 +87,7 @@ _POPULATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     _compile(r"\basylansøger\w*\b"),
     _compile(r"\btredjelandsborger\w*\b"),
     _compile(r"\bpersoner\s+med\s+opholdstilladelse\b"),
-    _compile(r"\budenlandske\s+borgere\b"),
+    _compile(r"\budenlandske\s+(?:statsborgere|borgere)\b"),
     _compile(r"\bikke\s*danske\s+statsborgere\b"),
     _compile(r"\bpersoner\s+med\s+international\s+beskyttelse\b"),
 )
@@ -195,6 +195,60 @@ def _target_context(text: str) -> bool:
     return bool(_UKRAINIAN.search(text))
 
 
+def _welfare_applicability(text: str) -> bool:
+    # A benefit restriction is uncertain legal applicability; spending statistics
+    # alone are not evidence that anybody's rights are changing.
+    return (bool(re.search(r"\bvelfærdsydels\w*\b", text))
+            and _has(_POPULATION_PATTERNS, text)
+            and bool(re.search(r"\b(?:afskær\w*|afskaff\w*|nedsæt\w*|betingels\w*|ret til|adgang til)\b", text)))
+
+
+def _non_applicable_target_context(text: str) -> bool:
+    """Explicit non-regulatory events/aid cannot inherit a protected-group mention."""
+    if not _target_context(text):
+        return False
+    applicable = (_welfare_applicability(text) or any(_has(patterns, text) for patterns in _TOPICS.values())
+                  or bool(re.search(r"\b(?:rettighed\w*|ret til|sundhedsydels\w*|tandplej\w*|skolegang\w*)\b", text))
+                  or any(rule == "direct.ukraine_special_law" for rule in _matched_direct(text)))
+    return not applicable and bool(re.search(
+        r"\b(?:invitation|koncert\w*|velgørenhedsarrangement\w*|humanitær adgang|sikker evakuering|"
+        r"militær (?:bistand|støtte|hjælp)|våbenleveranc\w*|forsvarsindustri\w*|"
+        r"ukrainefond\w*|ukrainefacilitet\w*|erhvervsinvestering\w*)\b", text))
+
+
+def _applicable_target_context(text: str) -> bool:
+    """Country mentions alone do not establish applicability to protected people."""
+    if not _target_context(text) or _non_applicable_target_context(text):
+        return False
+    if _matched_direct(text):
+        return True
+    return (_welfare_applicability(text) or any(_has(patterns, text) for patterns in _TOPICS.values())
+            or bool(re.search(r"\b(?:rettighed\w*|ret til|sundhedsydels\w*|tandplej\w*|skolegang\w*)\b", text)))
+
+
+def _territorial_exclusion(record: Mapping[str, object]) -> str | None:
+    # Use the legislative subject, not incidental countries in attachments. A
+    # committee is a container and can also hold material applying in Denmark.
+    title = normalize_text(str(record.get("title") or ""))
+    if record.get("type_id") == 4 or re.fullmatch(r"[a-zæøå]+ alm del(?: .*)?", title):
+        return None
+    territory = r"(?:grønland|færøerne|norge|sverige|island|tyskland)"
+    exclusive = re.search(
+        r"\b(?:lov(?:en)?|bekendtgørelse|regler|anordning)\s+(?:(?:alene|kun|udelukkende)\s+)?"
+        r"(?:for|i|på)\s+" + territory + r"\b", title)
+    exclusive = exclusive or re.search(r"\bikrafttræden\b.*\b(?:i|på)\s+" + territory + r"\b", title)
+    exclusive = exclusive or re.search(
+        r"\b(?:opholdstillad\w*|arbejdstillad\w*|arbejder|arbejde|grænsekontrol\w*)\s+"
+        r"(?:i|på)\s+(?:grønland|færøerne)\b", title)
+    description = normalize_text(str(record.get("content_text") or ""))
+    danish_application = re.search(
+        r"\b(?:gælder|anvendes|finder anvendelse)\s+(?:også\s+)?(?:i|for)\s+danmark\b", description)
+    if (exclusive and not danish_application
+            and not re.search(r"\bdanmark\b|\bf eks\b|\beksempelvis\b", title)):
+        return "negative.territory_specific_regime"
+    return None
+
+
 def _child_evidence_scope(record: Mapping[str, object], primary_text: str) -> str:
     """Require a topical bridge before a child can classify an entire Sag."""
     if record.get("source") != "folketinget":
@@ -247,6 +301,9 @@ def _potential_matches(text: str, *, target_context: bool = False) -> list[str]:
 
 def _scope_exclusion(record: Mapping[str, object], primary: str) -> str | None:
     """Positive evidence of another jurisdiction/regime, never absence of a keyword."""
+    territory = _territorial_exclusion(record)
+    if territory:
+        return territory
     if record.get("source") != "folketinget":
         return None
     title = normalize_text(record.get("title")) if isinstance(record.get("title"), str) else ""
@@ -257,9 +314,6 @@ def _scope_exclusion(record: Mapping[str, object], primary: str) -> str | None:
                                     for item in record.get(key, ()) or () if isinstance(item, Mapping))
             if not _UKRAINIAN.search(normalize_text(child_titles)):
                 return "negative.other_protection_regime"
-        if (re.search(r"\b(?:for grønland|i grønland|grønlandske)\b", title)
-                and not re.search(r"\bdanmark\b", title) and not re.search(r"\b1\s+.*\b2\b", title)):
-            return "negative.greenland_specific_regime"
         syrian_subject = re.search(r"\bsyriske (?:flygtninge|asylansøgere|statsborgere)\b|\b(?:syrere|syrer|syrien)\b", title)
         # A country mentioned as one example in a general programme is not its scope.
         if (syrian_subject and not _UKRAINIAN.search(primary)
@@ -288,7 +342,8 @@ def _scope_exclusion(record: Mapping[str, object], primary: str) -> str | None:
 def _broad_scope(text: str) -> bool:
     population = _has(_POPULATION_PATTERNS, text)
     migration_context = population or bool(re.search(r"\b(?:udlænding\w*|flygtning\w*|ophold\w*|ukrain\w*)\b", text))
-    return (_has(_TOPICS["residence"] + _TOPICS["family"] + _TOPICS["work"], text)
+    return (_welfare_applicability(text)
+            or _has(_TOPICS["residence"] + _TOPICS["family"] + _TOPICS["work"], text)
             or bool(_TEMP_PROTECTION.search(text))
             or (migration_context and any(_has(patterns, text) for patterns in _TOPICS.values()))
             or bool(re.search(r"\bintegrationsydelse\w*\b", text)))
@@ -303,13 +358,16 @@ def classify(publication: object) -> RelevanceResult:
     children = [item for item in texts if item[0] in {"documents.title", "stages.title"}]
     primary_context = " ".join(text for _, _, text in primary)
     # One child's words cannot establish scope for unrelated siblings.
-    primary_direct = [(field, rule) for field, _, text in primary for rule in _matched_direct(text)]
+    primary_direct = [(field, rule) for field, _, text in primary
+                      if not _non_applicable_target_context(text) for rule in _matched_direct(text)]
     # A comparison is not an assertion that the proposed change applies to this group.
     comparative = re.compile(r"\bpå lige fod med\b|\bsammenlignet med\b|\bi modsætning til\b|\btil forskel fra\b")
     child_direct = [(field, rule) for field, _, text in children
-                    if not comparative.search(text) for rule in _matched_direct(text)]
-    child_target = [(field, "potential.child_target_context") for field, _, text in children if _target_context(text)]
-    draft_direct = [(field, rule) for field, _, text in drafts for rule in _matched_direct(text)]
+                    if not comparative.search(text) and not _non_applicable_target_context(text)
+                    for rule in _matched_direct(text)]
+    child_target = [(field, "potential.child_target_context") for field, _, text in children if _applicable_target_context(text)]
+    draft_direct = [(field, rule) for field, _, text in drafts
+                    if not _non_applicable_target_context(text) for rule in _matched_direct(text)]
     negative_rules: list[str] = []
     if _UKRAINIAN.search(primary_context) and _has(_NEGATIVE_RULES[0][1], primary_context):
         negative_rules.append(_NEGATIVE_RULES[0][0])
@@ -334,6 +392,9 @@ def classify(publication: object) -> RelevanceResult:
     mixed = (child_scope == "mixed" or (record.get("source") == "folketinget"
              and record.get("type_id") == 9 and _has(_NEGATIVE_RULES[0][1], primary_context)))
     diagnostics: list[object] = []
+    if (any(re.search(r"\bsærlov(?:en|ens)?\b", text) for _, _, text in texts)
+            and not any(_applicable_target_context(text) for _, _, text in texts)):
+        diagnostics.append("ambiguous_special_law_scope")
     rules: list[str] = []
     evidence_fields: list[str] = []
     allowed = primary + drafts + (children if child_scope != "none" else [])
