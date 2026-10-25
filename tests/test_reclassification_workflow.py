@@ -61,6 +61,7 @@ class ReclassificationWorkflowTests(unittest.TestCase):
         self.assertEqual(json.loads(request.data), {"plan": json.loads(PLAN)})
         self.assertTrue(request.data.endswith(PLAN.encode() + b"}"))
         self.assertEqual(request.get_header("Authorization"), "Bearer " + TOKEN)
+        self.assertEqual(request.get_header("User-agent"), "DenmarkTgBot-Reclassification-Maintenance/1.0")
         self.assertEqual(timeout, 20)
         self.assertNotIn("conflicts", result.summary)
         self.assertNotIn("telegram_id", result.summary)
@@ -155,10 +156,13 @@ class ReclassificationWorkflowTests(unittest.TestCase):
     def test_non_2xx_cli_writes_only_filtered_summary_and_fails(self):
         body = json.dumps({**SUMMARY, "description": "private response detail"}).encode()
         error = urllib.error.HTTPError("https://worker.example", 409, "conflict", {}, io.BytesIO(body))
-        with tempfile.NamedTemporaryFile(mode="r+", encoding="utf-8") as summary:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event, \
+             tempfile.NamedTemporaryFile(mode="r+", encoding="utf-8") as summary:
+            json.dump({"inputs": {"plan_json": PLAN}}, event)
+            event.flush()
             output = io.StringIO()
             with patch.dict(os.environ, {"INPUT_ACTION": "apply", "INPUT_CONFIRM": "true",
-                 "INPUT_PLAN_JSON": PLAN, "INGEST_API_URL": "https://worker.example", "INGEST_API_TOKEN": TOKEN,
+                 "GITHUB_EVENT_PATH": event.name, "INGEST_API_URL": "https://worker.example", "INGEST_API_TOKEN": TOKEN,
                  "GITHUB_STEP_SUMMARY": summary.name}), patch.object(workflow.urllib.request, "build_opener",
                  return_value=Opener(error=error)), redirect_stdout(output):
                 self.assertEqual(workflow.main(), 1)
@@ -171,15 +175,63 @@ class ReclassificationWorkflowTests(unittest.TestCase):
 
     def test_cli_summary_and_stdout_never_print_plan_conflicts_or_token(self):
         output = io.StringIO()
-        with patch.dict(os.environ, {"INPUT_ACTION": "preview", "INPUT_CONFIRM": "false",
-             "INPUT_PLAN_JSON": PLAN, "INGEST_API_URL": "https://worker.example", "INGEST_API_TOKEN": TOKEN,
-             "GITHUB_STEP_SUMMARY": ""}), patch.object(workflow.urllib.request, "build_opener",
-             return_value=Opener(Response(200, SUMMARY))), redirect_stdout(output):
-            self.assertEqual(workflow.main(), 0)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event:
+            json.dump({"inputs": {"plan_json": PLAN}}, event)
+            event.flush()
+            with patch.dict(os.environ, {"INPUT_ACTION": "preview", "INPUT_CONFIRM": "false",
+                 "GITHUB_EVENT_PATH": event.name, "INGEST_API_URL": "https://worker.example", "INGEST_API_TOKEN": TOKEN,
+                 "GITHUB_STEP_SUMMARY": ""}), patch.object(workflow.urllib.request, "build_opener",
+                 return_value=Opener(Response(200, SUMMARY))), redirect_stdout(output):
+                self.assertEqual(workflow.main(), 0)
         rendered = output.getvalue()
         for private in ("private reason", "private-bearer-token", "70190", "must not leak", "secret-user", "source payload"):
             self.assertNotIn(private, rendered)
         self.assertIn("ready=1", rendered)
+
+    def test_cli_reads_exact_plan_from_github_event_file(self):
+        output = io.StringIO()
+        opener = Opener(Response(200, SUMMARY))
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event:
+            json.dump({"inputs": {"plan_json": PLAN}}, event)
+            event.flush()
+            with patch.dict(os.environ, {"INPUT_ACTION": "preview", "INPUT_CONFIRM": "false",
+                 "GITHUB_EVENT_PATH": event.name, "INGEST_API_URL": "https://worker.example", "INGEST_API_TOKEN": TOKEN,
+                 "GITHUB_STEP_SUMMARY": ""}), patch.object(workflow.urllib.request, "build_opener",
+                 return_value=opener), redirect_stdout(output):
+                self.assertEqual(workflow.main(), 0)
+        request, _ = opener.calls[0]
+        self.assertTrue(request.data.endswith(PLAN.encode() + b"}"))
+        for private in ("private reason", "70190", TOKEN):
+            self.assertNotIn(private, output.getvalue())
+
+    def test_cli_rejects_missing_or_malformed_event_plan_without_http(self):
+        for payload in ({}, {"inputs": {}}, {"inputs": {"plan_json": 123}}, None):
+            with self.subTest(payload=payload), tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event:
+                json.dump(payload, event)
+                event.flush()
+                output = io.StringIO()
+                opener = Opener(Response(200, SUMMARY))
+                with patch.dict(os.environ, {"INPUT_ACTION": "preview", "INPUT_CONFIRM": "false",
+                     "GITHUB_EVENT_PATH": event.name, "INGEST_API_URL": "https://worker.example", "INGEST_API_TOKEN": TOKEN,
+                     "GITHUB_STEP_SUMMARY": ""}), patch.object(workflow.urllib.request, "build_opener",
+                     return_value=opener), redirect_stdout(output):
+                    self.assertEqual(workflow.main(), 1)
+                self.assertEqual(opener.calls, [])
+                self.assertNotIn("70190", output.getvalue())
+                self.assertNotIn("private reason", output.getvalue())
+
+    def test_workflow_does_not_expose_plan_in_step_environment_or_shell(self):
+        path = ".github/workflows/reclassification-maintenance.yml"
+        with open(path, encoding="utf-8") as stream:
+            content = stream.read()
+        self.assertNotIn("INPUT_PLAN_JSON", content)
+        self.assertNotIn("${{ inputs.plan_json }}", content)
+        self.assertIn("GITHUB_EVENT_PATH: ${{ github.event_path }}", content)
+        self.assertNotIn("plan_json", content.split("        run:", 1)[1])
+        with open(workflow.__file__, encoding="utf-8") as stream:
+            helper_source = stream.read()
+        self.assertIn('os.environ.get("GITHUB_EVENT_PATH"', helper_source)
+        self.assertNotIn('os.environ.get("INPUT_PLAN_JSON"', helper_source)
 
     def test_workflow_is_dispatch_only_confirmed_and_serialized(self):
         path = ".github/workflows/reclassification-maintenance.yml"
@@ -197,6 +249,8 @@ class ReclassificationWorkflowTests(unittest.TestCase):
             self.assertEqual(set(inputs), {"action", "plan_json", "confirm"})
         self.assertIn("permissions:\n  contents: read", content)
         self.assertIn("INPUT_CONFIRM: ${{ inputs.confirm }}", content)
+        self.assertIn("GITHUB_EVENT_PATH: ${{ github.event_path }}", content)
+        self.assertNotIn("INPUT_PLAN_JSON", content)
         self.assertNotIn("set -x", content)
         self.assertIn("set +x", content)
         self.assertNotIn("TELEGRAM", content)

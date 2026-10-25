@@ -135,7 +135,8 @@ def run_request(
         request = urllib.request.Request(
             endpoint,
             data=body,
-            headers={"Authorization": "Bearer " + token, "Accept": "application/json", "Content-Type": "application/json"},
+            headers={"Authorization": "Bearer " + token, "Accept": "application/json", "Content-Type": "application/json",
+                     "User-Agent": "DenmarkTgBot-Reclassification-Maintenance/1.0"},
             method="POST",
         )
         client = opener or urllib.request.build_opener(_NoRedirect())
@@ -187,8 +188,19 @@ def _write_github_summary(action: str, result: Result) -> None:
 def main() -> int:
     action = os.environ.get("INPUT_ACTION", "")
     confirm = os.environ.get("INPUT_CONFIRM", "false")
-    plan_json = os.environ.get("INPUT_PLAN_JSON", "")
     try:
+        event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+        if not event_path:
+            raise WorkflowError("workflow_event_unavailable")
+        try:
+            with open(event_path, "r", encoding="utf-8") as stream:
+                event = json.load(stream)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise WorkflowError("workflow_event_invalid") from None
+        inputs = event.get("inputs") if isinstance(event, dict) else None
+        plan_json = inputs.get("plan_json") if isinstance(inputs, dict) else None
+        if not isinstance(plan_json, str):
+            raise WorkflowError("plan_json_missing")
         result = run_request(action, confirm, plan_json, os.environ.get("INGEST_API_URL", ""),
                              os.environ.get("INGEST_API_TOKEN", ""))
     except WorkflowError as error:
