@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { after, before, test } from "node:test";
 import { semanticRelationshipSummary } from "../src/ingestion.ts";
@@ -17,6 +18,15 @@ let persistPath: string;
 let baseUrl: string;
 let serverPort: number;
 let workerOutput = "";
+
+async function probeWorkerHealth(url: string, timeoutMs = 1_000): Promise<boolean> {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    return response.status === 200;
+  } catch {
+    return false;
+  }
+}
 
 async function request(path: string, method: string, body?: unknown, auth = true): Promise<{ status: number; body: any }> {
   let response: Response;
@@ -99,11 +109,10 @@ async function startWorker(): Promise<void> {
   server.stdout?.on("data", (chunk: Buffer) => { workerOutput = (workerOutput + chunk.toString()).slice(-4000); });
   server.stderr?.on("data", (chunk: Buffer) => { workerOutput = (workerOutput + chunk.toString()).slice(-4000); });
   baseUrl = "http://127.0.0.1:" + serverPort;
-  let ready = false;
-  for (let attempt = 0; attempt < 120; attempt += 1) {
+  const deadline = Date.now() + 30_000;
+  for (let attempt = 0; attempt < 120 && Date.now() < deadline; attempt += 1) {
     if (server.exitCode !== null && server.exitCode !== undefined) throw new Error("local Worker exited before starting: " + workerOutput.slice(-2000));
-    try { ready = (await fetch(baseUrl + "/health")).status === 200; } catch { /* server is starting */ }
-    if (ready) return;
+    if (await probeWorkerHealth(baseUrl + "/health")) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error("local Worker did not start: " + workerOutput.slice(-2000));
@@ -187,6 +196,21 @@ async function seedCommittedSnapshotState(
 async function expectLocalSqlFailure(sql: string): Promise<void> {
   await assert.rejects(query(sql));
 }
+
+test("local Worker readiness probe settles when the health response stalls", async () => {
+  const stalledServer = createHttpServer(() => { /* Keep the connection open without a response. */ });
+  await new Promise<void>((resolve) => stalledServer.listen(0, "127.0.0.1", resolve));
+  const address = stalledServer.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    const started = Date.now();
+    assert.equal(await probeWorkerHealth(`http://127.0.0.1:${address.port}/health`, 50), false);
+    assert.ok(Date.now() - started < 1_000, "a stalled HTTP response must not retain the test promise");
+  } finally {
+    stalledServer.closeAllConnections();
+    await new Promise<void>((resolve, reject) => stalledServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
 
 before(async () => {
   persistPath = await mkdtemp(join(tmpdir(), "denmarktgbot-d1-"));
