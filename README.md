@@ -1,21 +1,54 @@
 # DenmarkTgBot
 
-A free, open-source Telegram bot project for monitoring official Danish legislative updates that may affect Ukrainians under temporary protection.
+DenmarkTgBot is a free information bot that tracks official Danish publications that may affect Ukrainians under temporary protection in Denmark.
 
-**Intended audience:** Ukrainians under temporary protection in Denmark.
+**Status:** Public Beta
 
-## Current status
+**Telegram:** [@DenmarkForUABot](https://t.me/DenmarkForUABot)
 
-Phase 1.0.4 prepares Telegram onboarding, language selection, a localized menu, About, and notification settings for production. The production D1 database is created in the EU and its initial schema is applied. Worker deployment and Telegram webhook registration are pending. Source monitoring, News, Archive, and notification delivery are not implemented.
+**Languages:** Ukrainian and Russian
 
-## Technology stack
+## Sources
 
-- TypeScript and Cloudflare Workers
-- Cloudflare D1
-- Python collectors and GitHub Actions scheduling (planned)
-- Cloudflare Cron Triggers and Telegram Bot API (planned)
+Active beta sources:
 
-## Local development
+- [Høringsportalen](https://hoeringsportalen.dk/) — official Danish consultation publications and documents.
+- [Folketinget](https://www.ft.dk/) — parliamentary publications and proceedings.
+
+Planned after beta:
+
+- Nyidanmark
+- Retsinformation
+
+## Relevance and notifications
+
+Publications are classified as:
+
+- **DIRECT** — directly concerns Ukrainians under temporary protection in Denmark.
+- **POTENTIAL** — may be relevant depending on the subject and circumstances.
+- **IRRELEVANT** — does not meet the bot’s relevance criteria.
+
+Users can browse available publications in News and Archive, filter by category, and set independent notification preferences for DIRECT and POTENTIAL updates in Settings.
+
+## How it works
+
+- **Cloudflare Worker** serves the Telegram bot and application endpoints.
+- **Cloudflare D1** stores source publications, source state, user language, and notification preferences.
+- **Python collectors** retrieve and prepare official source data.
+- **GitHub Actions** runs the scheduled collector workflows.
+- **Telegram Bot API** delivers the localized bot interface and notifications.
+
+## Information and privacy
+
+DenmarkTgBot provides general information, not legal advice. Source monitoring is limited and may not include every relevant update. Always check the linked official source and seek qualified advice for decisions about your situation.
+
+The bot stores a Telegram identifier, language choice, and notification preferences to provide its service.
+
+## Development
+
+Requirements: Node.js 22.6 or newer and Python 3.
+
+Run the Worker locally and its checks:
 
 ```sh
 cd worker
@@ -25,23 +58,16 @@ npm run typecheck
 npm test
 ```
 
-The local Worker serves `GET /health` at `http://localhost:8787/health` and accepts authenticated updates at `POST /telegram/webhook`. Apply the existing schema locally with `npx wrangler d1 migrations apply denmarktgbot-db --local`.
+Run the Python test suite from the repository root:
 
-To configure local credentials, copy `.dev.vars.example` to `.dev.vars` and set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` there. Never commit `.dev.vars`. The webhook requires the `X-Telegram-Bot-Api-Secret-Token` header; without a configured secret it returns `503`, and a wrong value returns `401`. Automated tests replace the Telegram API with a mock and never contact Telegram. Do not send a real `/start` update to a locally running Worker unless you intend it to call the Telegram API.
+```sh
+python3 -m pip install -r collectors/requirements.txt
+python3 -m unittest discover -s tests
+```
 
-The test suite runs on Node.js 22.6 or newer and covers onboarding, saved languages and preferences, callback navigation, webhook validation, and `/health`/404 behavior.
+Current verified test baseline:
 
-## Production deployment
-
-Production is not yet configured. Use Cloudflare Workers Free and D1 Free; do not enable paid features. After authenticating Wrangler, inspect existing resources with `npx wrangler deployments list` and `npx wrangler d1 list`; reuse them if present. Create the D1 database only if missing, preferably with EU jurisdiction, then replace the local `database_id` in `worker/wrangler.jsonc` with the returned ID. Apply `npx wrangler d1 migrations apply denmarktgbot-db --remote`, set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` with interactive `npx wrangler secret put <NAME>` commands, then deploy with `npm run deploy`.
-
-Register the Telegram webhook only after verifying the deployed `/health` route and D1 binding. Configure HTTPS `/telegram/webhook`, the same secret as `TELEGRAM_WEBHOOK_SECRET`, and allowed updates `message` and `callback_query`; then verify with Telegram `getWebhookInfo`. Never put secret values in this file, Git, command output, or chat.
-
-After deployment, manually verify: `/start`; choose Ukrainian; open Settings; change both notification preferences independently; switch to Russian; return to the main menu; open About, News, and Archive; send `/start` again and confirm the language and preferences persisted. Acceptance remains pending until this manual check is confirmed. Do not expose Telegram IDs when checking D1.
-
-## Official data sources
-
-- [Folketinget Open Data (ODA)](https://oda.ft.dk/) — [documentation](https://www.ft.dk/da/dokumenter/aabne_data)
-- [Høringsportalen](https://hoeringsportalen.dk/) — [ATOM feeds](https://hoeringsportalen.dk/Syndication)
-
-See [docs/source_research.md](docs/source_research.md) for the source research report.
+| Suite | Tests |
+| --- | ---: |
+| Worker | 160 |
+| Python | 532 |

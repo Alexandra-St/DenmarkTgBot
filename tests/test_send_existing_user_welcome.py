@@ -23,7 +23,7 @@ from tools.send_existing_user_welcome import (
 class ExistingUserWelcomeTests(unittest.TestCase):
     def test_loads_exact_current_ukrainian_localization(self) -> None:
         text = localized_welcome("uk")
-        self.assertIn("🇩🇰 Вітаємо в DenmarkBot!", text)
+        self.assertIn("🇩🇰 Вітаємо в DenmarkTgBot!", text)
         self.assertIn("Høringsportalen", text)
         self.assertIn("Folketinget", text)
         self.assertLess(len(text), 4096)
@@ -42,8 +42,8 @@ class ExistingUserWelcomeTests(unittest.TestCase):
             {"telegram_id": 333333, "language": "uk"},
         ])
         self.assertEqual((recipient, language), (333333, "uk"))
-        self.assertIn("Вітаємо в DenmarkBot!", localized_welcome(language))
-        self.assertIn("Добро пожаловать в DenmarkBot!", localized_welcome("ru"))
+        self.assertIn("Вітаємо в DenmarkTgBot!", localized_welcome(language))
+        self.assertIn("Добро пожаловать в DenmarkTgBot!", localized_welcome("ru"))
 
     def test_refuses_wrong_count_missing_owner_or_invalid_language(self) -> None:
         with self.assertRaises(SafeUtilityError):

@@ -186,11 +186,17 @@ test("first language selection sends localized first-time welcome and then main 
     assert.equal(repo.users.get(id)?.notify_direct, 1);
     assert.equal(repo.users.get(id)?.notify_potential, 0);
     const welcome = telegram.sent.at(-1)!.text;
-    assert.match(welcome, language === "uk" ? /Вітаємо в DenmarkBot/u : /Добро пожаловать в DenmarkBot/u);
+    assert.match(welcome, language === "uk" ? /Вітаємо в DenmarkTgBot/u : /Добро пожаловать в DenmarkTgBot/u);
     assert.match(welcome, language === "uk" ? /Høringsportalen/u : /Høringsportalen/u);
-    assert.match(welcome, language === "uk" ? /Бета-джерела: Høringsportalen і Folketinget/u : /Источники бета-версии: Høringsportalen и Folketinget/u);
+    assert.match(welcome, language === "uk" ? /Активні джерела бета-версії: Høringsportalen і Folketinget/u : /Активные источники бета-версии: Høringsportalen и Folketinget/u);
     assert.doesNotMatch(welcome, /\b(?:Beta|DIRECT|POTENTIAL)\b/u);
-    assert.match(welcome, language === "uk" ? /Сповіщення поки тестуються й не надсилаються/u : /Уведомления пока тестируются и не отправляются/u);
+    assert.match(welcome, language === "uk" ? /налаштуваннях можна обрати категорії сповіщень/iu : /настройках можно выбрать категории уведомлений/iu);
+    assert.doesNotMatch(welcome, /уведомлен\w+ пока тестируются|сповіщен\w+ поки тестуються|автоматическ\w+ уведомлен\w+.*отключен\w+|автоматичн\w+ сповіщен\w+.*вимкнен\w+/iu);
+    const publicationNotice = t(language, "publicationListNotice");
+    assert.match(publicationNotice, /Høringsportalen/);
+    assert.match(publicationNotice, /Folketinget/);
+    assert.match(publicationNotice, language === "uk" ? /категорії сповіщень можна обрати в налаштуваннях/iu : /категории уведомлений можно выбрать в настройках/iu);
+    assert.doesNotMatch(`${welcome}\n${publicationNotice}`, /уведомлен\w+ пока тестируются|сповіщен\w+ поки тестуються|автоматическ\w+ уведомлен\w+.*отключен\w+|автоматичн\w+ сповіщен\w+.*вимкнен\w+/iu);
     assert.ok(welcome.length < 4096);
     assert.equal(telegram.edited.at(-1)!.text, language === "uk" ? "Мову збережено." : "Язык сохранён.");
     assert.deepEqual(telegram.edited.at(-1)!.keyboard, { inline_keyboard: [] });
@@ -200,7 +206,7 @@ test("first language selection sends localized first-time welcome and then main 
     assert.deepEqual(flow.map(({ kind }) => kind), ["edit", "send", "send"]);
     assert.match(flow[0].text, /Мову збережено|Язык сохранён/u);
     assert.match(flow[1].text, /Клавиатура навигации|Клавіатура навігації/u);
-    assert.match(flow[2].text, /Добро пожаловать в DenmarkBot|Вітаємо в DenmarkBot/u);
+    assert.match(flow[2].text, /Добро пожаловать в DenmarkTgBot|Вітаємо в DenmarkTgBot/u);
     assert.match(flow[2].text, new RegExp(menuPrompt));
     assert.equal(telegram.deleted.at(-1)?.messageId, 10, "the obsolete onboarding prompt is removed after the tracked pair is claimed");
     assert.equal(telegram.answered.length, 1);
@@ -352,14 +358,14 @@ test("existing users and Settings language changes never receive first-time welc
   repo.users.set(249, { telegram_id: 249, language: "ru", notify_direct: 0, notify_potential: 1 });
   await handleTelegramUpdate(message(249, "/start"), repo, telegram);
   await handleTelegramUpdate(callback(249, "lang:uk"), repo, telegram);
-  assert.equal(telegram.sent.some(({ text }) => text.includes("Добро пожаловать в DenmarkBot") || text.includes("Вітаємо в DenmarkBot")), false);
+  assert.equal(telegram.sent.some(({ text }) => text.includes("Добро пожаловать в DenmarkTgBot") || text.includes("Вітаємо в DenmarkTgBot")), false);
   assert.deepEqual(repo.users.get(249), { telegram_id: 249, language: "uk", notify_direct: 0, notify_potential: 1 });
   assert.deepEqual(telegram.lastReplyScreen?.keyboard, settingsKeyboard("uk"));
 
   await handleTelegramUpdate(callback(250, "lang:uk"), repo, telegram);
   const before = { ...repo.users.get(250)! };
   await handleTelegramUpdate(callback(250, "lang:ru"), repo, telegram);
-  assert.equal(telegram.sent.filter(({ text }) => text.includes("Вітаємо в DenmarkBot")).length, 1);
+  assert.equal(telegram.sent.filter(({ text }) => text.includes("Вітаємо в DenmarkTgBot")).length, 1);
   assert.equal(repo.users.get(250)?.language, "ru");
   assert.equal(repo.users.get(250)?.notify_direct, before.notify_direct);
   assert.equal(repo.users.get(250)?.notify_potential, before.notify_potential);
@@ -375,14 +381,14 @@ test("concurrent duplicate first language callbacks only send one welcome", asyn
     handleTelegramUpdate(callback(251, "lang:ru"), repo, telegram),
   ]);
   assert.equal(repo.creates, 1);
-  assert.equal(telegram.sent.filter(({ text }) => text.includes("Добро пожаловать в DenmarkBot")).length, 1);
+  assert.equal(telegram.sent.filter(({ text }) => text.includes("Добро пожаловать в DenmarkTgBot")).length, 1);
   assert.equal(telegram.sent.filter(({ text }) => /Выберите раздел/u.test(text)).length, 2);
 });
 
 test("/help shows the same localized instructions with the main menu for existing users", async () => {
   for (const [id, language, expected] of [
-    [252, "uk", /Вітаємо в DenmarkBot/u],
-    [253, "ru", /Добро пожаловать в DenmarkBot/u],
+    [252, "uk", /Вітаємо в DenmarkTgBot/u],
+    [253, "ru", /Добро пожаловать в DenmarkTgBot/u],
   ] as const) {
     const repo = new MemoryRepository();
     const telegram = new MemoryTelegram();
@@ -552,8 +558,8 @@ test("content-send failure removes only its newly sent keyboard anchor and prese
 
 test("About and unknown callbacks are handled in selected language", async () => {
   for (const [id, language, expected] of [
-    [400, "ru", [/бесплатный информационный бот/, /Høringsportalen/, /Folketinget: статус неизвестен/, /после бета-версии/i, /Nyidanmark, Retsinformation/, /автоматические уведомления пока отключены/i, /идентификатор Telegram/i, /не является юридической консультацией/]],
-    [401, "uk", [/безкоштовний інформаційний бот/, /Høringsportalen/, /Folketinget: статус невідомий/, /після бета-версії/i, /Nyidanmark, Retsinformation/, /автоматичні сповіщення наразі вимкнені/i, /ідентифікатор Telegram/i, /не є юридичною консультацією/]],
+    [400, "ru", [/бесплатный информационный бот/, /Høringsportalen/, /Folketinget: статус неизвестен/, /после бета-версии/i, /Nyidanmark, Retsinformation/, /прямые/i, /потенциальные/i, /категории уведомлений можно выбрать в настройках/i, /идентификатор Telegram/i, /не является юридической консультацией/]],
+    [401, "uk", [/безкоштовний інформаційний бот/, /Høringsportalen/, /Folketinget: статус невідомий/, /після бета-версії/i, /Nyidanmark, Retsinformation/, /безпосередні/i, /потенційні/i, /категорії сповіщень можна обрати в налаштуваннях/i, /ідентифікатор Telegram/i, /не є юридичною консультацією/]],
   ] as const) {
     const repo = new MemoryRepository();
     const telegram = new MemoryTelegram();
@@ -562,7 +568,7 @@ test("About and unknown callbacks are handled in selected language", async () =>
     const about = telegram.sent.at(-1)!.text;
     for (const phrase of expected) assert.match(about, phrase);
     assert.doesNotMatch(about, /\b(?:DIRECT|POTENTIAL|Beta|Telegram ID)\b/u);
-  assert.ok(Array.from(about).length <= 4096, "About screen fits Telegram message limit");
+    assert.ok(Array.from(about).length <= 4096, "About screen fits Telegram message limit");
     assert.deepEqual(
       [repo.users.get(id)?.notify_direct, repo.users.get(id)?.notify_potential],
       [1, 0],
