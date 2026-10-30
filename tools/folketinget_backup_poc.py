@@ -50,6 +50,7 @@ ODA_URL = "https://oda.ft.dk/odapublish/oda.bak"
 ODA_ORIGIN = ("https", "oda.ft.dk", 443)
 REQUIRED_ENTITIES = ("Sag", "Sagstrin", "SagDokument", "Dokument", "Afstemning", "Sagsstatus")
 MAX_BACKUP_BYTES = 5 * 1024**3
+BACKUP_DOWNLOAD_DEADLINE_SECONDS = 30 * 60
 GIB = 1024**3
 SQL_MAJOR = 17  # SQL Server 2025
 SQLCMD = "/opt/mssql-tools18/bin/sqlcmd"
@@ -337,7 +338,7 @@ def download_backup(opener: urllib.request.OpenerDirector, target: Path, expecte
     started = time.monotonic()
     digest = hashlib.sha256()
     written = 0
-    deadline = started + 20 * 60
+    deadline = started + BACKUP_DOWNLOAD_DEADLINE_SECONDS
     try:
         with opener.open(request, timeout=30) as response, target.open("wb") as output:
             if response.status != 200 or official_origin(response.geturl()) != ODA_ORIGIN:

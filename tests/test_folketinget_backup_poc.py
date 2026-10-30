@@ -107,6 +107,9 @@ def create_v2_candidate_manifest(
 
 
 class BackupPocSafetyTests(unittest.TestCase):
+    def test_backup_download_uses_30_minute_deadline_without_waiting(self) -> None:
+        self.assertEqual(POC.BACKUP_DOWNLOAD_DEADLINE_SECONDS, 30 * 60)
+
     def test_incremental_notification_run_id_output_only_exists_for_committed_promotion(self):
         with tempfile.TemporaryDirectory() as temp:
             output = pathlib.Path(temp) / "github-output"
