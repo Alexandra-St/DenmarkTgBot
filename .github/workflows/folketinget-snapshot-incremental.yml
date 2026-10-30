@@ -27,6 +27,15 @@ on:
         required: false
         type: string
         default: "39433055408"
+      recovery_base_run_id:
+        description: "Explicitly select a validated successful production manifest for recovery"
+        required: false
+        type: string
+      confirm_recovery_base:
+        description: "Confirm use of the explicitly supplied recovery manifest"
+        required: true
+        type: boolean
+        default: false
   schedule:
     # Run after the official nightly backup normally completes around 02:00 UTC.
     - cron: "17 4 * * *"
@@ -77,8 +86,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          RECOVERY_BASE_RUN_ID: ${{ inputs.recovery_base_run_id || '' }}
+          CONFIRM_RECOVERY_BASE: ${{ inputs.confirm_recovery_base }}
           BOOTSTRAP_MANIFEST_RUN_ID: ${{ inputs.bootstrap_manifest_run_id || '39433055408' }}
-        run: python3 tools/folketinget_snapshot_workflow.py select-base
+        run: |
+          set -euo pipefail
+          python3 tools/folketinget_snapshot_workflow.py select-base
 
       - name: Download selected manifest artifact
         uses: actions/download-artifact@v8

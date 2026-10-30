@@ -69,6 +69,41 @@ def validate_run(run: object, *, requested_id: str, workflow_id: int,
     return run
 
 
+def select_explicit_recovery_base(api: Any, run_id: str) -> tuple[str, str]:
+    """Validate and return one explicitly requested successful production manifest."""
+    if not isinstance(run_id, str) or not re.fullmatch(r"[0-9]+", run_id):
+        raise WorkflowError("manifest_run_id_invalid")
+    workflow_id = api.workflow_id(INCREMENTAL_WORKFLOW)
+    run = api.run(run_id)
+    validate_run(
+        run,
+        requested_id=run_id,
+        workflow_id=workflow_id,
+        allowed_events={"schedule", "workflow_dispatch"},
+        expected_title=PRODUCTION_TITLE,
+    )
+    if run.get("head_branch") != "main":
+        raise WorkflowError("manifest_run_not_successful")
+    artifact_name = f"folketinget-snapshot-incremental-{run_id}"
+    validate_artifact(api.artifacts(run_id), artifact_name)
+    return run_id, artifact_name
+
+
+def validate_recovery_inputs(event_name: str, confirmation: str, run_id: str) -> bool:
+    """Reject partial or scheduled recovery overrides; return whether recovery is requested."""
+    requested = bool(run_id)
+    confirmed = confirmation == "true"
+    if event_name == "schedule":
+        if requested or confirmed:
+            raise WorkflowError("recovery_override_not_allowed")
+        return False
+    if event_name != "workflow_dispatch":
+        raise WorkflowError("workflow_event_invalid")
+    if requested != confirmed:
+        raise WorkflowError("recovery_confirmation_invalid")
+    return requested
+
+
 def production_runs(
     runs: object, workflow_id: int, *, current_run_id: str | None = None
 ) -> list[dict[str, Any]]:
@@ -288,17 +323,28 @@ def main(argv: list[str] | None = None) -> int:
             print("production_branch_validation=PASS")
             return 0
         api = GitHubApi(os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GH_TOKEN", ""))
-        run_id, artifact_name = select_base(
-            api,
-            os.environ.get("BOOTSTRAP_MANIFEST_RUN_ID", ""),
-            current_run_id=os.environ.get("GITHUB_RUN_ID") or None,
+        recovery = validate_recovery_inputs(
+            os.environ.get("GITHUB_EVENT_NAME", ""),
+            os.environ.get("CONFIRM_RECOVERY_BASE", "false"),
+            os.environ.get("RECOVERY_BASE_RUN_ID", ""),
         )
+        if recovery:
+            run_id, artifact_name = select_explicit_recovery_base(
+                api, os.environ.get("RECOVERY_BASE_RUN_ID", "")
+            )
+        else:
+            run_id, artifact_name = select_base(
+                api,
+                os.environ.get("BOOTSTRAP_MANIFEST_RUN_ID", ""),
+                current_run_id=os.environ.get("GITHUB_RUN_ID") or None,
+            )
         output = os.environ.get("GITHUB_OUTPUT")
         if not output:
             raise WorkflowError("github_output_missing")
         with open(output, "a", encoding="utf-8") as target:
             target.write(f"run_id={run_id}\nartifact_name={artifact_name}\n")
-        print("snapshot_base_selection=PASS")
+        print("snapshot_base_selection=PASS mode=explicit_recovery" if recovery
+              else "snapshot_base_selection=PASS")
     except WorkflowError as error:
         operation = ("production_branch_validation" if args.command == "validate-production-ref"
                      else "snapshot_base_selection")

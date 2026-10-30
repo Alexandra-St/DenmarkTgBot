@@ -49,6 +49,65 @@ class FakeApi:
 
 
 class SnapshotWorkflowSelectionTests(unittest.TestCase):
+    def test_explicit_recovery_base_validates_production_run_and_artifact(self) -> None:
+        recovery_run_id = "40304681498"
+        recovery_run = run(int(recovery_run_id), number=13)
+        selected = FLOW.select_explicit_recovery_base(
+            FakeApi([], recovery_run,
+                   {recovery_run_id: artifact(f"folketinget-snapshot-incremental-{recovery_run_id}")}),
+            recovery_run_id,
+        )
+        self.assertEqual(selected, (recovery_run_id, f"folketinget-snapshot-incremental-{recovery_run_id}"))
+
+    def test_explicit_recovery_base_rejects_wrong_or_failed_run(self) -> None:
+        for candidate in (
+            run(12, number=12, conclusion="failure"),
+            run(12, number=12, event="push"),
+        ):
+            with self.subTest(candidate=candidate), self.assertRaises(FLOW.WorkflowError):
+                FLOW.select_explicit_recovery_base(FakeApi([], candidate, {"12": artifact(
+                    "folketinget-snapshot-incremental-12")}), "12")
+
+    def test_explicit_recovery_base_rejects_wrong_branch_title_or_workflow(self) -> None:
+        candidates = (
+            run(12, number=12, head_branch="feature"),
+            run(12, number=12, title="other workflow"),
+            run(12, number=12, workflow_id=21),
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate), self.assertRaises(FLOW.WorkflowError):
+                FLOW.select_explicit_recovery_base(FakeApi([], candidate, {"12": artifact(
+                    "folketinget-snapshot-incremental-12")}), "12")
+
+    def test_explicit_recovery_base_rejects_missing_expired_or_ambiguous_artifact(self) -> None:
+        name = "folketinget-snapshot-incremental-12"
+        cases = ([], artifact(name, expired=True), artifact(name) + artifact(name))
+        for artifacts in cases:
+            with self.subTest(artifacts=artifacts), self.assertRaises(FLOW.WorkflowError):
+                FLOW.select_explicit_recovery_base(FakeApi([], run(12, number=12),
+                    {"12": artifacts}), "12")
+
+    def test_recovery_input_contract_rejects_partial_or_scheduled_overrides(self) -> None:
+        self.assertTrue(FLOW.validate_recovery_inputs("workflow_dispatch", "true", "12"))
+        self.assertFalse(FLOW.validate_recovery_inputs("workflow_dispatch", "false", ""))
+        self.assertFalse(FLOW.validate_recovery_inputs("schedule", "false", ""))
+        for event, confirmation, run_id, category in (
+            ("workflow_dispatch", "false", "12", "recovery_confirmation_invalid"),
+            ("workflow_dispatch", "true", "", "recovery_confirmation_invalid"),
+            ("schedule", "true", "12", "recovery_override_not_allowed"),
+            ("schedule", "false", "12", "recovery_override_not_allowed"),
+        ):
+            with self.subTest(event=event, confirmation=confirmation, run_id=run_id):
+                with self.assertRaises(FLOW.WorkflowError) as error:
+                    FLOW.validate_recovery_inputs(event, confirmation, run_id)
+                self.assertEqual(error.exception.category, category)
+
+    def test_select_base_defaults_to_existing_selector_unless_recovery_requested(self) -> None:
+        workflow = (ROOT / ".github/workflows/folketinget-snapshot-incremental.yml").read_text()
+        self.assertIn("select_explicit_recovery_base", (ROOT / "tools/folketinget_snapshot_workflow.py").read_text())
+        self.assertIn("CONFIRM_RECOVERY_BASE", workflow)
+        self.assertIn("RECOVERY_BASE_RUN_ID", workflow)
+
     def test_select_base_uses_bootstrap_when_no_production_runs_exist(self) -> None:
         api = FakeApi(
             [], run(90, number=9, workflow_id=10, title="CREATE_MANIFEST_BASELINE"),
