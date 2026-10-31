@@ -1371,6 +1371,7 @@ class BackupPocSafetyTests(unittest.TestCase):
             self.assertEqual(result["status"], "INCOMPLETE")
             self.assertEqual(result["snapshot_client_dry_run"], "FAIL")
             self.assertFalse(result["submission_eligible"])
+            self.assertEqual(result["extraction_diagnostics"], [{"code": "affected_case_missing", "count": 1}])
 
     def test_snapshot_incremental_removed_sag_uses_tombstone_contract(self) -> None:
         from folketinget_candidate_extraction import InMemoryFolketingetProvider
@@ -1447,8 +1448,24 @@ class BackupPocSafetyTests(unittest.TestCase):
             POC.write_snapshot_incremental_summary(summary)
         self.assertIn("Snapshot incremental dry-run: PASS", output.getvalue())
         self.assertIn("removed: 2", output.getvalue())
+        self.assertIn("extraction diagnostics:\n  - none", output.getvalue())
         self.assertNotIn("external_id", output.getvalue())
         self.assertNotIn("title", output.getvalue())
+
+    def test_snapshot_incremental_summary_prints_only_diagnostic_code_counts(self) -> None:
+        summary = {
+            "status": "INCOMPLETE", "base_finish": "base", "target_finish": "target",
+            "snapshot_change": "CHANGED", "diff_totals": {"added": 0, "removed": 0, "changed": 0,
+                "technical_only": 0, "unchanged": 0}, "affected_case_count": 0, "hydrated_case_count": 0,
+            "DIRECT": 0, "POTENTIAL": 0, "IRRELEVANT": 0, "prepared_record_count": 0,
+            "batch_count": 0, "snapshot_client_dry_run": "FAIL", "submission_eligible": False,
+            "extraction_diagnostics": [{"code": "affected_case_missing", "count": 3}],
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            POC.write_snapshot_incremental_summary(summary)
+        self.assertIn("affected_case_missing: 3", output.getvalue())
+        self.assertNotIn("case_id", output.getvalue())
 
     def test_snapshot_incremental_base_artifact_validation_and_cleanup(self) -> None:
         stamp = "2026-10-20 02:00:40.000"

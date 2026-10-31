@@ -1600,6 +1600,18 @@ def run_snapshot_incremental_dry_run(
         if isinstance(batch_count, bool) or not isinstance(batch_count, int) or batch_count > 200:
             raise PocError("snapshot_incremental_batch_limit_exceeded")
     counts = client.get("relevance_counts", {}) if isinstance(client, dict) else {}
+    extraction_diagnostics = result.get("diagnostics", [])
+    if not isinstance(extraction_diagnostics, list):
+        raise PocError("snapshot_incremental_diagnostics_invalid")
+    safe_extraction_diagnostics: list[dict[str, Any]] = []
+    for item in extraction_diagnostics:
+        if not isinstance(item, dict):
+            raise PocError("snapshot_incremental_diagnostics_invalid")
+        code, count = item.get("code"), item.get("count")
+        if (not isinstance(code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,79}", code)
+                or isinstance(count, bool) or not isinstance(count, int) or count < 0):
+            raise PocError("snapshot_incremental_diagnostics_invalid")
+        safe_extraction_diagnostics.append({"code": code, "count": count})
     return {
         "status": status, "snapshot_change": "CHANGED",
         "base_finish": context["old_finish"], "target_finish": context["new_finish"],
@@ -1613,6 +1625,7 @@ def run_snapshot_incremental_dry_run(
         "batch_count": client.get("batch_count", 0) if isinstance(client, dict) else 0,
         "snapshot_client_dry_run": "PASS" if status == "PASS" else "FAIL",
         "submission_eligible": client.get("submission_eligible") is True if isinstance(client, dict) else False,
+        "extraction_diagnostics": safe_extraction_diagnostics,
     }
 
 
@@ -2741,6 +2754,17 @@ def write_snapshot_incremental_summary(summary: dict[str, Any]) -> None:
         f"- snapshot client dry-run: {summary['snapshot_client_dry_run']}",
         f"- submission eligible: {str(summary['submission_eligible']).lower()}",
     ]
+    diagnostics = summary.get("extraction_diagnostics", [])
+    lines.append("- extraction diagnostics:")
+    if diagnostics:
+        for item in diagnostics:
+            code, count = item.get("code"), item.get("count")
+            if (not isinstance(code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,79}", code)
+                    or isinstance(count, bool) or not isinstance(count, int) or count < 0):
+                raise PocError("snapshot_incremental_diagnostics_invalid")
+            lines.append(f"  - {code}: {count}")
+    else:
+        lines.append("  - none")
     text = "\n".join(lines) + "\n"
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
