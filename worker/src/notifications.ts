@@ -222,6 +222,7 @@ interface PendingNotification {
   source_code: string;
   source_name: string;
   external_url: string;
+  publication_id: number;
 }
 
 function clean(value: string, max: number): string {
@@ -270,6 +271,19 @@ export function formatNotification(event: PendingNotification): string | null {
   ].join("\n\n");
 }
 
+function formatNotificationGroup(events: PendingNotification[]): string | null {
+  if (events.length === 1) return formatNotification(events[0]);
+  const first = events[0];
+  const url = validatedOfficialUrl(first.source_code, first.external_url);
+  if (!url) return null;
+  const changes = [...new Set(events.map((event) => eventLabel(event, first.language)).filter((value): value is string => Boolean(value)))];
+  if (!changes.length) return null;
+  const marker = events.some((event) => event.relevance === "DIRECT") ? "🟢" : "🟡";
+  const header = marker + " " + t(first.language, events.some((event) => event.relevance === "DIRECT") ? "directShort" : "potentialShort");
+  const disclaimer = first.language === "uk" ? "Інформаційне повідомлення, не юридична консультація." : "Информационное сообщение, не юридическая консультация.";
+  return [header, "Изменения:\n" + changes.map((change) => "• " + change).join("\n"), clean(first.title, 500), t(first.language, "sourceLabel") + ": " + clean(first.source_name, 120), url, disclaimer].join("\n\n");
+}
+
 export interface DeliveryResult {
   enabled: boolean;
   sent: number;
@@ -279,6 +293,36 @@ export interface DeliveryResult {
 
 const DELIVERY_BATCH_SIZE = 10;
 
+async function countEligiblePendingNotifications(env: NotificationEnv, runId: string, now: Date, scope?: NotificationScope): Promise<number> {
+  const cutoff = activationCutoff(env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF);
+  if (!cutoff) return 0;
+  const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
+  const row = await env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM (
+    SELECT n.telegram_id, p.id AS publication_id
+    FROM notifications n
+    JOIN users u ON u.telegram_id = n.telegram_id
+    JOIN publication_events e ON e.id = n.event_id
+    JOIN publications p ON p.id = e.publication_id
+    JOIN sources s ON s.id = p.source_id
+    WHERE n.status = 'PENDING'
+      AND e.notify_eligible = 1
+      AND p.historical = 0
+      AND p.source_complete = 1
+      AND p.source_deleted = 0
+      AND p.relevance IN ('DIRECT', 'POTENTIAL')
+      AND ((p.relevance = 'DIRECT' AND u.notify_direct = 1)
+        OR (p.relevance = 'POTENTIAL' AND u.notify_potential = 1))
+      AND e.detected_at > ?
+      AND e.detected_at >= ?
+      AND e.event_key LIKE ?
+      AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')
+      ${scope ? "AND n.telegram_id = ? AND e.id = ?" : ""}
+    GROUP BY n.telegram_id, p.id
+    )
+  `).bind(cutoff.toISOString(), staleBefore, `ingest:${runId}:%`, ...(scope ? [scope.recipientId, scope.eventId] : [])).first<{ count: number }>();
+  return row?.count ?? 0;
+}
 
 export type ReconcileSendingResult = "reconciled" | "already_terminal" | "not_sending" | "not_in_run";
 
@@ -314,6 +358,7 @@ export async function reconcileSendingNotification(
   `).bind(notificationId, runPattern).run();
   return (result.meta.changes ?? 0) === 1 ? "reconciled" : "not_sending";
 }
+
 
 export interface CanaryRequest {
   confirmation?: unknown;
@@ -384,7 +429,7 @@ export async function deliverPendingNotifications(
     SELECT n.id, n.telegram_id, u.language, e.event_type, e.previous_status, e.new_status,
       u.notify_direct, u.notify_potential, p.historical, p.source_complete,
       p.relevance, p.original_title AS title, s.code AS source_code, s.name AS source_name,
-      p.external_url
+      p.external_url, p.id AS publication_id
     FROM notifications n
     JOIN users u ON u.telegram_id = n.telegram_id
     JOIN publication_events e ON e.id = n.event_id
@@ -403,48 +448,46 @@ export async function deliverPendingNotifications(
       AND e.event_key LIKE ?
       AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')${scopeSql}
     ORDER BY n.created_at, n.id
-    LIMIT ${scope ? 1 : DELIVERY_BATCH_SIZE}
   `).bind(cutoff.toISOString(), staleBefore, `ingest:${runId}:%`, ...scopeBindings).all<PendingNotification>();
 
+  const groups = new Map<string, PendingNotification[]>();
+  for (const row of rows.results ?? []) {
+    const key = scope ? `scope:${row.id}` : `${row.telegram_id}:${row.publication_id}:${runId}`;
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+  const selectedGroups = [...groups.values()].slice(0, scope ? 1 : DELIVERY_BATCH_SIZE);
   let sent = 0;
   let failed = 0;
-  for (const row of rows.results ?? []) {
-    const claim = await env.DB.prepare("UPDATE notifications SET status = 'SENDING' WHERE id = ? AND status = 'PENDING'")
-      .bind(row.id).run();
-    if ((claim.meta.changes ?? 0) !== 1) continue;
-    const text = formatNotification(row);
+  for (const group of selectedGroups) {
+    const ids = group.map((row) => row.id);
+    const placeholders = ids.map(() => "?").join(", ");
+    const claim = await env.DB.prepare(`UPDATE notifications SET status = 'SENDING' WHERE id IN (${placeholders}) AND status = 'PENDING'`)
+      .bind(...ids).run();
+    if ((claim.meta.changes ?? 0) !== ids.length) continue;
+    const row = group[0];
+    const text = formatNotificationGroup(group);
     if (!text) {
-      await env.DB.prepare("UPDATE notifications SET status = 'FAILED', last_error = 'invalid_notification_content' WHERE id = ? AND status = 'SENDING'")
-        .bind(row.id).run();
+      await env.DB.prepare(`UPDATE notifications SET status = 'FAILED', last_error = 'invalid_notification_content' WHERE id IN (${placeholders}) AND status = 'SENDING'`)
+        .bind(...ids).run();
       failed += 1;
       continue;
     }
     try {
       await telegram.sendMessage(row.telegram_id, text, notificationMainMenuKeyboard(row.language));
-      const result = await env.DB.prepare("UPDATE notifications SET status = 'SENT', attempts = attempts + 1, sent_at = ?, last_error = NULL WHERE id = ? AND status = 'SENDING'")
-        .bind(now.toISOString(), row.id).run();
-      if ((result.meta.changes ?? 0) === 1) sent += 1;
+      await env.DB.prepare(`UPDATE notifications SET status = 'SENT', attempts = attempts + 1, sent_at = ?, last_error = NULL WHERE id IN (${placeholders}) AND status = 'SENDING'`)
+        .bind(now.toISOString(), ...ids).run();
+      sent += 1;
     } catch {
       // Do not retry automatically: Telegram may have accepted a message before a timeout.
-      await env.DB.prepare("UPDATE notifications SET status = 'FAILED', attempts = attempts + 1, last_error = 'telegram_delivery_ambiguous_or_failed' WHERE id = ? AND status = 'SENDING'")
-        .bind(row.id).run();
+      await env.DB.prepare(`UPDATE notifications SET status = 'FAILED', attempts = attempts + 1, last_error = 'telegram_delivery_ambiguous_or_failed' WHERE id IN (${placeholders}) AND status = 'SENDING'`)
+        .bind(...ids).run();
       failed += 1;
     }
   }
-  const remainingRow = await env.DB.prepare(`
-    SELECT COUNT(*) AS count FROM notifications n
-    JOIN users u ON u.telegram_id = n.telegram_id
-    JOIN publication_events e ON e.id = n.event_id
-    JOIN publications p ON p.id = e.publication_id
-    JOIN sources s ON s.id = p.source_id
-    WHERE n.status = 'PENDING' AND e.notify_eligible = 1 AND p.historical = 0
-      AND p.source_complete = 1 AND p.source_deleted = 0
-      AND p.relevance IN ('DIRECT', 'POTENTIAL')
-      AND ((p.relevance = 'DIRECT' AND u.notify_direct = 1) OR (p.relevance = 'POTENTIAL' AND u.notify_potential = 1))
-      AND e.detected_at > ? AND e.detected_at >= ? AND e.event_key LIKE ?
-      AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')${scopeSql}
-  `).bind(cutoff.toISOString(), staleBefore, `ingest:${runId}:%`, ...scopeBindings).first<{ count: number }>();
-  return { enabled: true, sent, failed, remaining: remainingRow?.count ?? 0 };
+  const remaining = await countEligiblePendingNotifications(env, runId, now, scope);
+  return { enabled: true, sent, failed, remaining };
 }
 
 

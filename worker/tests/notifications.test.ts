@@ -626,6 +626,64 @@ test("ordinary delivery batches 25 run notifications and excludes other runs fro
   } finally { db.close(); }
 });
 
+test("three events for one publication and recipient are sent once and finalized together", async () => {
+  const db = await fixture();
+  try {
+    const first = await addEvent(db, { id: "group-first", eventType: "DOCUMENTS_CHANGED" });
+    const publicationId = (await db.prepare("SELECT publication_id FROM publication_events WHERE id = ?").bind(first).first<{publication_id:number}>())!.publication_id;
+    const eventIds = [first];
+    for (const [key, type] of [["stages", "STAGES_CHANGED"], ["status", "STATUS_CHANGED"]]) {
+      const inserted = await db.prepare("INSERT INTO publication_events (publication_id,event_key,event_type,previous_status,new_status,detected_at,notify_eligible) VALUES (?,?,?,?,?,?,1)")
+        .bind(publicationId, `ingest:${TEST_RUN_ID}:group:${key}`, type, type === "STATUS_CHANGED" ? "Open" : null, type === "STATUS_CHANGED" ? "Closed" : null, "2026-10-15T02:00:00.000Z").run();
+      eventIds.push(Number(inserted.meta.last_row_id));
+    }
+    for (const eventId of eventIds) await db.prepare("INSERT INTO notifications (telegram_id,event_id,status,attempts,created_at) VALUES (1,?,'PENDING',0,?)").bind(eventId, now.toISOString()).run();
+    let calls = 0; let message = "";
+    const result = await deliverPendingNotifications({DB:db as never,NOTIFICATION_DELIVERY_ENABLED:"true",NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF:cutoff}, {async sendMessage(_id,text){calls++;message=text;}}, TEST_RUN_ID, now);
+    assert.deepEqual(result,{enabled:true,sent:1,failed:0,remaining:0});
+    assert.equal(calls,1);
+    const changeLines = message.split("\n").filter((line) => line.startsWith("• "));
+    assert.equal(changeLines.length, 3, "each distinct event type appears once as a localized change bullet");
+    assert.equal(new Set(changeLines).size, 3, "change bullets are deduplicated");
+    assert.match(message, /Інформаційне повідомлення, не юридична консультація\./u);
+    assert.match(message, /Було: Open/u);
+    assert.match(message, /Стало: Closed/u);
+    const rows=await db.prepare("SELECT status,attempts FROM notifications WHERE event_id IN (?,?,?) ORDER BY event_id").bind(...eventIds).all<{status:string;attempts:number}>();
+    assert.equal(rows.results.length,3);
+    assert.ok(rows.results.every((row)=>row.status==="SENT"&&row.attempts===1));
+  } finally { db.close(); }
+});
+
+test("different recipients and publications are separate groups; run scope excludes other runs", async () => {
+  const db=await fixture();
+  try {
+    const a=await addEvent(db,{id:"group-a"}); const b=await addEvent(db,{id:"group-b"});
+    const pubA=(await db.prepare("SELECT publication_id FROM publication_events WHERE id=?").bind(a).first<{publication_id:number}>())!.publication_id;
+    const e2=await db.prepare("INSERT INTO publication_events (publication_id,event_key,event_type,detected_at,notify_eligible) VALUES (?,?,'STAGES_CHANGED',?,1)").bind(pubA,`ingest:${TEST_RUN_ID}:group:second`,`2026-10-15T02:00:00.000Z`).run();
+    const samePub=Number(e2.meta.last_row_id);
+    const otherRun=await db.prepare("INSERT INTO publication_events (publication_id,event_key,event_type,detected_at,notify_eligible) VALUES (?,?,'VOTES_CHANGED',?,1)").bind(pubA,"ingest:00000000-0000-4000-8000-000000000002:group:other","2026-10-15T02:00:00.000Z").run();
+    for(const [recipient,event] of [[1,a],[1,samePub],[2,a],[1,b],[1,Number(otherRun.meta.last_row_id)]] as const) await db.prepare("INSERT INTO notifications (telegram_id,event_id,status,created_at) VALUES (?,?,'PENDING',?)").bind(recipient,event,now.toISOString()).run();
+    const sent:number[]=[];
+    const result=await deliverPendingNotifications({DB:db as never,NOTIFICATION_DELIVERY_ENABLED:"true",NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF:cutoff},{async sendMessage(id){sent.push(id);}},TEST_RUN_ID,now);
+    assert.equal(result.sent,2); assert.equal(sent.length,2);
+    assert.equal((await db.prepare("SELECT status FROM notifications WHERE event_id=? AND telegram_id=1").bind(Number(otherRun.meta.last_row_id)).first<{status:string}>())?.status,"PENDING");
+  } finally {db.close();}
+});
+
+test("partial group claim never sends Telegram message", async () => {
+  const db=await fixture();
+  try {
+    const event=await addEvent(db,{id:"partial-claim"});
+    await db.prepare("INSERT INTO notifications (telegram_id,event_id,status,created_at) VALUES (1,?,'PENDING',?)").bind(event,now.toISOString()).run();
+    const original=db.prepare.bind(db);
+    let sendCount=0;
+    // Force the guarded claim to report no rows claimed, simulating a concurrent winner.
+    const wrapped={...db, prepare(sql:string){const prepared=original(sql); if(sql.startsWith("UPDATE notifications SET status = 'SENDING'")) return {bind(...args:unknown[]){const bound=prepared.bind(...args); return {...bound,run:()=>({success:true,meta:{changes:0,last_row_id:0}})};}}; return prepared;}};
+    await deliverPendingNotifications({DB:wrapped as never,NOTIFICATION_DELIVERY_ENABLED:"true",NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF:cutoff},{async sendMessage(){sendCount++;}},TEST_RUN_ID,now);
+    assert.equal(sendCount,0);
+  } finally {db.close();}
+});
+
 test("delivery for one run never sends pending notifications from another run", async () => {
   const db = await fixture();
   try {
@@ -997,10 +1055,10 @@ test("local end-to-end: historical baseline, incremental changes, preference que
     const delivery = await deliverPendingNotifications(envWithCutoff, {
       async sendMessage(chatId, text, keyboard) { sent.push({ chatId, text, keyboard }); },
     }, "00000000-0000-4000-8000-000000000102", new Date());
-    assert.deepEqual(delivery, { enabled: true, sent: 4, failed: 0, remaining: 0 });
-    assert.equal(sent.length, 4);
-    assert.equal(sent.filter((item) => item.chatId === 1001 && item.text.includes("не юридична консультація")).length, 2);
-    assert.equal(sent.filter((item) => item.chatId === 1002 && item.text.includes("не юридическая консультация")).length, 2);
+    assert.deepEqual(delivery, { enabled: true, sent: 2, failed: 0, remaining: 0 });
+    assert.equal(sent.length, 2);
+    assert.equal(sent.filter((item) => item.chatId === 1001 && item.text.includes("не юридична консультація")).length, 1);
+    assert.equal(sent.filter((item) => item.chatId === 1002 && item.text.includes("не юридическая консультация")).length, 1);
     assert.ok(sent.every((item) => item.text.includes("https://hoeringsportalen.dk/Hearing/Details/")));
     assert.ok(sent.every((item) => JSON.stringify(item.keyboard).includes('"callback_data":"notification:main"')));
     const states = await db.prepare("SELECT status, COUNT(*) AS count FROM notifications GROUP BY status").all<{ status: string; count: number }>();
