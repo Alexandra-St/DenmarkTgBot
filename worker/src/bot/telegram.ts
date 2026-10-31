@@ -1,7 +1,7 @@
 import type { InlineKeyboardMarkup, TelegramReplyMarkup } from "../types/telegram.ts";
 
 export interface TelegramClient {
-  sendMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<void>;
+  sendMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup, linkPreviewOptions?: { is_disabled: boolean }): Promise<void>;
   sendScreenMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<{ message_id: number }>;
   editMessage(chatId: number, messageId: number, text: string, keyboard?: InlineKeyboardMarkup): Promise<void>;
   deleteMessage(chatId: number, messageId: number): Promise<void>;
@@ -53,11 +53,12 @@ export class TelegramApi implements TelegramClient {
     return (result as { result?: unknown }).result;
   }
 
-  async sendMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup): Promise<void> {
+  async sendMessage(chatId: number, text: string, keyboard?: TelegramReplyMarkup, linkPreviewOptions?: { is_disabled: boolean }): Promise<void> {
     await this.call("sendMessage", {
       chat_id: chatId,
       text,
       ...(keyboard ? { reply_markup: keyboard } : {}),
+      ...(linkPreviewOptions ? { link_preview_options: linkPreviewOptions } : {}),
     });
   }
 

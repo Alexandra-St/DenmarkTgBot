@@ -742,18 +742,23 @@ test("Telegram API sends Reply and Inline keyboards on separate messages and onl
     const inline = { inline_keyboard: [[{ text: "Next", callback_data: "news:page:1" }]] };
     const keyboardScreen = await telegram.sendScreenMessage(1, "keyboard anchor", reply);
     const inlineScreen = await telegram.sendScreenMessage(1, "content screen", inline);
+    await telegram.sendMessage(1, "ordinary message");
+    await telegram.sendMessage(1, "notification message", notificationMainMenuKeyboard("uk"), { is_disabled: true });
     await telegram.editMessage(1, inlineScreen.message_id, "updated content", inline);
     assert.equal(keyboardScreen.message_id, 800);
     assert.equal(inlineScreen.message_id, 801);
-    assert.deepEqual(calls.map(({ method }) => method), ["sendMessage", "sendMessage", "editMessageText"]);
+    assert.deepEqual(calls.map(({ method }) => method), ["sendMessage", "sendMessage", "sendMessage", "sendMessage", "editMessageText"]);
     const replyPayload = calls[0].payload.reply_markup as Record<string, unknown>;
     const inlinePayload = calls[1].payload.reply_markup as Record<string, unknown>;
     assert.ok("keyboard" in replyPayload);
     assert.ok(!("inline_keyboard" in replyPayload));
     assert.ok("inline_keyboard" in inlinePayload);
     assert.ok(!("keyboard" in inlinePayload));
-    assert.ok(!("reply_markup" in calls[2].payload) || "inline_keyboard" in (calls[2].payload.reply_markup as object));
-    assert.equal(calls.some(({ method }) => method === "editMessageText" && "keyboard" in (calls[2].payload.reply_markup as object)), false);
+    assert.ok(!("link_preview_options" in calls[2].payload), "ordinary sendMessage keeps preview options omitted");
+    assert.deepEqual(calls[3].payload.link_preview_options, { is_disabled: true });
+    assert.ok(!("reply_markup" in calls[4].payload) || "inline_keyboard" in (calls[4].payload.reply_markup as object));
+    assert.equal("link_preview_options" in calls[3].payload, true);
+    assert.equal(calls[4].method, "editMessageText");
   } finally {
     globalThis.fetch = oldFetch;
   }
