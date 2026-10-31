@@ -274,7 +274,10 @@ export interface DeliveryResult {
   enabled: boolean;
   sent: number;
   failed: number;
+  remaining: number;
 }
+
+const DELIVERY_BATCH_SIZE = 10;
 
 export interface CanaryRequest {
   confirmation?: unknown;
@@ -333,11 +336,11 @@ export async function deliverPendingNotifications(
   scope?: NotificationScope,
 ): Promise<DeliveryResult> {
   if (!isValidNotificationRunId(runId) || (scope && scope.runId !== runId)) {
-    return { enabled: false, sent: 0, failed: 0 };
+    return { enabled: false, sent: 0, failed: 0, remaining: 0 };
   }
-  if (env.NOTIFICATION_DELIVERY_ENABLED !== "true") return { enabled: false, sent: 0, failed: 0 };
+  if (env.NOTIFICATION_DELIVERY_ENABLED !== "true") return { enabled: false, sent: 0, failed: 0, remaining: 0 };
   const cutoff = activationCutoff(env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF);
-  if (!cutoff || now.getTime() < cutoff.getTime()) return { enabled: false, sent: 0, failed: 0 };
+  if (!cutoff || now.getTime() < cutoff.getTime()) return { enabled: false, sent: 0, failed: 0, remaining: 0 };
   const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
   const scopeSql = scope ? " AND n.telegram_id = ? AND e.id = ?" : "";
   const scopeBindings = scope ? [scope.recipientId, scope.eventId] : [];
@@ -364,7 +367,7 @@ export async function deliverPendingNotifications(
       AND e.event_key LIKE ?
       AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')${scopeSql}
     ORDER BY n.created_at, n.id
-    LIMIT ${scope ? 1 : 100}
+    LIMIT ${scope ? 1 : DELIVERY_BATCH_SIZE}
   `).bind(cutoff.toISOString(), staleBefore, `ingest:${runId}:%`, ...scopeBindings).all<PendingNotification>();
 
   let sent = 0;
@@ -392,7 +395,20 @@ export async function deliverPendingNotifications(
       failed += 1;
     }
   }
-  return { enabled: true, sent, failed };
+  const remainingRow = await env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM notifications n
+    JOIN users u ON u.telegram_id = n.telegram_id
+    JOIN publication_events e ON e.id = n.event_id
+    JOIN publications p ON p.id = e.publication_id
+    JOIN sources s ON s.id = p.source_id
+    WHERE n.status = 'PENDING' AND e.notify_eligible = 1 AND p.historical = 0
+      AND p.source_complete = 1 AND p.source_deleted = 0
+      AND p.relevance IN ('DIRECT', 'POTENTIAL')
+      AND ((p.relevance = 'DIRECT' AND u.notify_direct = 1) OR (p.relevance = 'POTENTIAL' AND u.notify_potential = 1))
+      AND e.detected_at > ? AND e.detected_at >= ? AND e.event_key LIKE ?
+      AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')${scopeSql}
+  `).bind(cutoff.toISOString(), staleBefore, `ingest:${runId}:%`, ...scopeBindings).first<{ count: number }>();
+  return { enabled: true, sent, failed, remaining: remainingRow?.count ?? 0 };
 }
 
 

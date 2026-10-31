@@ -244,7 +244,7 @@ test("authenticated notification E2E routes prepare and deliver only the pinned 
     const ordinaryDeliver = await fetchWorker(new Request("https://local.test/internal/notifications/deliver", {
       method: "POST", headers: auth, body: JSON.stringify({ run_id: TEST_RUN_ID }),
     }), env);
-    assert.deepEqual(await ordinaryDeliver.json(), { enabled: false, sent: 0, failed: 0 }, "normal broad delivery is closed during E2E mode");
+    assert.deepEqual(await ordinaryDeliver.json(), { enabled: false, sent: 0, failed: 0, remaining: 0 }, "normal broad delivery is closed during E2E mode");
 
     const invalid = await fetchWorker(new Request("https://local.test/internal/notifications/e2e/prepare", {
       method: "POST", headers: auth, body: JSON.stringify({ confirmation: "PREPARE_ONE_ALLOWLISTED_NOTIFICATION", telegram_id: 2 }),
@@ -324,7 +324,7 @@ test("confirmed source deletion creates no queue item and suppresses pending del
       { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff },
       { async sendMessage() { sends += 1; } }, TEST_RUN_ID, now,
     );
-    assert.deepEqual(delivery, { enabled: true, sent: 0, failed: 0 });
+    assert.deepEqual(delivery, { enabled: true, sent: 0, failed: 0, remaining: 0 });
     assert.equal(sends, 0);
     assert.equal((await db.prepare("SELECT status FROM notifications WHERE event_id=?").bind(eventId).first<{ status: string }>())?.status, "PENDING");
   } finally { db.close(); }
@@ -397,7 +397,7 @@ test("delivery route is protected and disabled unless separately enabled with it
       method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: JSON.stringify({ run_id: TEST_RUN_ID }),
     }), env);
     assert.equal(disabled.status, 200);
-    assert.deepEqual(await disabled.json(), { enabled: false, sent: 0, failed: 0 });
+    assert.deepEqual(await disabled.json(), { enabled: false, sent: 0, failed: 0, remaining: 0 });
   } finally { db.close(); }
 });
 
@@ -502,7 +502,7 @@ test("canary route remains authenticated and inactive without its dedicated gate
       const regularDelivery = await fetch(new Request("https://local.test/internal/notifications/deliver", {
         method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: JSON.stringify({ run_id: TEST_RUN_ID }),
       }), activeEnv);
-      assert.deepEqual(await regularDelivery.json(), { enabled: false, sent: 0, failed: 0 });
+      assert.deepEqual(await regularDelivery.json(), { enabled: false, sent: 0, failed: 0, remaining: 0 });
       assert.equal(telegramCalls.length, 0, "canary gates do not enable production-wide delivery");
       const authorizedRequest = () => new Request("https://local.test/internal/notifications/canary", {
         method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body,
@@ -581,25 +581,47 @@ test("delivery remains disabled by default; success is recorded once through a m
       .bind(eventId, now.toISOString()).run();
     let calls = 0;
     const mock = { async sendMessage(_id: number, text: string) { calls += 1; assert.match(text, /Test publication deliver/u); } };
-    assert.deepEqual(await deliverPendingNotifications({ DB: db as never }, mock, TEST_RUN_ID), { enabled: false, sent: 0, failed: 0 });
+    assert.deepEqual(await deliverPendingNotifications({ DB: db as never }, mock, TEST_RUN_ID), { enabled: false, sent: 0, failed: 0, remaining: 0 });
     assert.deepEqual(await deliverPendingNotifications({
       DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_ACTIVATION_CUTOFF: cutoff,
-    }, mock, TEST_RUN_ID, now), { enabled: false, sent: 0, failed: 0 }, "queue cutoff does not activate delivery");
+    }, mock, TEST_RUN_ID, now), { enabled: false, sent: 0, failed: 0, remaining: 0 }, "queue cutoff does not activate delivery");
     assert.deepEqual(await deliverPendingNotifications({
       DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: "invalid",
-    }, mock, TEST_RUN_ID, now), { enabled: false, sent: 0, failed: 0 });
+    }, mock, TEST_RUN_ID, now), { enabled: false, sent: 0, failed: 0, remaining: 0 });
     assert.deepEqual(await deliverPendingNotifications({
       DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: "2026-10-17T00:00:00Z",
-    }, mock, TEST_RUN_ID, now), { enabled: false, sent: 0, failed: 0 });
+    }, mock, TEST_RUN_ID, now), { enabled: false, sent: 0, failed: 0, remaining: 0 });
     assert.equal(calls, 0);
 
     const result = await deliverPendingNotifications({
       DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff,
     }, mock, TEST_RUN_ID, now);
-    assert.deepEqual(result, { enabled: true, sent: 1, failed: 0 });
+    assert.deepEqual(result, { enabled: true, sent: 1, failed: 0, remaining: 0 });
     assert.equal(calls, 1);
     const row = await db.prepare("SELECT status, attempts FROM notifications WHERE event_id = ?").bind(eventId).first<{ status: string; attempts: number }>();
     assert.deepEqual({ ...row }, { status: "SENT", attempts: 1 });
+  } finally { db.close(); }
+});
+
+test("ordinary delivery batches 25 run notifications and excludes other runs from remaining", async () => {
+  const db = await fixture();
+  try {
+    const otherRun = "00000000-0000-4000-8000-000000000002";
+    const eventIds: number[] = [];
+    for (let index = 0; index < 25; index += 1) eventIds.push(await addEvent(db, { id: `batch-${index}` }));
+    const otherEvent = await addEvent(db, { id: "other-run-pending", runId: otherRun });
+    for (const eventId of [...eventIds, otherEvent]) {
+      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
+        .bind(eventId, now.toISOString()).run();
+    }
+    let calls = 0;
+    const env = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff };
+    const telegram = { async sendMessage() { calls += 1; } };
+    assert.deepEqual(await deliverPendingNotifications(env, telegram, TEST_RUN_ID, now), { enabled: true, sent: 10, failed: 0, remaining: 15 });
+    assert.deepEqual(await deliverPendingNotifications(env, telegram, TEST_RUN_ID, now), { enabled: true, sent: 10, failed: 0, remaining: 5 });
+    assert.deepEqual(await deliverPendingNotifications(env, telegram, TEST_RUN_ID, now), { enabled: true, sent: 5, failed: 0, remaining: 0 });
+    assert.equal(calls, 25);
+    assert.equal((await db.prepare("SELECT status FROM notifications WHERE event_id = ?").bind(otherEvent).first<{ status: string }>())?.status, "PENDING");
   } finally { db.close(); }
 });
 
@@ -616,7 +638,7 @@ test("delivery for one run never sends pending notifications from another run", 
     const result = await deliverPendingNotifications({
       DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff,
     }, { async sendMessage(_id, text) { sent.push(text); } }, runA, now);
-    assert.deepEqual(result, { enabled: true, sent: 1, failed: 0 });
+    assert.deepEqual(result, { enabled: true, sent: 1, failed: 0, remaining: 0 });
     assert.equal(sent.length, 1);
     assert.match(sent[0], /run-a/u);
     const statuses = await db.prepare("SELECT e.event_key, n.status FROM notifications n JOIN publication_events e ON e.id=n.event_id ORDER BY e.event_key")
@@ -625,6 +647,27 @@ test("delivery for one run never sends pending notifications from another run", 
       { event_key: `ingest:${runA}:fixture:run-a`, status: "SENT" },
       { event_key: `ingest:${runB}:fixture:run-b`, status: "PENDING" },
     ]);
+  } finally { db.close(); }
+});
+
+test("scoped E2E delivery handles one recipient/event and excludes unrelated notifications from remaining", async () => {
+  const db = await fixture();
+  try {
+    const eventOne = await addEvent(db, { id: "scope-one" });
+    const eventTwo = await addEvent(db, { id: "scope-two" });
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?), (1, ?, 'PENDING', ?)")
+      .bind(eventOne, now.toISOString(), eventTwo, now.toISOString()).run();
+    let calls = 0;
+    const env = {
+      DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff,
+      NOTIFICATION_E2E_ENABLED: "true", NOTIFICATION_E2E_TELEGRAM_ID: "1",
+      NOTIFICATION_E2E_RUN_ID: TEST_RUN_ID, NOTIFICATION_E2E_EVENT_ID: String(eventOne),
+    };
+    const result = await deliverPendingNotifications(env, { async sendMessage() { calls += 1; } }, TEST_RUN_ID, now,
+      { recipientId: 1, eventId: eventOne, runId: TEST_RUN_ID });
+    assert.deepEqual(result, { enabled: true, sent: 1, failed: 0, remaining: 0 });
+    assert.equal(calls, 1);
+    assert.equal((await db.prepare("SELECT status FROM notifications WHERE event_id = ?").bind(eventTwo).first<{ status: string }>())?.status, "PENDING");
   } finally { db.close(); }
 });
 
@@ -658,12 +701,12 @@ test("reclassification to IRRELEVANT defers a pending row but restoration can se
     let calls = 0;
     const mock = { sendMessage: async () => { calls += 1; return { ok: true }; } };
     const deliveryEnv = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff };
-    assert.deepEqual(await deliverPendingNotifications(deliveryEnv, mock, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 0 });
+    assert.deepEqual(await deliverPendingNotifications(deliveryEnv, mock, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 0, remaining: 0 });
     assert.equal(calls, 0);
     const pending = await db.prepare("SELECT status, attempts FROM notifications WHERE event_id = ?").bind(eventId).first();
     assert.deepEqual({ ...pending }, { status: "PENDING", attempts: 0 });
     await db.prepare("UPDATE publications SET relevance = 'POTENTIAL' WHERE external_id = ?").bind("relevance-change").run();
-    assert.deepEqual(await deliverPendingNotifications(deliveryEnv, mock, TEST_RUN_ID, now), { enabled: true, sent: 1, failed: 0 });
+    assert.deepEqual(await deliverPendingNotifications(deliveryEnv, mock, TEST_RUN_ID, now), { enabled: true, sent: 1, failed: 0, remaining: 0 });
     assert.equal(calls, 1, "without terminal suppression an old pending event can become eligible again");
   } finally { db.close(); }
 });
@@ -703,8 +746,8 @@ test("Telegram timeout/error is terminal and is not retried automatically", asyn
     let calls = 0;
     const failing = { async sendMessage() { calls += 1; throw new Error("timeout"); } };
     const env = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff };
-    assert.deepEqual(await deliverPendingNotifications(env, failing, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 1 });
-    assert.deepEqual(await deliverPendingNotifications(env, failing, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 0 });
+    assert.deepEqual(await deliverPendingNotifications(env, failing, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 1, remaining: 0 });
+    assert.deepEqual(await deliverPendingNotifications(env, failing, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 0, remaining: 0 });
     assert.equal(calls, 1);
     const row = await db.prepare("SELECT status, attempts, last_error FROM notifications WHERE event_id = ?").bind(eventId).first<{ status: string; attempts: number; last_error: string }>();
     assert.deepEqual({ ...row }, { status: "FAILED", attempts: 1, last_error: "telegram_delivery_ambiguous_or_failed" });
@@ -724,8 +767,8 @@ for (const [name, error] of [
       let calls = 0;
       const env = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff };
       const mock = { async sendMessage() { calls += 1; throw error; } };
-      assert.deepEqual(await deliverPendingNotifications(env, mock, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 1 });
-      assert.deepEqual(await deliverPendingNotifications(env, mock, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 0 });
+      assert.deepEqual(await deliverPendingNotifications(env, mock, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 1, remaining: 0 });
+      assert.deepEqual(await deliverPendingNotifications(env, mock, TEST_RUN_ID, now), { enabled: true, sent: 0, failed: 0, remaining: 0 });
       assert.equal(calls, 1);
     } finally { db.close(); }
   });
@@ -769,7 +812,7 @@ test("a row left SENDING by process interruption is not automatically resent", a
     const result = await deliverPendingNotifications({
       DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff,
     }, { async sendMessage() { calls += 1; } }, TEST_RUN_ID, now);
-    assert.deepEqual(result, { enabled: true, sent: 0, failed: 0 });
+    assert.deepEqual(result, { enabled: true, sent: 0, failed: 0, remaining: 0 });
     assert.equal(calls, 0);
     const row = await db.prepare("SELECT status, attempts FROM notifications WHERE event_id = ?")
       .bind(eventId).first<{ status: string; attempts: number }>();
@@ -896,7 +939,7 @@ test("local end-to-end: historical baseline, incremental changes, preference que
     const delivery = await deliverPendingNotifications(envWithCutoff, {
       async sendMessage(chatId, text, keyboard) { sent.push({ chatId, text, keyboard }); },
     }, "00000000-0000-4000-8000-000000000102", new Date());
-    assert.deepEqual(delivery, { enabled: true, sent: 4, failed: 0 });
+    assert.deepEqual(delivery, { enabled: true, sent: 4, failed: 0, remaining: 0 });
     assert.equal(sent.length, 4);
     assert.equal(sent.filter((item) => item.chatId === 1001 && item.text.includes("не юридична консультація")).length, 2);
     assert.equal(sent.filter((item) => item.chatId === 1002 && item.text.includes("не юридическая консультация")).length, 2);
@@ -917,7 +960,7 @@ test("local end-to-end: historical baseline, incremental changes, preference que
     const repeatedDelivery = await deliverPendingNotifications(envWithCutoff, {
       async sendMessage() { throw new Error("no new event should be delivered"); },
     }, "00000000-0000-4000-8000-000000000103", new Date());
-    assert.deepEqual(repeatedDelivery, { enabled: true, sent: 0, failed: 0 });
+    assert.deepEqual(repeatedDelivery, { enabled: true, sent: 0, failed: 0, remaining: 0 });
   } finally {
     db.close();
     await rm(directory, { recursive: true, force: true });

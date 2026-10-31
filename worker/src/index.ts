@@ -96,9 +96,9 @@ export default {
           ? (body as { run_id?: unknown }).run_id
           : undefined;
         if (!isValidNotificationRunId(runId)) return json({ error: "invalid_run_id" }, 400);
-        if (env.NOTIFICATION_E2E_ENABLED === "true") return json({ enabled: false, sent: 0, failed: 0 });
+        if (env.NOTIFICATION_E2E_ENABLED === "true") return json({ enabled: false, sent: 0, failed: 0, remaining: 0 });
         if (env.NOTIFICATION_DELIVERY_ENABLED !== "true" || !env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF) {
-          return json({ enabled: false, sent: 0, failed: 0 });
+          return json({ enabled: false, sent: 0, failed: 0, remaining: 0 });
         }
         if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "delivery_not_configured" }, 503);
         const result = await deliverPendingNotifications(notificationEnv, new TelegramApi(env.TELEGRAM_BOT_TOKEN), runId);
