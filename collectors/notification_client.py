@@ -127,14 +127,36 @@ def orchestrate(
         result["delivery_status"] = "disabled"
         return result
 
-    try:
-        delivery = _request(endpoint.rstrip("/") + "/internal/notifications/deliver", token, {"run_id": run_id}, opener)
-    except OrchestrationError as exc:
+    sent_total = 0
+    failed_total = 0
+    remaining = 1
+    delivery_requests = 0
+    while remaining > 0 and delivery_requests < 20:
+        delivery_requests += 1
+        try:
+            delivery = _request(endpoint.rstrip("/") + "/internal/notifications/deliver", token, {"run_id": run_id}, opener)
+        except OrchestrationError as exc:
+            result.update(delivery_status="failed", sent=sent_total, failed=failed_total)
+            raise OrchestrationError(exc.category, result) from None
+        if delivery.get("enabled") is not True:
+            result.update(delivery_status="worker_gate_closed", sent=sent_total, failed=failed_total)
+            return result
+        sent, failed, remaining_batch = delivery.get("sent"), delivery.get("failed"), delivery.get("remaining")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (sent, failed, remaining_batch)):
+            result.update(delivery_status="failed", sent=sent_total, failed=failed_total)
+            raise OrchestrationError("delivery_response_invalid", result)
+        sent_total += sent
+        failed_total += failed
+        remaining = remaining_batch
+        result.update(sent=sent_total, failed=failed_total)
+        if failed_total:
+            result["delivery_status"] = "completed_with_failures"
+            raise OrchestrationError("delivery_failed_or_ambiguous", result)
+    if remaining > 0:
         result["delivery_status"] = "failed"
-        raise OrchestrationError(exc.category, result) from None
-    if delivery.get("enabled") is not True:
-        result["delivery_status"] = "worker_gate_closed"
-        return result
+        raise OrchestrationError("delivery_batch_limit_exceeded", result)
+    result["delivery_status"] = "completed"
+    return result
     sent, failed = delivery.get("sent"), delivery.get("failed")
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (sent, failed)):
         result["delivery_status"] = "failed"

@@ -46,7 +46,7 @@ class NotificationClientTests(unittest.TestCase):
         return result, requests
 
     def test_committed_scheduled_run_queues_then_delivers_using_actual_run_id(self):
-        result, requests = self.invoke([{"eligible": True, "queued": 3}, {"enabled": True, "sent": 3, "failed": 0}])
+        result, requests = self.invoke([{"eligible": True, "queued": 3}, {"enabled": True, "sent": 3, "failed": 0, "remaining": 0}])
         self.assertEqual(result, {"queue_status": "eligible", "queued": 3, "delivery_status": "completed", "sent": 3, "failed": 0})
         self.assertEqual([request.full_url for request, _ in requests], [
             "https://worker.example/internal/notifications/prepare",
@@ -55,6 +55,18 @@ class NotificationClientTests(unittest.TestCase):
         self.assertEqual(json.loads(requests[0][0].data), {"run_id": RUN_ID})
         self.assertEqual(json.loads(requests[1][0].data), {"run_id": RUN_ID})
         self.assertTrue(all(timeout == 20 for _, timeout in requests))
+
+    def test_three_batches_sum_counts_and_keep_same_run_id(self):
+        result, requests = self.invoke([
+            {"eligible": True, "queued": 25},
+            {"enabled": True, "sent": 10, "failed": 0, "remaining": 15},
+            {"enabled": True, "sent": 10, "failed": 0, "remaining": 5},
+            {"enabled": True, "sent": 5, "failed": 0, "remaining": 0},
+        ])
+        self.assertEqual((result["sent"], result["failed"], result["delivery_status"]), (25, 0, "completed"))
+        deliveries = [r for r, _ in requests if r.full_url.endswith("/deliver")]
+        self.assertEqual(len(deliveries), 3)
+        self.assertEqual([json.loads(r.data) for r in deliveries], [{"run_id": RUN_ID}] * 3)
 
     def test_manual_production_and_dry_run_never_call_notification_endpoints(self):
         for mode in ("dry_run", "production_ingest"):
@@ -93,7 +105,7 @@ class NotificationClientTests(unittest.TestCase):
                      "state_kind": "snapshot", "snapshot_advanced": True,
                      "checkpoints_advanced": False}
         result, requests = self.invoke(
-            [{"eligible": True, "queued": 1}, {"enabled": True, "sent": 1, "failed": 0}],
+            [{"eligible": True, "queued": 1}, {"enabled": True, "sent": 1, "failed": 0, "remaining": 0}],
             ingestion=ingestion,
         )
         self.assertEqual(result["delivery_status"], "completed")
@@ -126,7 +138,7 @@ class NotificationClientTests(unittest.TestCase):
         snapshot = {"run_id": RUN_ID, "status": "COMMITTED", "mode": "incremental",
                     "state_kind": "snapshot", "snapshot_advanced": True}
         result, requests = self.invoke(
-            [{"eligible": True, "queued": 2}, {"enabled": True, "sent": 2, "failed": 0}],
+            [{"eligible": True, "queued": 2}, {"enabled": True, "sent": 2, "failed": 0, "remaining": 0}],
             ingestion=snapshot, event="workflow_dispatch", replay=True,
             replay_confirmation=REPLAY_CONFIRMATION,
         )
@@ -200,7 +212,7 @@ class NotificationClientTests(unittest.TestCase):
             if request.full_url.endswith("prepare"):
                 sent_run_ids.append(json.loads(request.data)["run_id"])
                 return Response({"eligible": True, "queued": 0})
-            return Response({"enabled": True, "sent": 0, "failed": 0})
+            return Response({"enabled": True, "sent": 0, "failed": 0, "remaining": 0})
 
         for _ in range(2):
             orchestrate(COMMITTED, event_name="schedule", queue_gate="true", delivery_gate="true",
