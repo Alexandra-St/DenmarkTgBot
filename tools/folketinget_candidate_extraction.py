@@ -225,10 +225,7 @@ def _resolve_affected_sag_ids(
     if entity == "Dokument":
         links = _safe_lookup(provider, "by_field", "SagDokument", (record_id,), diagnostics, field="dokumentid")
         sag_ids = {_required_int(link, "sagid") for link in links}
-        if not links:
-            diagnostics.update(("unresolved_relationship",))
-            diagnostics.update(("document_no_links",))
-        elif None in sag_ids:
+        if links and None in sag_ids:
             diagnostics.update(("unresolved_relationship",))
             diagnostics.update(("document_link_invalid_sagid",))
         return {value for value in sag_ids if value is not None}

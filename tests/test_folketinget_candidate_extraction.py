@@ -118,7 +118,6 @@ class CandidateExtractionTests(unittest.TestCase):
         cases = (
             ("Sagstrin", 10, {"Sagstrin": [{"id": 10, "sagid": None}]}, "sagstrin_invalid_sagid"),
             ("SagDokument", 11, {"SagDokument": [{"id": 11, "sagid": "bad"}]}, "sagdokument_invalid_sagid"),
-            ("Dokument", 12, {"Dokument": [{"id": 12}], "SagDokument": []}, "document_no_links"),
             ("Dokument", 13, {"Dokument": [{"id": 13}], "SagDokument": [{"id": 20, "dokumentid": 13, "sagid": None}]}, "document_link_invalid_sagid"),
             ("Afstemning", 14, {"Afstemning": [{"id": 14, "sagstrinid": None}]}, "vote_invalid_stageid"),
             ("Afstemning", 15, {"Afstemning": [{"id": 15, "sagstrinid": 99}], "Sagstrin": []}, "vote_stage_not_found"),
@@ -149,7 +148,7 @@ class CandidateExtractionTests(unittest.TestCase):
 
     def build(self, changes: list[tuple[str, str, int]], source_rows: dict[str, list[dict[str, object]]], *,
               old_routing: dict[tuple[str, int], dict[str, int | None]] | None = None, old_format: int = 2,
-              max_affected_cases: int = CANDIDATES.MAX_AFFECTED_CASES):
+              max_affected_cases: int = CANDIDATES.MAX_AFFECTED_CASES, provider=None):
         new_rows: dict[str, list[tuple[str, int, int]]] = {entity: [] for entity in ENTITIES}
         old_rows: dict[str, list[tuple[str, int, int]]] = {entity: [] for entity in ENTITIES}
         for entity, category, identifier in changes:
@@ -172,7 +171,7 @@ class CandidateExtractionTests(unittest.TestCase):
         self.new.unlink(missing_ok=True)
         make_manifest(self.old, old_rows, backup="1", routing=old_routing, format_version=old_format)
         make_manifest(self.new, new_rows, backup="2")
-        provider = CANDIDATES.InMemoryFolketingetProvider(source_rows)
+        provider = provider or CANDIDATES.InMemoryFolketingetProvider(source_rows)
         return CANDIDATES.extract_candidates(self.old, self.new, provider, max_affected_cases=max_affected_cases)
 
     def test_direct_sag_addition_produces_classifier_compatible_case(self) -> None:
@@ -210,6 +209,51 @@ class CandidateExtractionTests(unittest.TestCase):
             {"Sag": [sag(5)], "Sagstrin": [stage(400, 5)], "Afstemning": [vote(500, 400)]},
         )
         self.assertEqual([case["external_id"] for case in vote_bundle["cases"]], ["5"])
+
+    def test_unlinked_document_is_ignored_and_removed_link_uses_old_routing(self) -> None:
+        for category in ("added", "changed"):
+            with self.subTest(category=category):
+                bundle = self.build([("Dokument", category, 300)], {"Dokument": [document(300)]})
+                self.assertTrue(bundle["complete"])
+                self.assertEqual(bundle["_summary"]["affected_case_count"], 0)
+                self.assertNotIn("unresolved_relationship", {item["code"] for item in bundle["diagnostics"]})
+                self.assertNotIn("document_no_links", {item["code"] for item in bundle["diagnostics"]})
+
+        bundle = self.build(
+            [("Dokument", "added", 300), ("SagDokument", "removed", 40)],
+            {"Sag": [sag(4)], "Dokument": [document(300)]},
+            old_routing={("SagDokument", 40): {"sagid": 4, "dokumentid": 300}},
+        )
+        self.assertTrue(bundle["complete"])
+        self.assertEqual(bundle["_summary"]["affected_case_count"], 1)
+        self.assertEqual([case["external_id"] for case in bundle["cases"]], ["4"])
+        self.assertNotIn("unresolved_relationship", {item["code"] for item in bundle["diagnostics"]})
+
+    def test_document_reverse_lookup_failure_and_invalid_sagid_fail_closed(self) -> None:
+        class FailingDocumentLinkProvider(CANDIDATES.InMemoryFolketingetProvider):
+            def find_by_field(self, entity, field, values):
+                if entity == "SagDokument" and field == "dokumentid":
+                    raise SQLProviderError("provider_query_failed")
+                return super().find_by_field(entity, field, values)
+
+        failed = self.build(
+            [("Dokument", "added", 300)], {"Dokument": [document(300)]},
+            provider=FailingDocumentLinkProvider({"Dokument": [document(300)]}),
+        )
+        failed_codes = {item["code"] for item in failed["diagnostics"]}
+        self.assertFalse(failed["complete"])
+        self.assertIn("source_lookup_failed", failed_codes)
+        self.assertNotIn("unresolved_relationship", failed_codes)
+        self.assertNotIn("document_no_links", failed_codes)
+
+        invalid = self.build(
+            [("Dokument", "added", 300)],
+            {"Dokument": [document(300)], "SagDokument": [{"id": 40, "dokumentid": 300, "sagid": None}]},
+        )
+        invalid_codes = {item["code"] for item in invalid["diagnostics"]}
+        self.assertFalse(invalid["complete"])
+        self.assertIn("unresolved_relationship", invalid_codes)
+        self.assertIn("document_link_invalid_sagid", invalid_codes)
 
     def test_status_change_resolves_all_matching_cases_and_duplicates_collapse(self) -> None:
         bundle = self.build(
