@@ -279,6 +279,42 @@ export interface DeliveryResult {
 
 const DELIVERY_BATCH_SIZE = 10;
 
+
+export type ReconcileSendingResult = "reconciled" | "already_terminal" | "not_sending" | "not_in_run";
+
+/** Explicitly mark one ambiguous delivery as failed, scoped to its ingestion run. */
+export async function reconcileSendingNotification(
+  env: NotificationEnv,
+  runId: string,
+  notificationId: number,
+): Promise<ReconcileSendingResult> {
+  if (!isValidNotificationRunId(runId) || !Number.isSafeInteger(notificationId) || notificationId <= 0) {
+    return "not_in_run";
+  }
+  const runPattern = `ingest:${runId}:%`;
+  const row = await env.DB.prepare(`
+    SELECT n.status
+    FROM notifications n
+    JOIN publication_events e ON e.id = n.event_id
+    WHERE n.id = ? AND e.event_key LIKE ?
+  `).bind(notificationId, runPattern).first<{ status: string }>();
+  if (!row) return "not_in_run";
+  if (row.status === "SENT" || row.status === "FAILED") return "already_terminal";
+  if (row.status !== "SENDING") return "not_sending";
+
+  const result = await env.DB.prepare(`
+    UPDATE notifications
+    SET status = 'FAILED', attempts = attempts + 1,
+        last_error = 'telegram_delivery_ambiguous_or_failed'
+    WHERE id = ? AND status = 'SENDING'
+      AND EXISTS (
+        SELECT 1 FROM publication_events e
+        WHERE e.id = notifications.event_id AND e.event_key LIKE ?
+      )
+  `).bind(notificationId, runPattern).run();
+  return (result.meta.changes ?? 0) === 1 ? "reconciled" : "not_sending";
+}
+
 export interface CanaryRequest {
   confirmation?: unknown;
   request_id?: unknown;

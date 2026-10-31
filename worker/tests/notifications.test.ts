@@ -12,6 +12,7 @@ import {
   formatNotification,
   prepareNotificationQueue,
   prepareSingleNotificationE2E,
+  reconcileSendingNotification,
   previewNotifications,
   sendNotificationCanary,
 } from "../src/notifications.ts";
@@ -799,6 +800,63 @@ test("concurrent dispatchers claim a notification once; invalid URLs are never s
     const invalidResult = await deliverPendingNotifications(env, mock, TEST_RUN_ID, now);
     assert.equal(invalidResult.failed, 1);
     assert.equal(calls, 1, "invalid official URL is never sent");
+  } finally { db.close(); }
+});
+
+test("reconciliation only fails the exact SENDING notification in its run", async () => {
+  const db = await fixture();
+  try {
+    const states = ["SENDING", "SENT", "FAILED", "PENDING"] as const;
+    const ids: Record<string, number> = {};
+    for (const status of states) {
+      const eventId = await addEvent(db, { id: `reconcile-${status}` });
+      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, attempts, last_error, sent_at, created_at) VALUES (1, ?, ?, 4, 'prior-error', 'sent-time', ?)")
+        .bind(eventId, status, now.toISOString()).run();
+      ids[status] = (await db.prepare("SELECT id FROM notifications WHERE event_id = ?").bind(eventId).first<{id:number}>())!.id;
+    }
+    const otherEvent = await addEvent(db, { id: "reconcile-other-run", runId: "00000000-0000-4000-8000-000000000002" });
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, attempts, created_at) VALUES (1, ?, 'SENDING', 2, ?)")
+      .bind(otherEvent, now.toISOString()).run();
+    const otherId = (await db.prepare("SELECT id FROM notifications WHERE event_id = ?").bind(otherEvent).first<{id:number}>())!.id;
+    assert.equal(await reconcileSendingNotification({DB:db as never}, TEST_RUN_ID, ids.SENDING), "reconciled");
+    assert.equal(await reconcileSendingNotification({DB:db as never}, TEST_RUN_ID, ids.SENT), "already_terminal");
+    assert.equal(await reconcileSendingNotification({DB:db as never}, TEST_RUN_ID, ids.FAILED), "already_terminal");
+    assert.equal(await reconcileSendingNotification({DB:db as never}, TEST_RUN_ID, ids.PENDING), "not_sending");
+    assert.equal(await reconcileSendingNotification({DB:db as never}, TEST_RUN_ID, otherId), "not_in_run");
+    assert.equal(await reconcileSendingNotification({DB:db as never}, TEST_RUN_ID, 999999), "not_in_run");
+    const changed = await db.prepare("SELECT status, attempts, last_error, sent_at FROM notifications WHERE id = ?").bind(ids.SENDING).first();
+    assert.deepEqual({...changed}, {status:"FAILED", attempts:5, last_error:"telegram_delivery_ambiguous_or_failed", sent_at:"sent-time"});
+    for (const status of ["SENT", "FAILED", "PENDING"] as const) {
+      const row = await db.prepare("SELECT status, attempts, last_error, sent_at FROM notifications WHERE id = ?").bind(ids[status]).first();
+      assert.deepEqual({...row}, {status, attempts:4, last_error:"prior-error", sent_at:"sent-time"});
+    }
+    assert.equal((await db.prepare("SELECT status, attempts FROM notifications WHERE id = ?").bind(otherId).first<{status:string;attempts:number}>())?.status, "SENDING");
+  } finally { db.close(); }
+});
+
+test("reconciliation route validates confirmation and scope before core mutation", async () => {
+  const db = await fixture();
+  try {
+    const eventId = await addEvent(db, { id: "route-reconcile" });
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, attempts, created_at) VALUES (1, ?, 'SENDING', 2, ?)")
+      .bind(eventId, now.toISOString()).run();
+    const notificationId = (await db.prepare("SELECT id FROM notifications WHERE event_id = ?").bind(eventId).first<{id:number}>())!.id;
+    const token="reconcile-route-token";
+    const env={DB:db as never, INGEST_API_TOKEN:token};
+    const fetch=worker.fetch as unknown as (request:Request, env:typeof env)=>Promise<Response>;
+    const valid={run_id:TEST_RUN_ID, notification_id:notificationId, confirmation:"MARK_AMBIGUOUS_SENDING_FAILED"};
+    for (const payload of [
+      {...valid, run_id:"invalid"}, {...valid, notification_id:0}, {...valid, notification_id:1.5},
+      {...valid, confirmation:"wrong"}, {run_id:TEST_RUN_ID, notification_id:notificationId},
+    ]) {
+      const response=await fetch(new Request("https://local.test/internal/notifications/reconcile-sending", {method:"POST", headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"}, body:JSON.stringify(payload)}),env);
+      assert.equal(response.status,400);
+    }
+    const untouched=await db.prepare("SELECT status, attempts FROM notifications WHERE id = ?").bind(notificationId).first();
+    assert.deepEqual({...untouched},{status:"SENDING",attempts:2});
+    const response=await fetch(new Request("https://local.test/internal/notifications/reconcile-sending", {method:"POST", headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"}, body:JSON.stringify(valid)}),env);
+    assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),{status:"reconciled"});
   } finally { db.close(); }
 });
 

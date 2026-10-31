@@ -8,7 +8,7 @@ import { D1PublicationRepository } from "./database/publications.ts";
 import { D1SourceStatusRepository } from "./database/source_status.ts";
 import type { TelegramUpdate } from "./types/telegram.ts";
 import { handleIngestionRequest, handleSnapshotReadinessRequest, handleSourceStatesRequest, isIngestionRequestAuthorized } from "./ingestion.ts";
-import { deliverPendingNotifications, deliverSingleNotificationE2E, isValidNotificationRunId, prepareNotificationQueue, prepareSingleNotificationE2E, previewNotifications, sendNotificationCanary, type NotificationEnv } from "./notifications.ts";
+import { deliverPendingNotifications, deliverSingleNotificationE2E, isValidNotificationRunId, reconcileSendingNotification, prepareNotificationQueue, prepareSingleNotificationE2E, previewNotifications, sendNotificationCanary, type NotificationEnv } from "./notifications.ts";
 
 interface Env {
   DB: D1Database;
@@ -74,6 +74,21 @@ export default {
     if (url.pathname.startsWith("/internal/notifications/")) {
       if (!await isIngestionRequestAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
       const notificationEnv = env as Env & NotificationEnv;
+      if (url.pathname === "/internal/notifications/reconcile-sending") {
+        if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        let body: unknown;
+        try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+        if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "invalid_reconciliation_request" }, 400);
+        const payload = body as { run_id?: unknown; notification_id?: unknown; confirmation?: unknown };
+        if (!isValidNotificationRunId(payload.run_id)
+            || typeof payload.notification_id !== "number"
+            || !Number.isSafeInteger(payload.notification_id) || payload.notification_id <= 0
+            || payload.confirmation !== "MARK_AMBIGUOUS_SENDING_FAILED") {
+          return json({ error: "invalid_reconciliation_request" }, 400);
+        }
+        const status = await reconcileSendingNotification(notificationEnv, payload.run_id, payload.notification_id);
+        return json({ status });
+      }
       if (url.pathname === "/internal/notifications/preview") {
         if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
         return json(await previewNotifications(notificationEnv));
