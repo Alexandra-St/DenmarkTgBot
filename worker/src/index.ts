@@ -8,7 +8,7 @@ import { D1PublicationRepository } from "./database/publications.ts";
 import { D1SourceStatusRepository } from "./database/source_status.ts";
 import type { TelegramUpdate } from "./types/telegram.ts";
 import { handleIngestionRequest, handleSnapshotReadinessRequest, handleSourceStatesRequest, isIngestionRequestAuthorized } from "./ingestion.ts";
-import { deliverPendingNotifications, deliverSingleNotificationE2E, prepareNotificationQueue, prepareSingleNotificationE2E, previewNotifications, sendNotificationCanary, type NotificationEnv } from "./notifications.ts";
+import { deliverPendingNotifications, deliverSingleNotificationE2E, isValidNotificationRunId, prepareNotificationQueue, prepareSingleNotificationE2E, previewNotifications, sendNotificationCanary, type NotificationEnv } from "./notifications.ts";
 
 interface Env {
   DB: D1Database;
@@ -90,12 +90,18 @@ export default {
       }
       if (url.pathname === "/internal/notifications/deliver") {
         if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+        let body: unknown;
+        try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+        const runId = body && typeof body === "object" && !Array.isArray(body)
+          ? (body as { run_id?: unknown }).run_id
+          : undefined;
+        if (!isValidNotificationRunId(runId)) return json({ error: "invalid_run_id" }, 400);
         if (env.NOTIFICATION_E2E_ENABLED === "true") return json({ enabled: false, sent: 0, failed: 0 });
         if (env.NOTIFICATION_DELIVERY_ENABLED !== "true" || !env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF) {
           return json({ enabled: false, sent: 0, failed: 0 });
         }
         if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "delivery_not_configured" }, 503);
-        const result = await deliverPendingNotifications(notificationEnv, new TelegramApi(env.TELEGRAM_BOT_TOKEN));
+        const result = await deliverPendingNotifications(notificationEnv, new TelegramApi(env.TELEGRAM_BOT_TOKEN), runId);
         return json(result);
       }
       if (url.pathname === "/internal/notifications/e2e/prepare") {

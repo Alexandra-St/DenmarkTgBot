@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from collectors.notification_client import OrchestrationError, orchestrate
+from collectors.notification_client import REPLAY_CONFIRMATION, OrchestrationError, orchestrate
 from collectors.workflow_support import render_summary
 
 
@@ -29,7 +29,8 @@ class Response:
 
 
 class NotificationClientTests(unittest.TestCase):
-    def invoke(self, responses, *, ingestion=COMMITTED, event="schedule", queue="true", delivery="true"):
+    def invoke(self, responses, *, ingestion=COMMITTED, event="schedule", queue="true", delivery="true",
+               replay=False, replay_confirmation=None):
         requests = []
 
         def opener(request, timeout):
@@ -40,6 +41,7 @@ class NotificationClientTests(unittest.TestCase):
         result = orchestrate(
             ingestion, event_name=event, queue_gate=queue, delivery_gate=delivery,
             endpoint="https://worker.example", token="test-token-never-logged", opener=opener,
+            replay=replay, replay_confirmation=replay_confirmation,
         )
         return result, requests
 
@@ -51,6 +53,7 @@ class NotificationClientTests(unittest.TestCase):
             "https://worker.example/internal/notifications/deliver",
         ])
         self.assertEqual(json.loads(requests[0][0].data), {"run_id": RUN_ID})
+        self.assertEqual(json.loads(requests[1][0].data), {"run_id": RUN_ID})
         self.assertTrue(all(timeout == 20 for _, timeout in requests))
 
     def test_manual_production_and_dry_run_never_call_notification_endpoints(self):
@@ -95,6 +98,59 @@ class NotificationClientTests(unittest.TestCase):
         )
         self.assertEqual(result["delivery_status"], "completed")
         self.assertEqual(len(requests), 2)
+
+    def test_manual_dispatch_without_explicit_replay_remains_skipped(self):
+        result, requests = self.invoke([], event="workflow_dispatch")
+        self.assertEqual(result["queue_status"], "manual_skipped")
+        self.assertEqual(result["delivery_status"], "manual_skipped")
+        self.assertEqual(requests, [])
+
+    def test_replay_without_exact_confirmation_is_blocked_without_requests(self):
+        for confirmation in (None, "wrong"):
+            with self.subTest(confirmation=confirmation):
+                requests = []
+                with self.assertRaises(OrchestrationError) as caught:
+                    orchestrate(
+                        {"run_id": RUN_ID, "status": "COMMITTED", "mode": "incremental",
+                         "state_kind": "snapshot", "snapshot_advanced": True},
+                        event_name="workflow_dispatch", queue_gate="true", delivery_gate="true",
+                        endpoint="https://worker.example", token="hidden", replay=True,
+                        replay_confirmation=confirmation,
+                        opener=lambda *args, **kwargs: requests.append(True),
+                    )
+                self.assertEqual(caught.exception.category, "notification_replay_confirmation_required")
+                self.assertEqual(caught.exception.result["queue_status"], "blocked")
+                self.assertEqual(requests, [])
+
+    def test_explicit_replay_queues_and_delivers_the_same_committed_snapshot_run(self):
+        snapshot = {"run_id": RUN_ID, "status": "COMMITTED", "mode": "incremental",
+                    "state_kind": "snapshot", "snapshot_advanced": True}
+        result, requests = self.invoke(
+            [{"eligible": True, "queued": 2}, {"enabled": True, "sent": 2, "failed": 0}],
+            ingestion=snapshot, event="workflow_dispatch", replay=True,
+            replay_confirmation=REPLAY_CONFIRMATION,
+        )
+        self.assertEqual(result["delivery_status"], "completed")
+        self.assertEqual([json.loads(request.data) for request, _ in requests], [
+            {"run_id": RUN_ID}, {"run_id": RUN_ID},
+        ])
+
+    def test_replay_requires_advanced_committed_snapshot_and_valid_uuid(self):
+        invalid = [
+            {"run_id": RUN_ID, "status": "OPEN", "mode": "incremental", "state_kind": "snapshot", "snapshot_advanced": True},
+            {"run_id": RUN_ID, "status": "COMMITTED", "mode": "incremental", "state_kind": "snapshot", "snapshot_advanced": False},
+            {"run_id": "not-a-uuid", "status": "COMMITTED", "mode": "incremental", "state_kind": "snapshot", "snapshot_advanced": True},
+        ]
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                requests = []
+                with self.assertRaises(OrchestrationError) as caught:
+                    orchestrate(payload, event_name="workflow_dispatch", queue_gate="true", delivery_gate="true",
+                                endpoint="https://worker.example", token="hidden", replay=True,
+                                replay_confirmation=REPLAY_CONFIRMATION,
+                                opener=lambda *args, **kwargs: requests.append(True))
+                self.assertEqual(caught.exception.category, "ingestion_not_confirmed_committed")
+                self.assertEqual(requests, [])
 
     def test_snapshot_contract_requires_incremental_snapshot_commit_and_advance(self):
         invalid = [
