@@ -219,29 +219,43 @@ def _resolve_affected_sag_ids(
         sag_id = _required_int(row, "sagid")
         if sag_id is None:
             diagnostics.update(("unresolved_relationship",))
+            diagnostics.update(("sagstrin_invalid_sagid" if entity == "Sagstrin" else "sagdokument_invalid_sagid",))
             return set()
         return {sag_id}
     if entity == "Dokument":
         links = _safe_lookup(provider, "by_field", "SagDokument", (record_id,), diagnostics, field="dokumentid")
         sag_ids = {_required_int(link, "sagid") for link in links}
-        if not links or None in sag_ids:
+        if not links:
             diagnostics.update(("unresolved_relationship",))
+            diagnostics.update(("document_no_links",))
+        elif None in sag_ids:
+            diagnostics.update(("unresolved_relationship",))
+            diagnostics.update(("document_link_invalid_sagid",))
         return {value for value in sag_ids if value is not None}
     if entity == "Afstemning":
         stage_id = _required_int(row, "sagstrinid")
         if stage_id is None:
             diagnostics.update(("unresolved_relationship",))
+            diagnostics.update(("vote_invalid_stageid",))
             return set()
         stages = _safe_lookup(provider, "by_ids", "Sagstrin", (stage_id,), diagnostics)
         sag_ids = {_required_int(stage, "sagid") for stage in stages}
-        if not stages or None in sag_ids:
+        if not stages:
             diagnostics.update(("unresolved_relationship",))
+            diagnostics.update(("vote_stage_not_found",))
+        elif None in sag_ids:
+            diagnostics.update(("unresolved_relationship",))
+            diagnostics.update(("vote_stage_invalid_sagid",))
         return {value for value in sag_ids if value is not None}
     if entity == "Sagsstatus":
         sags = _safe_lookup(provider, "by_field", "Sag", (record_id,), diagnostics, field="statusid")
         sag_ids = {_required_int(sag, "id") for sag in sags}
-        if not sags or None in sag_ids:
+        if not sags:
             diagnostics.update(("unresolved_relationship",))
+            diagnostics.update(("status_no_matching_sags",))
+        elif None in sag_ids:
+            diagnostics.update(("unresolved_relationship",))
+            diagnostics.update(("status_invalid_sag_id",))
         return {value for value in sag_ids if value is not None}
     diagnostics.update(("unsupported_entity",))
     return set()

@@ -114,6 +114,39 @@ class CandidateExtractionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_unresolved_relationship_diagnostics_are_specific_and_aggregate(self) -> None:
+        cases = (
+            ("Sagstrin", 10, {"Sagstrin": [{"id": 10, "sagid": None}]}, "sagstrin_invalid_sagid"),
+            ("SagDokument", 11, {"SagDokument": [{"id": 11, "sagid": "bad"}]}, "sagdokument_invalid_sagid"),
+            ("Dokument", 12, {"Dokument": [{"id": 12}], "SagDokument": []}, "document_no_links"),
+            ("Dokument", 13, {"Dokument": [{"id": 13}], "SagDokument": [{"id": 20, "dokumentid": 13, "sagid": None}]}, "document_link_invalid_sagid"),
+            ("Afstemning", 14, {"Afstemning": [{"id": 14, "sagstrinid": None}]}, "vote_invalid_stageid"),
+            ("Afstemning", 15, {"Afstemning": [{"id": 15, "sagstrinid": 99}], "Sagstrin": []}, "vote_stage_not_found"),
+            ("Afstemning", 16, {"Afstemning": [{"id": 16, "sagstrinid": 100}], "Sagstrin": [{"id": 100, "sagid": None}]}, "vote_stage_invalid_sagid"),
+            ("Sagsstatus", 17, {"Sagsstatus": [{"id": 17}], "Sag": []}, "status_no_matching_sags"),
+            ("Sagsstatus", 18, {"Sagsstatus": [{"id": 18}], "Sag": [{"statusid": 18, "id": None}]}, "status_invalid_sag_id"),
+        )
+        totals = Counter()
+        for entity, identifier, rows, expected in cases:
+            with self.subTest(code=expected):
+                provider = CANDIDATES.InMemoryFolketingetProvider(rows)
+                diagnostics = Counter()
+                CANDIDATES._resolve_affected_sag_ids(entity, identifier, provider, diagnostics)
+                self.assertEqual(diagnostics["unresolved_relationship"], 1)
+                self.assertEqual(diagnostics[expected], 1)
+                totals.update(diagnostics)
+
+        specific_codes = {expected for _entity, _identifier, _rows, expected in cases}
+        self.assertEqual(totals["unresolved_relationship"], sum(totals[code] for code in specific_codes))
+        self.assertEqual(sum(totals[code] for code in specific_codes), len(cases))
+
+        bundle = self.build([("Sagstrin", "added", 19)], {"Sagstrin": [{"id": 19, "sagid": None}]})
+        summary_diagnostics = {
+            item["code"]: item["count"] for item in CANDIDATES.candidate_summary(bundle)["diagnostics"]
+        }
+        self.assertEqual(summary_diagnostics["unresolved_relationship"], 1)
+        self.assertEqual(summary_diagnostics["sagstrin_invalid_sagid"], 1)
+
     def build(self, changes: list[tuple[str, str, int]], source_rows: dict[str, list[dict[str, object]]], *,
               old_routing: dict[tuple[str, int], dict[str, int | None]] | None = None, old_format: int = 2,
               max_affected_cases: int = CANDIDATES.MAX_AFFECTED_CASES):
