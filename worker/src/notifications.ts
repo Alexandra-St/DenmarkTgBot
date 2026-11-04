@@ -271,19 +271,6 @@ export function formatNotification(event: PendingNotification): string | null {
   ].join("\n\n");
 }
 
-function formatNotificationGroup(events: PendingNotification[]): string | null {
-  if (events.length === 1) return formatNotification(events[0]);
-  const first = events[0];
-  const url = validatedOfficialUrl(first.source_code, first.external_url);
-  if (!url) return null;
-  const changes = [...new Set(events.map((event) => eventLabel(event, first.language)).filter((value): value is string => Boolean(value)))];
-  if (!changes.length) return null;
-  const marker = events.some((event) => event.relevance === "DIRECT") ? "🟢" : "🟡";
-  const header = marker + " " + t(first.language, events.some((event) => event.relevance === "DIRECT") ? "directShort" : "potentialShort");
-  const disclaimer = first.language === "uk" ? "Інформаційне повідомлення, не юридична консультація." : "Информационное сообщение, не юридическая консультация.";
-  return [header, "Изменения:\n" + changes.map((change) => "• " + change).join("\n"), clean(first.title, 500), t(first.language, "sourceLabel") + ": " + clean(first.source_name, 120), url, disclaimer].join("\n\n");
-}
-
 export interface DeliveryResult {
   enabled: boolean;
   sent: number;
@@ -292,14 +279,162 @@ export interface DeliveryResult {
 }
 
 const DELIVERY_BATCH_SIZE = 10;
+const DIGEST_TEXT_LIMIT = 3_500;
 
-async function countEligiblePendingNotifications(env: NotificationEnv, runId: string, now: Date, scope?: NotificationScope): Promise<number> {
+interface DeliveryMessage {
+  telegramId: number;
+  language: Language;
+  rows: PendingNotification[];
+  text: string;
+  keyboard: InlineKeyboardMarkup;
+}
+
+function notificationDisclaimer(language: Language): string {
+  return language === "uk"
+    ? "Інформаційне повідомлення, не юридична консультація."
+    : "Информационное сообщение, не юридическая консультация.";
+}
+
+function publicationChanges(rows: PendingNotification[]): string[] {
+  const seenTypes = new Set<string>();
+  const changes: string[] = [];
+  for (const row of rows) {
+    if (seenTypes.has(row.event_type)) continue;
+    seenTypes.add(row.event_type);
+    const label = eventLabel(row, row.language);
+    if (label) changes.push(label);
+  }
+  return changes;
+}
+
+function publicationBlock(rows: PendingNotification[], number: number): string | null {
+  const first = rows[0];
+  const changes = publicationChanges(rows);
+  if (!changes.length) return null;
+  return `${number}. ${clean(first.title, 500)}\n${changes.map((change) => "• " + change).join("\n")}`;
+}
+
+function publicationIsDeliverable(rows: PendingNotification[]): boolean {
+  const first = rows[0];
+  return Boolean(validatedOfficialUrl(first.source_code, first.external_url) && publicationChanges(rows).length);
+}
+
+function categoryHeader(relevance: "DIRECT" | "POTENTIAL", language: Language): string {
+  return `${relevance === "DIRECT" ? "🟢" : "🟡"} ${t(language, relevance === "DIRECT" ? "directShort" : "potentialShort")}`;
+}
+
+function categoryFooter(publications: PendingNotification[][], language: Language): string {
+  const sources = [...new Set(publications.map((rows) => clean(rows[0].source_name, 120)))];
+  return [
+    `${t(language, "sourceLabel")}: ${sources.join(", ")}`,
+    notificationDisclaimer(language),
+  ].join("\n\n");
+}
+
+function digestText(
+  relevance: "DIRECT" | "POTENTIAL",
+  language: Language,
+  publications: PendingNotification[][],
+): string | null {
+  const blocks = publications.map((rows, index) => publicationBlock(rows, index + 1));
+  if (blocks.some((block) => block === null)) return null;
+  return [categoryHeader(relevance, language), (blocks as string[]).join("\n\n"), categoryFooter(publications, language)].join("\n\n");
+}
+
+function notificationKeyboard(publications: PendingNotification[][], language: Language): InlineKeyboardMarkup {
+  const links = publications.map((rows) => {
+    const first = rows[0];
+    const url = validatedOfficialUrl(first.source_code, first.external_url);
+    return [{ text: clean(first.title, 48), ...(url ? { url } : {}) }];
+  }).filter((row) => "url" in row[0]);
+  return {
+    inline_keyboard: [...links, ...notificationMainMenuKeyboard(language).inline_keyboard],
+  };
+}
+
+function buildDeliveryMessages(rows: PendingNotification[], scope?: NotificationScope): DeliveryMessage[] {
+  if (scope) {
+    return rows.map((row) => {
+      const text = formatNotification(row) ?? "";
+      return {
+        telegramId: row.telegram_id,
+        language: row.language,
+        rows: [row],
+        text,
+        keyboard: notificationMainMenuKeyboard(row.language),
+      };
+    });
+  }
+
+  const categories = new Map<string, PendingNotification[]>();
+  for (const row of rows) {
+    const key = `${row.telegram_id}:${row.relevance}`;
+    const category = categories.get(key) ?? [];
+    category.push(row);
+    categories.set(key, category);
+  }
+
+  const messages: DeliveryMessage[] = [];
+  for (const categoryRows of categories.values()) {
+    const first = categoryRows[0];
+    const publications = new Map<number, PendingNotification[]>();
+    for (const row of categoryRows) {
+      const publication = publications.get(row.publication_id) ?? [];
+      publication.push(row);
+      publications.set(row.publication_id, publication);
+    }
+
+    const validPublications: PendingNotification[][] = [];
+    for (const publicationRows of publications.values()) {
+      if (publicationIsDeliverable(publicationRows)) {
+        validPublications.push(publicationRows);
+      } else {
+        // Invalid content is terminal per publication, while unrelated valid publications
+        // continue through the ordinary digest path.
+        messages.push({
+          telegramId: first.telegram_id,
+          language: first.language,
+          rows: publicationRows,
+          text: "",
+          keyboard: notificationMainMenuKeyboard(first.language),
+        });
+      }
+    }
+
+    let chunk: PendingNotification[][] = [];
+    const flush = () => {
+      if (!chunk.length) return;
+      const text = digestText(first.relevance, first.language, chunk);
+      messages.push({
+        telegramId: first.telegram_id,
+        language: first.language,
+        rows: chunk.flat(),
+        text: text ?? "",
+        keyboard: notificationKeyboard(chunk, first.language),
+      });
+      chunk = [];
+    };
+
+    for (const publicationRows of validPublications) {
+      const candidate = [...chunk, publicationRows];
+      const text = digestText(first.relevance, first.language, candidate);
+      if (chunk.length && (!text || Array.from(text).length > DIGEST_TEXT_LIMIT)) flush();
+      chunk.push(publicationRows);
+      // A single publication block is bounded by clean() and eventLabel() field limits.
+    }
+    flush();
+  }
+  return messages;
+}
+
+async function loadEligiblePendingNotifications(env: NotificationEnv, runId: string, now: Date, scope?: NotificationScope): Promise<PendingNotification[]> {
   const cutoff = activationCutoff(env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF);
-  if (!cutoff) return 0;
+  if (!cutoff) return [];
   const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
-  const row = await env.DB.prepare(`
-    SELECT COUNT(*) AS count FROM (
-    SELECT n.telegram_id, p.id AS publication_id
+  const result = await env.DB.prepare(`
+    SELECT n.id, n.telegram_id, u.language, e.event_type, e.previous_status, e.new_status,
+      p.relevance, p.original_title AS title, s.code AS source_code, s.name AS source_name,
+      p.external_url, p.id AS publication_id
     FROM notifications n
     JOIN users u ON u.telegram_id = n.telegram_id
     JOIN publication_events e ON e.id = n.event_id
@@ -318,10 +453,9 @@ async function countEligiblePendingNotifications(env: NotificationEnv, runId: st
       AND e.event_key LIKE ?
       AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')
       ${scope ? "AND n.telegram_id = ? AND e.id = ?" : ""}
-    GROUP BY n.telegram_id, p.id
-    )
-  `).bind(cutoff.toISOString(), staleBefore, `ingest:${runId}:%`, ...(scope ? [scope.recipientId, scope.eventId] : [])).first<{ count: number }>();
-  return row?.count ?? 0;
+    ORDER BY n.created_at, n.id
+  `).bind(cutoff.toISOString(), staleBefore, `ingest:${runId}:%`, ...(scope ? [scope.recipientId, scope.eventId] : [])).all<PendingNotification>();
+  return result.results ?? [];
 }
 
 export type ReconcileSendingResult = "reconciled" | "already_terminal" | "not_sending" | "not_in_run";
@@ -422,60 +556,25 @@ export async function deliverPendingNotifications(
   if (env.NOTIFICATION_DELIVERY_ENABLED !== "true") return { enabled: false, sent: 0, failed: 0, remaining: 0 };
   const cutoff = activationCutoff(env.NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF);
   if (!cutoff || now.getTime() < cutoff.getTime()) return { enabled: false, sent: 0, failed: 0, remaining: 0 };
-  const staleBefore = new Date(now.getTime() - MAX_EVENT_AGE_MS).toISOString();
-  const scopeSql = scope ? " AND n.telegram_id = ? AND e.id = ?" : "";
-  const scopeBindings = scope ? [scope.recipientId, scope.eventId] : [];
-  const rows = await env.DB.prepare(`
-    SELECT n.id, n.telegram_id, u.language, e.event_type, e.previous_status, e.new_status,
-      u.notify_direct, u.notify_potential, p.historical, p.source_complete,
-      p.relevance, p.original_title AS title, s.code AS source_code, s.name AS source_name,
-      p.external_url, p.id AS publication_id
-    FROM notifications n
-    JOIN users u ON u.telegram_id = n.telegram_id
-    JOIN publication_events e ON e.id = n.event_id
-    JOIN publications p ON p.id = e.publication_id
-    JOIN sources s ON s.id = p.source_id
-    WHERE n.status = 'PENDING'
-      AND e.notify_eligible = 1
-      AND p.historical = 0
-      AND p.source_complete = 1
-      AND p.source_deleted = 0
-      AND p.relevance IN ('DIRECT', 'POTENTIAL')
-      AND ((p.relevance = 'DIRECT' AND u.notify_direct = 1)
-        OR (p.relevance = 'POTENTIAL' AND u.notify_potential = 1))
-      AND e.detected_at > ?
-      AND e.detected_at >= ?
-      AND e.event_key LIKE ?
-      AND NOT (s.code = 'hoeringsportalen' AND e.event_type = 'FIRST_SEEN')${scopeSql}
-    ORDER BY n.created_at, n.id
-  `).bind(cutoff.toISOString(), staleBefore, `ingest:${runId}:%`, ...scopeBindings).all<PendingNotification>();
-
-  const groups = new Map<string, PendingNotification[]>();
-  for (const row of rows.results ?? []) {
-    const key = scope ? `scope:${row.id}` : `${row.telegram_id}:${row.publication_id}:${runId}`;
-    const group = groups.get(key) ?? [];
-    group.push(row);
-    groups.set(key, group);
-  }
-  const selectedGroups = [...groups.values()].slice(0, scope ? 1 : DELIVERY_BATCH_SIZE);
+  const rows = await loadEligiblePendingNotifications(env, runId, now, scope);
+  const messages = buildDeliveryMessages(rows, scope);
+  const selectedMessages = messages.slice(0, scope ? 1 : DELIVERY_BATCH_SIZE);
   let sent = 0;
   let failed = 0;
-  for (const group of selectedGroups) {
-    const ids = group.map((row) => row.id);
+  for (const message of selectedMessages) {
+    const ids = message.rows.map((row) => row.id);
     const placeholders = ids.map(() => "?").join(", ");
     const claim = await env.DB.prepare(`UPDATE notifications SET status = 'SENDING' WHERE id IN (${placeholders}) AND status = 'PENDING'`)
       .bind(...ids).run();
     if ((claim.meta.changes ?? 0) !== ids.length) continue;
-    const row = group[0];
-    const text = formatNotificationGroup(group);
-    if (!text) {
+    if (!message.text) {
       await env.DB.prepare(`UPDATE notifications SET status = 'FAILED', last_error = 'invalid_notification_content' WHERE id IN (${placeholders}) AND status = 'SENDING'`)
         .bind(...ids).run();
       failed += 1;
       continue;
     }
     try {
-      await telegram.sendMessage(row.telegram_id, text, notificationMainMenuKeyboard(row.language), { is_disabled: true });
+      await telegram.sendMessage(message.telegramId, message.text, message.keyboard, { is_disabled: true });
       await env.DB.prepare(`UPDATE notifications SET status = 'SENT', attempts = attempts + 1, sent_at = ?, last_error = NULL WHERE id IN (${placeholders}) AND status = 'SENDING'`)
         .bind(now.toISOString(), ...ids).run();
       sent += 1;
@@ -486,7 +585,7 @@ export async function deliverPendingNotifications(
       failed += 1;
     }
   }
-  const remaining = await countEligiblePendingNotifications(env, runId, now, scope);
+  const remaining = buildDeliveryMessages(await loadEligiblePendingNotifications(env, runId, now, scope), scope).length;
   return { enabled: true, sent, failed, remaining };
 }
 

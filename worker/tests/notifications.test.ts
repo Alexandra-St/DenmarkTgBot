@@ -604,17 +604,24 @@ test("delivery remains disabled by default; success is recorded once through a m
   } finally { db.close(); }
 });
 
-test("ordinary delivery batches 25 run notifications and excludes other runs from remaining", async () => {
+test("ordinary delivery batches 25 recipient category digests and excludes other runs from remaining", async () => {
   const db = await fixture();
   try {
     const otherRun = "00000000-0000-4000-8000-000000000002";
     const eventIds: number[] = [];
-    for (let index = 0; index < 25; index += 1) eventIds.push(await addEvent(db, { id: `batch-${index}` }));
-    const otherEvent = await addEvent(db, { id: "other-run-pending", runId: otherRun });
-    for (const eventId of [...eventIds, otherEvent]) {
-      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
-        .bind(eventId, now.toISOString()).run();
+    for (let index = 0; index < 25; index += 1) {
+      eventIds.push(await addEvent(db, { id: `batch-${index}` }));
+      const recipientId = 100 + index;
+      await db.prepare("INSERT INTO users (telegram_id, language, notify_direct, notify_potential, created_at, updated_at) VALUES (?, 'uk', 1, 0, ?, ?)")
+        .bind(recipientId, now.toISOString(), now.toISOString()).run();
     }
+    const otherEvent = await addEvent(db, { id: "other-run-pending", runId: otherRun });
+    for (const [index, eventId] of eventIds.entries()) {
+      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (?, ?, 'PENDING', ?)")
+        .bind(100 + index, eventId, now.toISOString()).run();
+    }
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
+      .bind(otherEvent, now.toISOString()).run();
     let calls = 0;
     const env = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff };
     const telegram = { async sendMessage() { calls += 1; } };
@@ -657,6 +664,7 @@ test("three events for one publication and recipient are sent once and finalized
 test("different recipients and publications are separate groups; run scope excludes other runs", async () => {
   const db=await fixture();
   try {
+    await db.prepare("UPDATE users SET notify_direct = 1 WHERE telegram_id = 2").run();
     const a=await addEvent(db,{id:"group-a"}); const b=await addEvent(db,{id:"group-b"});
     const pubA=(await db.prepare("SELECT publication_id FROM publication_events WHERE id=?").bind(a).first<{publication_id:number}>())!.publication_id;
     const e2=await db.prepare("INSERT INTO publication_events (publication_id,event_key,event_type,detected_at,notify_eligible) VALUES (?,?,'STAGES_CHANGED',?,1)").bind(pubA,`ingest:${TEST_RUN_ID}:group:second`,`2026-10-15T02:00:00.000Z`).run();
@@ -666,8 +674,92 @@ test("different recipients and publications are separate groups; run scope exclu
     const sent:number[]=[];
     const result=await deliverPendingNotifications({DB:db as never,NOTIFICATION_DELIVERY_ENABLED:"true",NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF:cutoff},{async sendMessage(id){sent.push(id);}},TEST_RUN_ID,now);
     assert.equal(result.sent,2); assert.equal(sent.length,2);
+    assert.deepEqual(sent.sort((left, right) => left - right), [1, 2]);
     assert.equal((await db.prepare("SELECT status FROM notifications WHERE event_id=? AND telegram_id=1").bind(Number(otherRun.meta.last_row_id)).first<{status:string}>())?.status,"PENDING");
   } finally {db.close();}
+});
+
+test("five POTENTIAL publications become one localized category digest with URL buttons and disabled previews", async () => {
+  const db = await fixture();
+  try {
+    const eventIds: number[] = [];
+    for (let index = 1; index <= 5; index += 1) {
+      eventIds.push(await addEvent(db, { id: `potential-digest-${index}`, relevance: "POTENTIAL" }));
+    }
+    const excludedDirect = await addEvent(db, { id: "preference-excluded-direct", relevance: "DIRECT" });
+    for (const eventId of eventIds) {
+      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (2, ?, 'PENDING', ?)")
+        .bind(eventId, now.toISOString()).run();
+    }
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (2, ?, 'PENDING', ?)")
+      .bind(excludedDirect, now.toISOString()).run();
+    const sent: Array<{ id: number; text: string; keyboard: { inline_keyboard: Array<Array<{ text: string; url?: string; callback_data?: string }>> }; preview?: { is_disabled: boolean } }> = [];
+    const result = await deliverPendingNotifications({ DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff }, {
+      async sendMessage(id, text, keyboard, preview) { sent.push({ id, text, keyboard: keyboard as typeof sent[number]["keyboard"], preview }); },
+    }, TEST_RUN_ID, now);
+    assert.deepEqual(result, { enabled: true, sent: 1, failed: 0, remaining: 0 });
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].id, 2);
+    assert.match(sent[0].text, /^🟡 Потенциальные/u);
+    for (let index = 1; index <= 5; index += 1) assert.match(sent[0].text, new RegExp(`Test publication potential-digest-${index}`, "u"));
+    assert.equal((sent[0].text.match(/^• /gmu) ?? []).length, 5);
+    assert.equal((sent[0].text.match(/Источник:/gu) ?? []).length, 1);
+    assert.equal((sent[0].text.match(/не юридическая консультация\./gu) ?? []).length, 1);
+    const buttons = sent[0].keyboard.inline_keyboard.flat();
+    const urlButtons = buttons.filter((button) => button.url);
+    assert.equal(urlButtons.length, 5);
+    assert.ok(urlButtons.every((button) => button.url === "https://hoeringsportalen.dk/Hearing/Details/123"));
+    assert.equal(buttons.at(-1)?.callback_data, "notification:main");
+    assert.deepEqual(sent[0].preview, { is_disabled: true });
+  } finally { db.close(); }
+});
+
+test("DIRECT and POTENTIAL stay in separate digests for one recipient", async () => {
+  const db = await fixture();
+  try {
+    await db.prepare("UPDATE users SET notify_potential = 1 WHERE telegram_id = 1").run();
+    const direct = await addEvent(db, { id: "digest-direct", relevance: "DIRECT" });
+    const potential = await addEvent(db, { id: "digest-potential", relevance: "POTENTIAL" });
+    for (const eventId of [direct, potential]) {
+      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
+        .bind(eventId, now.toISOString()).run();
+    }
+    const texts: string[] = [];
+    const result = await deliverPendingNotifications({ DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff }, {
+      async sendMessage(_id, text) { texts.push(text); },
+    }, TEST_RUN_ID, now);
+    assert.deepEqual(result, { enabled: true, sent: 2, failed: 0, remaining: 0 });
+    assert.equal(texts.length, 2);
+    assert.equal(texts.filter((text) => text.startsWith("🟢 Прямі")).length, 1);
+    assert.equal(texts.filter((text) => text.startsWith("🟡 Потенційні")).length, 1);
+  } finally { db.close(); }
+});
+
+test("oversized category digests split between publications and remaining counts chunks", async () => {
+  const db = await fixture();
+  try {
+    for (let index = 0; index < 70; index += 1) {
+      const eventId = await addEvent(db, { id: `oversized-${index}` });
+      const title = `Publication ${index} ${"x".repeat(480)}`;
+      await db.prepare("UPDATE publications SET original_title = ? WHERE id = (SELECT publication_id FROM publication_events WHERE id = ?)")
+        .bind(title, eventId).run();
+      await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
+        .bind(eventId, now.toISOString()).run();
+    }
+    const texts: string[] = [];
+    const env = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff };
+    const first = await deliverPendingNotifications(env, { async sendMessage(_id, text) { texts.push(text); } }, TEST_RUN_ID, now);
+    assert.equal(first.sent, 10);
+    assert.equal(first.failed, 0);
+    assert.ok(first.remaining > 0);
+    assert.ok(texts.every((text) => Array.from(text).length <= 3_500));
+    const firstChunkTitles = texts.flatMap((text) => [...text.matchAll(/^\d+\. Publication (\d+)/gmu)].map((match) => match[1]));
+    assert.equal(new Set(firstChunkTitles).size, firstChunkTitles.length, "no publication is repeated across chunks");
+    const second = await deliverPendingNotifications(env, { async sendMessage(_id, text) { texts.push(text); } }, TEST_RUN_ID, now);
+    assert.equal(second.sent, first.remaining);
+    assert.equal(second.remaining, 0);
+    assert.equal(texts.length, first.sent + second.sent);
+  } finally { db.close(); }
 });
 
 test("partial group claim never sends Telegram message", async () => {
@@ -839,25 +931,37 @@ test("concurrent dispatchers claim a notification once; invalid URLs are never s
     const eventId = await addEvent(db, { id: "concurrent" });
     await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
       .bind(eventId, now.toISOString()).run();
-    let calls = 0;
-    const mock = { async sendMessage() { calls += 1; } };
+    const sends: Array<{ text: string; keyboard: { inline_keyboard: Array<Array<{ url?: string; callback_data?: string }>> } }> = [];
+    const mock = { async sendMessage(_id: number, text: string, keyboard: unknown) { sends.push({ text, keyboard: keyboard as typeof sends[number]["keyboard"] }); } };
     const env = { DB: db as never, NOTIFICATION_DELIVERY_ENABLED: "true", NOTIFICATION_DELIVERY_ACTIVATION_CUTOFF: cutoff };
     const results = await Promise.all([
       deliverPendingNotifications(env, mock, TEST_RUN_ID, now),
       deliverPendingNotifications(env, mock, TEST_RUN_ID, now),
     ]);
-    assert.equal(calls, 1);
+    assert.equal(sends.length, 1);
     assert.equal(results.reduce((total, result) => total + result.sent, 0), 1);
     const row = await db.prepare("SELECT status, attempts, last_error FROM notifications WHERE event_id = ?")
       .bind(eventId).first<{ status: string; attempts: number; last_error: string }>();
     assert.equal(row?.status, "SENT");
 
+    const validId = await addEvent(db, { id: "valid-beside-invalid" });
     const invalidId = await addEvent(db, { id: "bad-url", url: "https://example.com/not-official" });
-    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?)")
-      .bind(invalidId, now.toISOString()).run();
+    await db.prepare("INSERT INTO notifications (telegram_id, event_id, status, created_at) VALUES (1, ?, 'PENDING', ?), (1, ?, 'PENDING', ?)")
+      .bind(validId, now.toISOString(), invalidId, now.toISOString()).run();
     const invalidResult = await deliverPendingNotifications(env, mock, TEST_RUN_ID, now);
-    assert.equal(invalidResult.failed, 1);
-    assert.equal(calls, 1, "invalid official URL is never sent");
+    assert.deepEqual(invalidResult, { enabled: true, sent: 1, failed: 1, remaining: 0 });
+    assert.equal(sends.length, 2, "one Telegram send is made for the valid publication digest");
+    assert.match(sends[1].text, /valid-beside-invalid/u);
+    assert.doesNotMatch(sends[1].text, /bad-url/u);
+    const buttons = sends[1].keyboard.inline_keyboard.flat();
+    assert.equal(buttons.filter((button) => button.url).length, 1);
+    assert.equal(buttons.find((button) => button.url)?.url, "https://hoeringsportalen.dk/Hearing/Details/123");
+    const states = await db.prepare("SELECT e.id AS event_id, n.status, n.attempts, n.last_error FROM notifications n JOIN publication_events e ON e.id=n.event_id WHERE e.id IN (?, ?) ORDER BY e.id")
+      .bind(validId, invalidId).all<{ event_id: number; status: string; attempts: number; last_error: string | null }>();
+    assert.deepEqual(states.results.map((row) => ({ status: row.status, attempts: row.attempts, last_error: row.last_error })), [
+      { status: "SENT", attempts: 1, last_error: null },
+      { status: "FAILED", attempts: 0, last_error: "invalid_notification_content" },
+    ]);
   } finally { db.close(); }
 });
 
@@ -1059,7 +1163,7 @@ test("local end-to-end: historical baseline, incremental changes, preference que
     assert.equal(sent.length, 2);
     assert.equal(sent.filter((item) => item.chatId === 1001 && item.text.includes("не юридична консультація")).length, 1);
     assert.equal(sent.filter((item) => item.chatId === 1002 && item.text.includes("не юридическая консультация")).length, 1);
-    assert.ok(sent.every((item) => item.text.includes("https://hoeringsportalen.dk/Hearing/Details/")));
+    assert.ok(sent.every((item) => JSON.stringify(item.keyboard).includes("https://hoeringsportalen.dk/Hearing/Details/")));
     assert.ok(sent.every((item) => JSON.stringify(item.keyboard).includes('"callback_data":"notification:main"')));
     const states = await db.prepare("SELECT status, COUNT(*) AS count FROM notifications GROUP BY status").all<{ status: string; count: number }>();
     assert.deepEqual(states.results.map((row) => ({ ...row })), [{ status: "SENT", count: 4 }]);
