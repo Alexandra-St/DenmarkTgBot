@@ -15,7 +15,7 @@
 Use the repository's normal macOS Terminal. Before changing anything, confirm the repository and Cloudflare identity/database:
 
 ```sh
-cd /Users/alexandra/Projects/DenmarkTgBot/worker
+cd "$(git rev-parse --show-toplevel)/worker"
 npx wrangler whoami
 npx wrangler d1 info denmarktgbot-db
 ```
@@ -51,7 +51,7 @@ chmod 700 "$BACKUP_DIR"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 SQL_FILE="$BACKUP_DIR/denmarktgbot-${STAMP}.sql"
 RESTORE_FILE="$BACKUP_DIR/denmarktgbot-${STAMP}-verify.sqlite"
-cd /Users/alexandra/Projects/DenmarkTgBot/worker
+cd "$(git rev-parse --show-toplevel)/worker"
 npx wrangler d1 export denmarktgbot-db --remote --output="$SQL_FILE"
 test -s "$SQL_FILE"
 sqlite3 "$RESTORE_FILE" < "$SQL_FILE"
@@ -99,7 +99,7 @@ Require the status constraint to include `SENDING`; compare the aggregate counts
 Record the currently deployed version first using Wrangler's read-only deployment listing, then deploy the reviewed commit only:
 
 ```sh
-cd /Users/alexandra/Projects/DenmarkTgBot/worker
+cd "$(git rev-parse --show-toplevel)/worker"
 npx wrangler deployments list --name denmarktgbot
 npm run deploy
 npx wrangler deployments list --name denmarktgbot

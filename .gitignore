@@ -15,6 +15,12 @@ build/
 !.dev.vars.example
 *.local
 
+# Python local environments and bytecode
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
 # Logs and temporary files
 *.log
 *.tmp

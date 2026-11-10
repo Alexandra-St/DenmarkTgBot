@@ -15,7 +15,7 @@ Active beta sources:
 - [Høringsportalen](https://hoeringsportalen.dk/) — official Danish consultation publications and documents.
 - [Folketinget](https://www.ft.dk/) — parliamentary publications and proceedings.
 
-Planned after beta:
+Future integrations:
 
 - Nyidanmark
 - Retsinformation
@@ -37,6 +37,13 @@ Users can browse available publications in News and Archive, filter by category,
 - **Python collectors** retrieve and prepare official source data.
 - **GitHub Actions** runs the scheduled collector workflows.
 - **Telegram Bot API** delivers the localized bot interface and notifications.
+
+## Engineering highlights
+
+- Incremental ingestion uses committed runs, checkpoints, and idempotent writes to resume safely.
+- Deterministic rules classify publications as DIRECT, POTENTIAL, or IRRELEVANT.
+- Queued notification digests use guarded delivery claims and explicit reconciliation for interrupted sends.
+- Ambiguous Telegram send outcomes are treated as terminal; the bot does not automatically resend them.
 
 ## Information and privacy
 
@@ -69,5 +76,9 @@ Current verified test baseline:
 
 | Suite | Tests |
 | --- | ---: |
-| Worker | 160 |
-| Python | 532 |
+| Worker | 172 |
+| Python | 548 |
+
+## License
+
+Original DenmarkTgBot source code is licensed under the MIT License. Third-party and official-source materials in test fixtures remain subject to their original source terms and provenance; they are not relicensed by this project. See the fixture provenance notes under `tests/fixtures/`.
